@@ -8,8 +8,8 @@ This repository is the complete standalone project: both Cargo workspace members
 
 - **Search:** a compact description field with visible Settings and keyboard hints. Typing searches after a short pause; Enter submits immediately. There is no Browse all photos button. The existing empty-query Enter action still lists indexed images.
 - **Results:** a thumbnail list and selected-image preview, friendly folder names, an All folders filter, and explicit **Open image** / **Show in folder** buttons. Preferences offers list-and-preview or list-only layout; narrow windows use the list with actions beneath it. A photo grid is not implemented.
-- **Settings → Folders:** add folders, see image counts, remove a folder from the index, rescan folders and review skipped files. Removing a folder preserves originals and asks for confirmation.
-- **Settings → Preferences:** prepare search at login, keep folders up to date, hide after opening a photo, maximum results and result layout.
+- **Settings → Folders:** add folders, see image counts, remove a folder from the index, rescan folders, keep folders up to date and review skipped files. Removing a folder preserves originals and asks for confirmation.
+- **Settings → Preferences:** prepare search at login, hide after opening a photo, maximum results and result layout.
 - **Settings → Performance:** model setup, a compact Accelerator section, shortcut setup and Stop service. Accelerator checks GPU requirements automatically when shown, displays actual CPU/GPU activity, and greys out an unavailable GPU. Details expands the report; Copy diagnostics prepares it to share with your agent. Availability does not mean active GPU inference and never changes the configured provider.
 
 Up/Down selects results, Enter opens the selection, Ctrl+Enter shows it in the file manager, and Ctrl+, opens Settings. Escape goes back or hides the panel. Ctrl+Q asks to stop the service; Cancel is focused by default, using the same confirmation component as folder removal. Left/Right switches a focused settings tab. All panels follow Omarchy's theme and font tokens.

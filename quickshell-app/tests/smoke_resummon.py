@@ -179,17 +179,17 @@ with (root / 'viewer.log').open('a') as log:
         wait(lambda s: s['page'] == 'settings')
         time.sleep(.3)
         subprocess.run(['grim', str(root / 'folders.png')], env=env, check=True, timeout=5)
+        before = json.loads(call('test', 'state'))['settings']['watchChanges']
+        call('test', 'toggleWatch')
+        wait(lambda s: not s['loading'] and s['settings']['watchChanges'] != before)
+        call('test', 'toggleWatch')
+        wait(lambda s: not s['loading'] and s['settings']['watchChanges'] == before)
         call('test', 'clickTab', 'Preferences')
         wait(lambda s: s['settingsTab'] == 1)
         call('test', 'tabKey', str(0x01000014))  # Right
         wait(lambda s: s['settingsTab'] == 2)
         call('test', 'tabKey', str(0x01000012))  # Left
         wait(lambda s: s['settingsTab'] == 1)
-        before = json.loads(call('test', 'state'))['settings']['watchChanges']
-        call('test', 'toggleWatch')
-        wait(lambda s: not s['loading'] and s['settings']['watchChanges'] != before)
-        call('test', 'toggleWatch')
-        wait(lambda s: not s['loading'] and s['settings']['watchChanges'] == before)
         time.sleep(.2)
         subprocess.run(['grim', str(root / 'preferences.png')], env=env, check=True, timeout=5)
         call('test', 'resize', '480', '440')

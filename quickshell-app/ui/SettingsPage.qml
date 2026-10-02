@@ -152,6 +152,28 @@ ColumnLayout {
                         onClicked: page.addFolder()
                     }
                 }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    SearchToggle {
+                        Layout.fillWidth: true
+                        text: "Keep folders up to date"
+                        colors: page.app.colors
+                        checked: page.app.settings.watchChanges
+                        enabled: page.app.ready && !page.app.busy
+                        onClicked: page.app.updateSettings({
+                            watchChanges: checked
+                        })
+                    }
+                    SearchText {
+                        Layout.fillWidth: true
+                        Layout.bottomMargin: Style.space(8)
+                        text: "Automatically index new and changed photos."
+                        color: page.app.secondaryText
+                        font.pixelSize: SearchTheme.font.bodySmall
+                        wrapMode: Text.WordWrap
+                    }
+                }
                 RowLayout {
                     Layout.fillWidth: true
                     Rectangle {
@@ -214,24 +236,6 @@ ColumnLayout {
                         Layout.fillWidth: true
                         Layout.bottomMargin: Style.space(8)
                         text: "Load the search model in the background for faster searches."
-                        color: page.app.secondaryText
-                        font.pixelSize: SearchTheme.font.bodySmall
-                        wrapMode: Text.WordWrap
-                    }
-                    SearchToggle {
-                        Layout.fillWidth: true
-                        text: "Keep folders up to date"
-                        colors: page.app.colors
-                        checked: page.app.settings.watchChanges
-                        enabled: page.app.ready && !page.app.busy
-                        onClicked: page.app.updateSettings({
-                            watchChanges: checked
-                        })
-                    }
-                    SearchText {
-                        Layout.fillWidth: true
-                        Layout.bottomMargin: Style.space(8)
-                        text: "Automatically index new and changed photos."
                         color: page.app.secondaryText
                         font.pixelSize: SearchTheme.font.bodySmall
                         wrapMode: Text.WordWrap

@@ -10,8 +10,8 @@ Type a description to search. Results use a compact list and a larger selected-i
 
 Settings has three tabs:
 
-- **Folders:** add search folders, see their image counts, rescan, review skipped files, or remove a folder from the index. Removal always asks for confirmation and preserves originals.
-- **Preferences:** prepare search at login, keep folders up to date, hide after opening a photo, and choose the result count and layout.
+- **Folders:** add search folders, see their image counts, rescan, keep folders up to date, review skipped files, or remove a folder from the index. Removal always asks for confirmation and preserves originals.
+- **Preferences:** prepare search at login, hide after opening a photo, and choose the result count and layout.
 - **Performance:** set up the search engine, inspect GPU requirements, copy diagnostics, configure a launcher shortcut, and stop the service safely.
 
 The tabs remain visible while their contents scroll. Left/Right switches a focused tab. All panels use the active Omarchy theme; confirmations share the same component and default to Cancel.
@@ -85,7 +85,7 @@ Text-only background preparation measured roughly 0.95–0.97 GiB worker RSS plu
 3. Results show a vertically navigable thumbnail/file/folder list and a large preview of the selected image. Up/Down changes the selection; Enter opens the original in the desktop viewer; Ctrl+Enter reveals it in the file manager. Double-clicking a row also opens the original. Previews preserve aspect ratio, are bounded to a maximum side of 1,600 pixels, and do not upscale small images. Earlier square thumbnail/preview caches are repaired on access without recomputing embeddings; repair failures remain visible.
 4. Use **All folders** to restrict results to one indexed folder. Settings → Preferences controls **Maximum results** (1–100, default 12) and **Result layout** (list with preview or list only). Narrow windows use the list to keep filenames and navigation usable. Catalog browsing has a **Load more** button.
 5. Settings → Folders lists indexed folders with their image counts. **Remove** removes a folder from the index after confirmation; original files stay in place. **Rescan folders** scans the configured folders in sequence. Unchanged files keep their vectors and stable IDs. Missing thumbnails are repaired without reembedding. Modified files are updated, and removed files leave the catalog only after a completed, uncancelled traversal. Overlapping sources are rejected. A reindex batch pauses on skipped files so their report remains available.
-6. **Keep folders up to date** enables automatic updates while the service is running. **Hide after opening a photo** dismisses the panel after a successful desktop-open request; the service stays resident. Escape goes back from settings/results, then dismisses the summon prompt. Ctrl+Q opens the Stop service confirmation. The explicit plugin `quit` call stops the backend cleanly after active work finishes without a UI confirmation.
+6. **Settings → Folders → Keep folders up to date** enables automatic updates while the service is running. **Hide after opening a photo** dismisses the panel after a successful desktop-open request; the service stays resident. Escape goes back from settings/results, then dismisses the summon prompt. Ctrl+Q opens the Stop service confirmation. The explicit plugin `quit` call stops the backend cleanly after active work finishes without a UI confirmation.
 
 Omarchy owns the plugin lifecycle and exposes these commands:
 
