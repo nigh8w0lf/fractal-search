@@ -73,7 +73,7 @@ Item {
                     if (diagnostics.report !== null || data.length > 65536)
                         throw new Error("Invalid or oversized accelerator diagnostic response.");
                     const value = JSON.parse(data);
-                    if (value.schemaVersion !== 1 || typeof value.summary !== "string" || !Array.isArray(value.libraries) || !Array.isArray(value.gpus) || !Array.isArray(value.probeErrors) || !Array.isArray(value.installSteps) || !Array.isArray(value.librarySearchLocations) || !value.nvidiaDriver || !value.cudaToolkit || !value.linkerCache || !value.providerDependencies)
+                    if (value.schemaVersion !== 1 || typeof value.checksPassed !== "boolean" || typeof value.summary !== "string" || !Array.isArray(value.libraries) || !Array.isArray(value.gpus) || !Array.isArray(value.probeErrors) || !Array.isArray(value.installSteps) || !Array.isArray(value.librarySearchLocations) || !value.nvidiaDriver || !value.cudaToolkit || !value.linkerCache || !value.providerDependencies)
                         throw new Error("Incompatible accelerator diagnostic response. Reinstall the plugin.");
                     diagnostics.report = value;
                 } catch (error) {

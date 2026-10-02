@@ -362,74 +362,9 @@ ColumnLayout {
                     implicitHeight: 1
                     color: page.app.borderColor
                 }
-                ColumnLayout {
+                AcceleratorSection {
                     Layout.fillWidth: true
-                    spacing: Style.space(6)
-                    RowLayout {
-                        Layout.fillWidth: true
-                        SearchText {
-                            text: "GPU acceleration"
-                            font.bold: true
-                            color: page.app.colors.foreground
-                            Layout.fillWidth: true
-                            wrapMode: Text.WordWrap
-                        }
-                        SearchButton {
-                            text: page.app.runtimeDiagnostics.checking ? "Checking…" : page.app.runtimeDiagnostics.report ? "Refresh" : "Check"
-                            colors: page.app.colors
-                            enabled: !page.app.runtimeDiagnostics.checking
-                            onClicked: page.app.runtimeDiagnostics.refresh()
-                        }
-                    }
-                    SearchText {
-                        Layout.fillWidth: true
-                        text: page.app.runtimeDiagnostics.summary
-                        color: page.app.runtimeDiagnostics.errorMessage.length ? page.app.colors.error : page.app.secondaryText
-                        font.pixelSize: SearchTheme.font.bodySmall
-                        wrapMode: Text.WordWrap
-                    }
-                    SearchText {
-                        Layout.fillWidth: true
-                        text: "Configured: " + page.app.configuredProvider.toUpperCase() + (page.app.configuredProvider === "cuda" ? " · device " + page.app.configuredDeviceId : "") + ". Checks work even when the search service cannot start."
-                        color: page.app.secondaryText
-                        font.pixelSize: SearchTheme.font.bodySmall
-                        wrapMode: Text.WordWrap
-                    }
-                    ColumnLayout {
-                        visible: page.app.runtimeDiagnostics.details.length > 0
-                        Layout.fillWidth: true
-                        spacing: Style.space(6)
-                        SearchButton {
-                            text: "Copy details"
-                            colors: page.app.colors
-                            onClicked: {
-                                diagnosticDetails.selectAll();
-                                diagnosticDetails.copy();
-                                diagnosticDetails.deselect();
-                            }
-                        }
-                        ScrollView {
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: Style.space(240)
-                            contentWidth: availableWidth
-                            clip: true
-                            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-                            TextArea {
-                                id: diagnosticDetails
-                                text: page.app.runtimeDiagnostics.details
-                                readOnly: true
-                                selectByMouse: true
-                                wrapMode: TextEdit.Wrap
-                                font.family: page.app.monoFont
-                                font.pixelSize: SearchTheme.font.bodySmall
-                                color: page.app.colors.foreground
-                                background: Rectangle {
-                                    color: Qt.alpha(page.app.colors.foreground, 0.035)
-                                    border.color: page.app.borderColor
-                                }
-                            }
-                        }
-                    }
+                    app: page.app
                 }
                 Rectangle {
                     Layout.fillWidth: true

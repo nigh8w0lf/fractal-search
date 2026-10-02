@@ -79,6 +79,7 @@ Representative integration commands (replace `/absolute/path/to/models` with the
 python3 quickshell-app/tests/smoke_plugin.py target/debug/fractal-search /absolute/path/to/models
 python3 quickshell-app/tests/smoke_mcp.py target/debug/fractal-search target/debug/fractal-search-mcp /absolute/path/to/models
 python3 quickshell-app/tests/smoke_resummon.py target/debug/fractal-search /absolute/path/to/models
+python3 quickshell-app/tests/smoke_accelerator_ui.py
 python3 quickshell-app/tests/smoke_diagnostics_ui.py
 python3 quickshell-app/tests/smoke_installer.py /absolute/path/to/prebuilt/bundle
 ```
@@ -95,3 +96,5 @@ Run simulated keyboard/mouse input only in the isolated compositor. Shared-deskt
 - Use the Omarchy skill for desktop customization. Do not change shortcuts without authorization. Do not edit `/usr/share/omarchy/`; user-owned plugins hot reload. A slow plugin load may need `OMARCHY_SHELL_IPC_TIMEOUT=15s` for the installer, not a desktop restart.
 - Inspect the final diff for unrelated work, generated files and secrets. Change lockfiles only when dependency resolution changes. Do not commit build outputs, model assets, logs, runtime data or generated design mockups. Preserve attribution; publishing/licensing needs separate authorization.
 - Keep both root onboarding docs and affected scoped docs aligned when behavior, source ownership, commands or workflows change. Report exact checks and material limitations; dated test counts must never stand in for current validation.
+
+- Accelerator status must distinguish configured, available and active providers. Grey out GPU when requirements fail; do not label a disconnected CUDA service as active CPU. Keep diagnostics collapsed by default, errors visible, and the full report copyable for sharing with an agent. Automatic preflight must not load models or switch providers.

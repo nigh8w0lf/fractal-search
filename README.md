@@ -10,7 +10,7 @@ This repository is the complete standalone project: both Cargo workspace members
 - **Results:** a thumbnail list and selected-image preview, friendly folder names, an All folders filter, and explicit **Open image** / **Show in folder** buttons. Preferences offers list-and-preview or list-only layout; narrow windows use the list with actions beneath it. A photo grid is not implemented.
 - **Settings → Folders:** add folders, see image counts, remove a folder from the index, rescan folders and review skipped files. Removing a folder preserves originals and asks for confirmation.
 - **Settings → Preferences:** prepare search at login, keep folders up to date, hide after opening a photo, maximum results and result layout.
-- **Settings → Performance:** model setup, GPU acceleration diagnostics, shortcut setup and Stop service. Diagnostics list missing runtime components and can be copied without starting inference.
+- **Settings → Performance:** model setup, a compact Accelerator section, shortcut setup and Stop service. Accelerator checks GPU requirements automatically when shown, displays actual CPU/GPU activity, and greys out an unavailable GPU. Details expands the report; Copy diagnostics prepares it to share with your agent. Availability does not mean active GPU inference and never changes the configured provider.
 
 Up/Down selects results, Enter opens the selection, Ctrl+Enter shows it in the file manager, and Ctrl+, opens Settings. Escape goes back or hides the panel. Ctrl+Q asks to stop the service; Cancel is focused by default, using the same confirmation component as folder removal. Left/Right switches a focused settings tab. All panels follow Omarchy's theme and font tokens.
 
@@ -76,6 +76,7 @@ The desktop socket is trusted same-user access: it may index folders and open or
 | `quickshell-app/ui/SettingsPage.qml` | Folders, Preferences and Performance tabs. |
 | `quickshell-app/ui/ResultActions.qml` | Shared Open image / Show in folder controls for preview and narrow/list layouts. |
 | `quickshell-app/ui/SearchConfirmationDialog.qml` | Shared folder-removal and stop-service confirmation. |
+| `quickshell-app/ui/AcceleratorSection.qml` | Compact CPU/GPU activity and capability status with expandable, copyable diagnostics. |
 | `quickshell-app/ui/RuntimeConfig.qml`, `RuntimeDiagnostics.qml`, `ServiceAutostart.qml` | Runtime paths, dependency diagnostics and login registration. The installer generates the installed RuntimeConfig. |
 | `quickshell-app/backend/src/main.rs`, `daemon.rs` | Worker commands/settings and resident socket service/lifecycle. |
 | `quickshell-app/backend/src/models.rs`, `watch.rs`, `diagnostics.rs` | Verified downloads, folder watching and CUDA preflight. |
