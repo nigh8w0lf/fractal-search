@@ -77,6 +77,18 @@ hl.config({input={follow_mouse=0},animations={enabled=false},misc={disable_hyprl
         env['DBUS_SESSION_BUS_ADDRESS'] = bus.stdout.readline().strip()
         assert env['DBUS_SESSION_BUS_ADDRESS'].startswith('unix:')
 
+        # A private FileManager1 command fixture records reveal requests.
+        backend_commands = root / 'backend-commands'; backend_commands.mkdir()
+        file_manager = backend_commands / 'gdbus'
+        file_manager.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+assert 'org.freedesktop.FileManager1.ShowItems' in sys.argv
+Path(os.environ['FRACTAL_RESUMMON_ROOT'], 'reveal.json').write_text(json.dumps(sys.argv[1:]))
+print('()')
+''')
+        file_manager.chmod(0o755)
+        env['PATH'] = str(backend_commands) + ':' + env['PATH']
         backend_root = root / 'backend'; backend_root.mkdir()
         backend, client, socket, log = launch(args.binary.resolve(), args.models.resolve(), backend_root, env)
         children.append(backend); logs.append(log)
@@ -86,11 +98,13 @@ hl.config({input={follow_mouse=0},animations={enabled=false},misc={disable_hyprl
         ui = root / 'ui'
         shutil.copytree(Path(__file__).resolve().parents[1] / 'ui', ui)
         (ui / 'Commons').symlink_to('/usr/share/omarchy/shell/Commons', target_is_directory=True)
-        # Scroll the private harness through scoped IPC, never shared-session input.
+        # Test-only controls dispatch input exclusively to this private window.
+        settings_source = ui / 'SettingsPage.qml'
+        settings_source.write_text(settings_source.read_text().replace('id: page', 'id: page; property alias testScroll: settingsScroll').replace('text: modelData', 'objectName: modelData; text: modelData').replace('text: "Keep folders up to date"', 'objectName: "watchChangesToggle"; text: "Keep folders up to date"'))
         panel_source = ui / 'SearchPanel.qml'
-        panel_source.write_text(panel_source.read_text().replace('SettingsPage {', 'SettingsPage { id: diagnosticTestSettings').replace(
+        panel_source.write_text(panel_source.read_text().replace('import QtQuick\n', 'import QtQuick\nimport QtTest\n').replace('id: panel', 'id: panel; TestCase { id: input; when: false }', 1).replace('ResultActions {', 'ResultActions { id: previewTestActions', 1).replace(
             'function refreshDiagnostics()',
-            'function scrollSettings(amount: real): void { diagnosticTestSettings.contentItem.contentY = amount; }\n        function refreshDiagnostics()'))
+            'function scrollSettings(amount: real): void { settingsPage.testScroll.contentItem.contentY = amount; }\n        function clickTab(name: string): void { const button = input.findChild(settingsPage, name); if (!button) throw new Error("Missing tab " + name); input.mouseClick(button); }\n        function clickOpen(): void { const button = input.findChild(previewTestActions, "openImageButton"); if (!button) throw new Error("Missing open action"); input.mouseClick(button); }\n        function tabKey(key: int): void { input.keyClick(key); }\n        function clickReveal(): void { input.mouseClick(input.findChild(previewTestActions, "revealImageButton")); }\n        function toggleWatch(): void { input.mouseClick(input.findChild(settingsPage, "watchChangesToggle")); }\n        function refreshDiagnostics()'))
         # An opaque desktop window exercises remapping above another app.
         shell = ui / 'shell.qml'
         shell.write_text(shell.read_text().replace('ShellRoot {', '''ShellRoot {
@@ -148,13 +162,48 @@ with (root / 'viewer.log').open('a') as log:
         wait(lambda s: s['loading'])
         wait(lambda s: not s['loading'] and s['count'] == 2 and bool(s['previewUrl']), timeout=60)
 
+        call('test', 'acknowledge')
+        time.sleep(.3)
+        subprocess.run(['grim', str(root / 'results.png')], env=env, check=True, timeout=5)
+        selected = json.loads(call('test', 'state'))['selectedAsset']
+        call('test', 'clickReveal')
+        deadline = time.monotonic() + 5
+        while not (root / 'reveal.json').exists():
+            assert time.monotonic() < deadline, 'Show in folder did not dispatch'
+            time.sleep(.02)
+        arguments = json.loads((root / 'reveal.json').read_text())
+        assert json.loads(arguments[-2]) == [Path(selected['path']).as_uri()], arguments
+        call('search', 'summon')
+        wait(lambda s: s['active'])
         call('test', 'settings')
+        wait(lambda s: s['page'] == 'settings')
+        time.sleep(.3)
+        subprocess.run(['grim', str(root / 'folders.png')], env=env, check=True, timeout=5)
+        call('test', 'clickTab', 'Preferences')
+        wait(lambda s: s['settingsTab'] == 1)
+        call('test', 'tabKey', str(0x01000014))  # Right
+        wait(lambda s: s['settingsTab'] == 2)
+        call('test', 'tabKey', str(0x01000012))  # Left
+        wait(lambda s: s['settingsTab'] == 1)
+        before = json.loads(call('test', 'state'))['settings']['watchChanges']
+        call('test', 'toggleWatch')
+        wait(lambda s: not s['loading'] and s['settings']['watchChanges'] != before)
+        call('test', 'toggleWatch')
+        wait(lambda s: not s['loading'] and s['settings']['watchChanges'] == before)
+        time.sleep(.2)
+        subprocess.run(['grim', str(root / 'preferences.png')], env=env, check=True, timeout=5)
+        call('test', 'resize', '480', '440')
+        time.sleep(.3)
+        subprocess.run(['grim', str(root / 'narrow-preferences.png')], env=env, check=True, timeout=5)
+        call('test', 'resize', '0', '0')
+        call('test', 'clickTab', 'Performance')
+        wait(lambda s: s['settingsTab'] == 2)
         call('test', 'refreshDiagnostics')
         diagnostic = wait(lambda s: not s['runtimeDiagnosticChecking'] and bool(s['runtimeDiagnosticDetails']), timeout=25)
         assert not diagnostic['runtimeDiagnosticError'], diagnostic
         assert 'Required libraries:' in diagnostic['runtimeDiagnosticDetails']
         assert 'cuDNN 9' in diagnostic['runtimeDiagnosticDetails']
-        call('test', 'scrollSettings', '575')
+        call('test', 'scrollSettings', '0')
         time.sleep(.2)
         subprocess.run(['grim', str(root / 'diagnostics-settings.png')], env=env, check=True, timeout=5)
         call('test', 'scrollSettings', '0')
@@ -167,7 +216,7 @@ with (root / 'viewer.log').open('a') as log:
             for _ in range(8):
                 call('test', 'browse')
                 wait(lambda s: not s['loading'] and s['selectedAsset'] and s['previewUrl'] and s['active'])
-                call('test', 'openOriginal')
+                call('test', 'clickOpen')
                 deadline = time.monotonic() + 3
                 while not (root / 'viewer.pid').exists():
                     assert time.monotonic() < deadline, (root / 'ui.log').read_text()
@@ -184,7 +233,7 @@ with (root / 'viewer.log').open('a') as log:
         call('test', 'browse')
         selected = wait(lambda s: not s['loading'] and not s['previewLoading'] and s['previewUrl'] and s['selectedAsset'])['selectedAsset']
         Path(selected['path']).unlink()
-        call('test', 'openOriginal')
+        call('test', 'clickOpen')
         wait(lambda s: 'Original image is missing' in s['error'] and s['visible'])
         call('test', 'acknowledge')
         call('search', 'toggle')

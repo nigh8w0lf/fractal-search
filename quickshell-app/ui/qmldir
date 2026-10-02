@@ -13,3 +13,4 @@ SearchToggle 1.0 SearchToggle.qml
 SettingsPage 1.0 SettingsPage.qml
 ShortcutKey 1.0 ShortcutKey.qml
 SearchConfirmationDialog 1.0 SearchConfirmationDialog.qml
+ResultActions 1.0 ResultActions.qml

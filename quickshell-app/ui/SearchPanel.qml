@@ -132,8 +132,8 @@ Item {
         readonly property int compactHeight: Math.ceil(Style.space(56) + hotkeysFooter.implicitHeight)
         readonly property bool hasStatus: app.errorMessage.length > 0 || app.notice.length > 0 || app.showIndexReport || (app.ready && !app.status.modelsPresent) || app.indexing || app.installingModels
         readonly property bool expanded: app.page !== "summon" || hasStatus || errorDialog.visible || skippedFiles.visible || stopDialog.visible
-        readonly property int preferredWidth: Style.space(app.page === "results" ? 980 : app.page === "settings" ? 520 : 680)
-        readonly property int preferredHeight: app.page === "settings" ? Style.space(740) : app.page === "results" || errorDialog.visible || skippedFiles.visible ? Style.space(640) : stopDialog.visible ? Style.space(320) : hasStatus ? Math.ceil(compactHeight + statusArea.implicitHeight + Style.space(32)) : compactHeight
+        readonly property int preferredWidth: Style.space(app.page === "results" ? 980 : app.page === "settings" ? 600 : 680)
+        readonly property int preferredHeight: app.page === "settings" ? Style.space(640) : app.page === "results" || errorDialog.visible || skippedFiles.visible ? Style.space(640) : stopDialog.visible ? Style.space(320) : hasStatus ? Math.ceil(compactHeight + statusArea.implicitHeight + Style.space(32)) : compactHeight
         readonly property int targetWidth: Math.min(panel.testWidth || preferredWidth, surfaceWidth)
         readonly property int targetHeight: Math.min(panel.testHeight || preferredHeight, surfaceHeight)
         implicitWidth: surfaceWidth
@@ -343,7 +343,7 @@ Item {
                                 SearchText {
                                     visible: app.page === "settings"
                                     Layout.fillWidth: true
-                                    text: "Image search / Settings"
+                                    text: "Settings"
                                     color: app.colors.foreground
                                     font.pixelSize: SearchTheme.font.subtitle
                                 }
@@ -354,7 +354,7 @@ Item {
                                     Layout.minimumWidth: 0
                                     padding: 0
                                     text: app.query
-                                    placeholderText: app.serviceStarting && !app.errorMessage.length ? app.loadingMessage : "Describe an image…"
+                                    placeholderText: app.serviceStarting && !app.errorMessage.length ? app.loadingMessage : "Describe a photo…"
                                     placeholderTextColor: app.secondaryText
                                     color: app.colors.foreground
                                     font.family: app.monoFont
@@ -383,8 +383,7 @@ Item {
                                     Component.onCompleted: forceActiveFocus()
                                 }
                                 SearchButton {
-                                    text: "⚙"
-                                    font.pixelSize: 19
+                                    text: "Settings"
                                     visible: app.page !== "settings"
                                     colors: app.colors
                                     quiet: true
@@ -565,6 +564,7 @@ Item {
                         }
 
                         SettingsPage {
+                            id: settingsPage
                             visible: app.page === "settings"
                             Layout.fillWidth: true
                             Layout.fillHeight: true
@@ -695,7 +695,7 @@ Item {
                                                     SearchText {
                                                         Layout.fillWidth: true
                                                         Layout.minimumWidth: 0
-                                                        text: app.displayPath(app.folderPath(resultRow.model.path))
+                                                        text: app.folderPath(resultRow.model.path).split("/").filter(Boolean).pop() || "/"
                                                         color: app.secondaryText
                                                         elide: Text.ElideMiddle
                                                         font.pixelSize: SearchTheme.font.bodySmall
@@ -775,6 +775,10 @@ Item {
                                             elide: Text.ElideMiddle
                                             font.pixelSize: SearchTheme.font.bodySmall
                                         }
+                                        ResultActions {
+                                            Layout.fillWidth: true
+                                            app: app
+                                        }
                                     }
                                 }
                                 ColumnLayout {
@@ -807,6 +811,12 @@ Item {
                                         onClicked: imageFolder.open()
                                     }
                                 }
+                            }
+                            ResultActions {
+                                visible: app.results.count > 0 && !previewPane.visible
+                                Layout.fillWidth: true
+                                Layout.margins: Style.space(12)
+                                app: app
                             }
                             SearchButton {
                                 Layout.alignment: Qt.AlignHCenter
@@ -865,15 +875,7 @@ Item {
                                 onClicked: panel.submit()
                             }
                             FooterButton {
-                                visible: app.page === "results"
-                                text: "Reveal"
-                                shortcut: "Ctrl+Enter"
-                                colors: app.colors
-                                enabled: !!app.selectedAsset && !app.closing
-                                onClicked: app.revealOriginal()
-                            }
-                            FooterButton {
-                                visible: app.page !== "settings"
+                                visible: app.page === "summon"
                                 text: "Settings"
                                 shortcut: "Ctrl+,"
                                 colors: app.colors
@@ -1160,6 +1162,7 @@ Item {
                 closeShortcutEnabled: panel.closeShortcutEnabled,
                 previewUrl: app.previewUrl,
                 page: app.page,
+                settingsTab: settingsPage.currentTab,
                 selectedIndex: app.selectedIndex,
                 selectedAsset: app.selectedAsset,
                 settings: app.settings,
@@ -1205,6 +1208,9 @@ Item {
         }
         function settings(): void {
             app.showSettings();
+        }
+        function settingsTab(index: int): void {
+            settingsPage.selectTab(index);
         }
         function refreshDiagnostics(): void {
             app.runtimeDiagnostics.refresh();

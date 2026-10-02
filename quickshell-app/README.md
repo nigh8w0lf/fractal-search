@@ -4,6 +4,18 @@ An Omarchy Shell plugin with a Quickshell search panel and a bundled native Rust
 
 `crates/fractal-search-core/` implements native decoding, dynamic-patch preprocessing, short-text tokenization and the SQLite search catalog. The workspace builds the plugin backend, native folder chooser and read-only MCP server together.
 
+## Search and settings
+
+Type a description to search. Results use a compact list and a larger selected-image preview; **Open image** opens the original in your viewer and **Show in folder** selects it in your file manager. Both actions remain available in the list-only layout and narrow windows. Arrow keys select results, Enter opens the selected image, Ctrl+Enter reveals it, and Escape goes back. There is no Browse all photos button.
+
+Settings has three tabs:
+
+- **Folders:** add search folders, see their image counts, rescan, review skipped files, or remove a folder from the index. Removal always asks for confirmation and preserves originals.
+- **Preferences:** prepare search at login, keep folders up to date, hide after opening a photo, and choose the result count and layout.
+- **Performance:** set up the search engine, inspect GPU requirements, copy diagnostics, configure a launcher shortcut, and stop the service safely.
+
+The tabs remain visible while their contents scroll. Left/Right switches a focused tab. All panels use the active Omarchy theme; confirmations share the same component and default to Cancel.
+
 ## Install and launch
 
 For a prebuilt bundle, run its `install.sh`, then:
