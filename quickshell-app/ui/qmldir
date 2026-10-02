@@ -1,0 +1,15 @@
+RuntimeConfig 1.0 RuntimeConfig.qml
+RuntimeDiagnostics 1.0 RuntimeDiagnostics.qml
+PortalFolderDialog 1.0 PortalFolderDialog.qml
+singleton SearchTheme 1.0 SearchTheme.qml
+Controller 1.0 Controller.qml
+ServiceAutostart 1.0 ServiceAutostart.qml
+FooterButton 1.0 FooterButton.qml
+SearchButton 1.0 SearchButton.qml
+SearchChoice 1.0 SearchChoice.qml
+SearchPanel 1.0 SearchPanel.qml
+SearchText 1.0 SearchText.qml
+SearchToggle 1.0 SearchToggle.qml
+SettingsPage 1.0 SettingsPage.qml
+ShortcutKey 1.0 ShortcutKey.qml
+SearchConfirmationDialog 1.0 SearchConfirmationDialog.qml

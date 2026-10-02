@@ -1,0 +1,22 @@
+Fractal Search development bundle
+
+Native runtime: Rust, ONNX Runtime, SQLite/sqlite-vec, Hugging Face tokenizers,
+zbus, libheif and libjpeg-turbo. System libraries are provided by Omarchy packages;
+ONNX Runtime is linked into the executable. Dependency licenses remain their
+respective owners' licenses (ONNX Runtime: MIT; SQLite: public domain;
+sqlite-vec: see its bundled Rust crate license; tokenizers: Apache-2.0; zbus: MIT;
+libheif: LGPL-3.0;
+libjpeg-turbo: IJG/BSD/zlib).
+
+CUDA-capable bundles additionally carry ONNX Runtime's CUDA/shared provider
+libraries. NVIDIA driver, CUDA 12 and cuDNN 9 libraries are external runtime
+requirements and are not redistributed in this bundle. The stdio MCP server
+uses rmcp (MIT) and Tokio (MIT).
+
+First-run models are downloaded from zihuv/fg-clip2-base-onnx at the exact
+revision recorded in model-manifest.json. Original FG-CLIP2:
+https://github.com/360CVGroup/FG-CLIP
+https://huggingface.co/zihuv/fg-clip2-base-onnx
+
+This local development bundle is not a published or signed release. Complete
+project and third-party license/redistribution review before public distribution.

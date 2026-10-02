@@ -1,0 +1,32 @@
+# Local tools and secrets
+.agent/
+.agents/
+.codex/
+.claude/
+.cursor/
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+
+# Generated artifacts and Python development environments
+target/
+**/target/
+dist/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime data and model weights belong outside the checkout
+*.db
+*.db-shm
+*.db-wal
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.safetensors

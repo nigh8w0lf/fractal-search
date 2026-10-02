@@ -1,0 +1,46 @@
+[package]
+name = "fractal-search-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["runtime", "catalog"]
+runtime = ["dep:ort"]
+cuda = ["runtime", "ort/cuda", "ort/copy-dylibs"]
+catalog = ["dep:rusqlite", "dep:sqlite-vec", "dep:walkdir", "dep:url", "dep:libc"]
+
+[dependencies]
+anyhow = "1"
+image = { version = "0.25.8", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
+libheif-rs = { version = "2.6", default-features = false, features = ["image", "v1_20"] }
+tokenizers = { version = "=0.22.2", default-features = false, features = ["fancy-regex"] }
+half = "=2.7.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+uuid = { version = "1", features = ["v4"] }
+ort = { version = "=2.0.0-rc.10", optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+sqlite-vec = { version = "=0.1.9", optional = true }
+walkdir = { version = "2.5", optional = true }
+url = { version = "2.5", optional = true }
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Omarchy supplies libjpeg-turbo. Choose it explicitly without a bundled CMake
+# build or repository-wide environment override.
+turbojpeg = { version = "1.1", default-features = false, features = ["pkg-config"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+turbojpeg = "1.1"
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[[example]]
+name = "validate_fgclip2"
+required-features = ["runtime"]
+
+[[example]]
+name = "validate_cuda"
+required-features = ["cuda"]
