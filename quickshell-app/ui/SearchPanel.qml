@@ -383,7 +383,9 @@ Item {
                                     Component.onCompleted: forceActiveFocus()
                                 }
                                 SearchButton {
-                                    text: "Settings"
+                                    text: "⚙"
+                                    font.pixelSize: 19
+                                    Accessible.name: "Settings"
                                     visible: app.page !== "settings"
                                     colors: app.colors
                                     quiet: true
@@ -595,7 +597,7 @@ Item {
                                 implicitHeight: Style.space(36)
                                 SearchText {
                                     Layout.fillWidth: true
-                                    text: app.loading ? app.loadingMessage : app.results.count + (app.activeQuery.length ? " results" : " / " + app.total + " images")
+                                    text: app.loading ? app.loadingMessage : (app.activeQuery.length ? "Top " + app.results.count + " results" : app.results.count + " / " + app.total + " images")
                                     color: app.secondaryText
                                 }
                                 SearchChoice {

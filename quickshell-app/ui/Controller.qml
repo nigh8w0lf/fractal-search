@@ -67,7 +67,7 @@ Item {
             modelDirectory: "",
             themeFile: "",
             settings: {
-                topMatches: 12,
+                topMatches: 6,
                 resultLayout: "listPreview",
                 watchChanges: false,
                 closeAfterOpening: true

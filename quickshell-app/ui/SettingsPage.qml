@@ -125,7 +125,8 @@ ColumnLayout {
                                     font.pixelSize: SearchTheme.font.bodySmall
                                 }
                                 SearchButton {
-                                    text: "Remove"
+                                    text: "×"
+                                    Accessible.name: "Remove folder from index"
                                     colors: page.app.colors
                                     quiet: true
                                     enabled: page.app.ready && !page.app.busy

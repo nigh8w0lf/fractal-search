@@ -137,7 +137,7 @@ struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            top_matches: 12,
+            top_matches: 6,
             result_layout: ResultLayout::ListPreview,
             watch_changes: false,
             close_after_opening: true,
