@@ -267,7 +267,7 @@ impl NativeRuntime {
         if matches!(self.provider, ExecutionProvider::Cuda { .. }) {
             // ORT deliberately assigns shape calculations to CPU to avoid
             // expensive tiny transfers; this is not a failed CUDA registration.
-            eprintln!("[Model] CUDA executes supported graph operations; ONNX Runtime may place shape/control operations on CPU. Image decoding, tokenization and SQLite remain on CPU");
+            eprintln!("[Model] CUDA executes supported graph operations; ONNX Runtime may place shape/control operations on CPU. Image decoding, tokenization and catalog operations remain on CPU");
         }
         Ok(session)
     }

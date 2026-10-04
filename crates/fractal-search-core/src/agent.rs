@@ -1,17 +1,15 @@
 //! Read-only, bounded views of the Quickshell catalog for local agent clients.
 //! Never delegates to Catalog: its display helpers may repair caches from originals.
 use crate::{
-    catalog::{register_vectors, vector_bytes, APPLICATION_ID},
+    store::{Record, Store},
     MODEL_PROFILE,
 };
 use anyhow::{ensure, Context, Result};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{Cursor, Read},
     path::{Path, PathBuf},
-    time::Duration,
 };
 use uuid::Uuid;
 
@@ -47,11 +45,11 @@ pub struct AgentStatus {
 }
 
 pub struct AgentCatalog {
-    conn: Connection,
+    store: Store,
     thumbnails: PathBuf,
 }
 
-fn database<T>(result: rusqlite::Result<T>) -> Result<T> {
+fn database<T>(result: Result<T>) -> Result<T> {
     result.map_err(|_| {
         anyhow::anyhow!("Cannot read search catalog; inspect or repair it in Fractal Search")
     })
@@ -86,64 +84,29 @@ impl AgentCatalog {
                 "Search catalog directory is unavailable; index a folder in Fractal Search first"
             )
         })?;
-        let path = data_dir.join("search.db");
-        let metadata = fs::symlink_metadata(&path).map_err(|_| {
-            anyhow::anyhow!("Search catalog is unavailable; index a folder in Fractal Search first")
-        })?;
-        ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "Search catalog must be a regular file"
-        );
-        register_vectors().map_err(|_| anyhow::anyhow!("Cannot initialize sqlite-vec"))?;
-        let conn = database(Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ))?;
-        database(conn.busy_timeout(Duration::from_secs(2)))?;
-        database(conn.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;"))?;
-        let id: i64 = database(conn.query_row("PRAGMA application_id", [], |r| r.get(0)))?;
-        let version: i64 = database(conn.query_row("PRAGMA user_version", [], |r| r.get(0)))?;
-        ensure!(
-            id == APPLICATION_ID && version == 1,
-            "Unsupported search catalog; open the correct Quickshell catalog"
-        );
-        let profile: String = database(conn.query_row(
-            "SELECT value FROM settings WHERE key='model_profile'",
-            [],
-            |r| r.get(0),
-        ))?;
-        ensure!(
-            profile == MODEL_PROFILE,
-            "Incompatible catalog model profile; reindex using Fractal Search"
-        );
+        let store = database(Store::open(&data_dir, true))?;
         Ok(Self {
-            conn,
+            store,
             thumbnails: data_dir.join("thumbnails"),
         })
     }
     pub fn status(&self) -> Result<AgentStatus> {
+        let (image_count, sources) = database(self.store.status())?;
         Ok(AgentStatus {
-            image_count: database(
-                self.conn
-                    .query_row("SELECT count(*) FROM images", [], |r| r.get(0)),
-            )?,
-            source_count: database(
-                self.conn
-                    .query_row("SELECT count(*) FROM sources", [], |r| r.get(0)),
-            )?,
+            image_count,
+            source_count: sources.len(),
             model_profile: MODEL_PROFILE,
         })
     }
-    fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetMetadata> {
-        let asset_id: String = row.get(0)?;
-        Ok(AssetMetadata {
-            thumbnail_handle: format!("thumbnail_{asset_id}"),
-            asset_id,
-            filename: row.get(1)?,
-            width: row.get(2)?,
-            height: row.get(3)?,
+    fn row(row: Record) -> AssetMetadata {
+        AssetMetadata {
+            thumbnail_handle: format!("thumbnail_{}", row.asset_id),
+            asset_id: row.asset_id,
+            filename: row.filename,
+            width: row.width,
+            height: row.height,
             similarity: None,
-        })
+        }
     }
     fn validate(asset: AssetMetadata) -> Result<AssetMetadata> {
         validate_asset_id(&asset.asset_id)
@@ -169,16 +132,11 @@ impl AgentCatalog {
     }
     pub fn browse(&self, offset: usize, limit: usize) -> Result<AssetPage> {
         validate_page(offset, limit)?;
-        // One read transaction keeps the page and count coherent during indexing.
-        let tx = database(self.conn.unchecked_transaction())?;
-        let total = database(tx.query_row("SELECT count(*) FROM images", [], |r| r.get(0)))?;
-        let mut stmt = database(tx.prepare("SELECT asset_id,filename,width,height FROM images ORDER BY filename COLLATE NOCASE,asset_id LIMIT ?1 OFFSET ?2"))?;
-        let rows = database(stmt.query_map(params![limit as i64, offset as i64], Self::row))?;
+        let (total, rows) = database(self.store.browse(offset, limit, None))?;
         let items = rows
-            .map(|row| Self::validate(database(row)?))
+            .into_iter()
+            .map(|row| Self::validate(Self::row(row)))
             .collect::<Result<Vec<_>>>()?;
-        drop(stmt);
-        database(tx.commit())?;
         Ok(AssetPage {
             items,
             total,
@@ -188,30 +146,14 @@ impl AgentCatalog {
     }
     pub fn metadata(&self, asset_id: &str) -> Result<AssetMetadata> {
         validate_asset_id(asset_id)?;
-        let asset = database(
-            self.conn
-                .query_row(
-                    "SELECT asset_id,filename,width,height FROM images WHERE asset_id=?1",
-                    [asset_id],
-                    Self::row,
-                )
-                .optional(),
-        )?
-        .context("Asset does not exist in the search catalog")?;
-        Self::validate(asset)
+        Self::validate(Self::row(database(self.store.asset(asset_id, false))?))
     }
     pub fn search(&self, embedding: &[f32], limit: usize) -> Result<Vec<AssetMetadata>> {
         validate_page(0, limit)?;
-        let vector = vector_bytes(embedding)?;
-        let mut stmt = database(self.conn.prepare("SELECT i.asset_id,i.filename,i.width,i.height,v.distance FROM image_vectors v JOIN images i ON i.id=v.rowid WHERE v.embedding MATCH ?1 AND k=?2 ORDER BY v.distance"))?;
-        let rows = database(stmt.query_map(params![vector, limit as i64], |r| {
-            Ok((Self::row(r)?, r.get::<_, f32>(4)?))
-        }))?;
+        let hits = database(self.store.search(embedding, limit, None))?;
         let mut items = Vec::with_capacity(limit);
-        for row in rows {
-            let (asset, distance) = database(row)?;
-            ensure!(distance.is_finite(), "Invalid vector-search score");
-            let mut asset = Self::validate(asset)?;
+        for (row, distance) in hits {
+            let mut asset = Self::validate(Self::row(row))?;
             asset.similarity = Some((1.0 - distance).clamp(-1.0, 1.0));
             items.push(asset);
         }
@@ -227,12 +169,10 @@ impl AgentCatalog {
         let id = handle
             .strip_prefix("thumbnail_")
             .context("Invalid thumbnail handle")?;
-        let asset = self.metadata(id)?;
-        let cache: String = database(self.conn.query_row(
-            "SELECT thumbnail FROM images WHERE asset_id=?1",
-            [id],
-            |r| r.get(0),
-        ))?;
+        validate_asset_id(id)?;
+        let record = database(self.store.asset(id, false))?;
+        let cache = record.thumbnail.clone();
+        let asset = Self::validate(Self::row(record))?;
         let cache = Path::new(&cache);
         ensure!(
             cache.parent() == Some(self.thumbnails.as_path()),
@@ -362,6 +302,7 @@ fn open_cache_file(_: &Path, _: &str) -> Result<File> {
 mod tests {
     use super::*;
     use crate::{catalog::Catalog, Embedder, EMBEDDING_DIM};
+    use std::fs;
     struct Fake;
     impl Embedder for Fake {
         fn embed_image(&mut self, _: &image::RgbImage) -> Result<Vec<f32>> {
@@ -403,7 +344,7 @@ mod tests {
             agent.search(&embedding, 10).unwrap()[0].asset_id,
             asset.asset_id
         );
-        assert!(agent.conn.execute("DELETE FROM images", []).is_err());
+        assert!(agent.store.delete("true").is_err());
         assert!(agent.browse(0, 101).is_err());
         assert!(agent.browse(250001, 1).is_err());
         assert!(agent.metadata("../../private-originals/red.png").is_err());
@@ -415,35 +356,25 @@ mod tests {
     fn missing_or_wrong_catalog_is_never_created_or_migrated() {
         let root = tempfile::tempdir().unwrap();
         assert!(AgentCatalog::open(root.path()).is_err());
-        assert!(!root.path().join("search.db").exists());
-        let conn = Connection::open(root.path().join("search.db")).unwrap();
-        conn.execute_batch("PRAGMA application_id=123; PRAGMA user_version=7;")
-            .unwrap();
+        assert!(!root.path().join("catalog.lancedb").exists());
+        fs::create_dir(root.path().join("catalog.lancedb")).unwrap();
+        fs::write(root.path().join("catalog.lancedb/unrelated"), b"preserve").unwrap();
         assert!(AgentCatalog::open(root.path()).is_err());
         assert_eq!(
-            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            7
+            fs::read(root.path().join("catalog.lancedb/unrelated")).unwrap(),
+            b"preserve"
         );
     }
     #[test]
     fn malformed_catalog_metadata_fails_without_path_disclosure() {
         let (root, _desktop, agent) = fixture();
-        let writer = Connection::open(root.path().join("data/search.db")).unwrap();
-        writer
-            .execute(
-                "UPDATE images SET filename='/private/secrets/photo.png'",
-                [],
-            )
-            .unwrap();
+        let writer = Store::open(&root.path().join("data"), false).unwrap();
+        let id = agent.browse(0, 1).unwrap().items[0].asset_id.clone();
+        writer.update_for_test(&id, "filename", "/private/secrets/photo.png");
         let error = agent.browse(0, 10).unwrap_err().to_string();
         assert!(!error.contains("/private"));
-        writer
-            .execute(
-                "UPDATE images SET filename='photo.png', asset_id='legacy/path'",
-                [],
-            )
-            .unwrap();
+        writer.update_for_test(&id, "filename", "photo.png");
+        writer.update_for_test(&id, "asset_id", "legacy/path");
         assert!(agent.browse(0, 10).is_err());
     }
     #[cfg(unix)]
@@ -452,10 +383,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         let (root, _desktop, agent) = fixture();
         let asset = agent.browse(0, 1).unwrap().items.remove(0);
-        let cache: String = agent
-            .conn
-            .query_row("SELECT thumbnail FROM images", [], |r| r.get(0))
-            .unwrap();
+        let cache = agent.store.asset(&asset.asset_id, false).unwrap().thumbnail;
         let outside = root.path().join("private-originals/red.png");
         fs::remove_file(&cache).unwrap();
         symlink(&outside, &cache).unwrap();
@@ -463,23 +391,15 @@ mod tests {
         fs::remove_file(&cache).unwrap();
         fs::hard_link(&outside, &cache).unwrap();
         assert!(agent.thumbnail(&asset.thumbnail_handle).is_err());
-        let writer = Connection::open(root.path().join("data/search.db")).unwrap();
-        writer
-            .execute(
-                "UPDATE images SET thumbnail=?1",
-                [outside.to_str().unwrap()],
-            )
-            .unwrap();
+        let writer = Store::open(&root.path().join("data"), false).unwrap();
+        writer.update_for_test(&asset.asset_id, "thumbnail", outside.to_str().unwrap());
         assert!(agent.thumbnail(&asset.thumbnail_handle).is_err());
     }
     #[test]
     fn missing_or_legacy_thumbnail_never_reads_original_or_repairs() {
         let (_root, _desktop, agent) = fixture();
         let asset = agent.browse(0, 1).unwrap().items.remove(0);
-        let cache: String = agent
-            .conn
-            .query_row("SELECT thumbnail FROM images", [], |r| r.get(0))
-            .unwrap();
+        let cache = agent.store.asset(&asset.asset_id, false).unwrap().thumbnail;
         image::RgbImage::from_pixel(384, 384, image::Rgb([0, 0, 0]))
             .save(&cache)
             .unwrap();
@@ -495,10 +415,7 @@ mod tests {
     fn returned_thumbnail_strips_nonpixel_riff_payloads() {
         let (_root, _desktop, agent) = fixture();
         let asset = agent.browse(0, 1).unwrap().items.remove(0);
-        let cache: String = agent
-            .conn
-            .query_row("SELECT thumbnail FROM images", [], |r| r.get(0))
-            .unwrap();
+        let cache = agent.store.asset(&asset.asset_id, false).unwrap().thumbnail;
         let mut bytes = fs::read(&cache).unwrap();
         let secret = b"private-metadata";
         bytes.extend_from_slice(b"JUNK");
@@ -518,10 +435,7 @@ mod tests {
     fn cached_thumbnail_byte_limit_and_corruption_fail_visibly() {
         let (_root, _desktop, agent) = fixture();
         let asset = agent.browse(0, 1).unwrap().items.remove(0);
-        let cache: String = agent
-            .conn
-            .query_row("SELECT thumbnail FROM images", [], |r| r.get(0))
-            .unwrap();
+        let cache = agent.store.asset(&asset.asset_id, false).unwrap().thumbnail;
         fs::write(&cache, vec![0; MAX_THUMBNAIL_BYTES + 1]).unwrap();
         assert!(agent.thumbnail(&asset.thumbnail_handle).is_err());
         fs::write(&cache, b"not a WebP").unwrap();

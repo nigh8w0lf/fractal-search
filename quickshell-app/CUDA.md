@@ -13,7 +13,7 @@ build support, missing libraries and invalid GPUs fail visibly; the runtime neve
 retries a failed CUDA session on CPU.
 
 CUDA accelerates the native FG-CLIP2 vision and text ONNX sessions. Decoding,
-patch preparation, tokenization and SQLite retrieval remain on CPU. ONNX Runtime
+patch preparation, tokenization and LanceDB retrieval remain on CPU. ONNX Runtime
 also deliberately places small vision shape/control operations on CPU; startup
 logs state this. The validation below verifies that matrix and attention kernels
 execute on CUDA in both models. TF32 is disabled to preserve the FP32 embedding

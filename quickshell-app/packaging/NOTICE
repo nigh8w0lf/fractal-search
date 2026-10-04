@@ -1,11 +1,10 @@
 Fractal Search development bundle
 
-Native runtime: Rust, ONNX Runtime, SQLite/sqlite-vec, Hugging Face tokenizers,
-zbus, libheif and libjpeg-turbo. System libraries are provided by Omarchy packages;
+Native runtime: Rust, ONNX Runtime, LanceDB/Lance, Apache Arrow, Hugging Face
+tokenizers, zbus, libheif and libjpeg-turbo. System libraries are provided by Omarchy packages;
 ONNX Runtime is linked into the executable. Dependency licenses remain their
-respective owners' licenses (ONNX Runtime: MIT; SQLite: public domain;
-sqlite-vec: see its bundled Rust crate license; tokenizers: Apache-2.0; zbus: MIT;
-libheif: LGPL-3.0;
+respective owners' licenses (ONNX Runtime: MIT; LanceDB/Lance and Arrow:
+Apache-2.0; tokenizers: Apache-2.0; zbus: MIT; libheif: LGPL-3.0;
 libjpeg-turbo: IJG/BSD/zlib).
 
 CUDA-capable bundles additionally carry ONNX Runtime's CUDA/shared provider

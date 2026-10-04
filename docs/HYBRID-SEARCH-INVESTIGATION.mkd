@@ -1,0 +1,121 @@
+# Hybrid image and document search investigation
+
+Date: 2026-10-03
+Status: Research summary and proposed direction; not an implementation specification or approval to implement.
+
+## Scope and requirements
+
+Expand the standalone Fractal Search Quickshell app from image search to image and document search. Initial document formats are PDF, Word, Markdown and plain text, with a collection of fewer than 10,000 documents. “Hybrid” means combining BM25 keyword retrieval with semantic vector retrieval.
+
+Keep local processing, visible progress and actionable failures. Do not silently substitute models, providers or search modes. Preserve the existing image-search behavior and the separate read-only MCP permission boundary.
+
+## Repository context
+
+The investigation originally assumed SQLite plus sqlite-vec, which made SQLite FTS5 a natural BM25 companion. On saving this summary, the working tree's README, contributor guidance and source describe an in-progress LanceDB catalog migration. The original SQLite recommendation is therefore historical context, not a claim about the current backend.
+
+The retrieval design below remains applicable with either storage engine. Before implementation, settle the storage decision against the completed migration. Do not introduce a second database merely to reproduce the earlier recommendation. This investigation did not benchmark LanceDB hybrid search or validate its Rust full-text API against the project's pinned version.
+
+## Main recommendation
+
+Start with document extraction, passage indexing, BM25 plus dense semantic retrieval, and Reciprocal Rank Fusion (RRF). Evaluate quality and latency before adding query expansion or a reranker.
+
+```text
+PDF / Word / Markdown / text
+              |
+       extract structured text
+              |
+  passages + title + page/heading + source identity
+              |
+       +------+------+
+       |             |
+ keyword index   text embeddings
+    (BM25)       (vector index)
+       |             |
+       +------+------+
+              |
+       ranked-list fusion
+              |
+  group by document + best matching passage
+```
+
+Use a dedicated document embedding model. Preserve FG-CLIP2 for image search; its existing short text mode and image-oriented embedding contract are not a substitute for evaluating document retrieval.
+
+Hybrid search does not require a multi-vector model. A conventional embedding model produces one vector per passage. A document can have many passage vectors without token-level late interaction such as ColBERT. BM25 operates independently over indexed text; fusion combines the ranked results. sqlite-vec stores and searches vectors; it does not generate them.
+
+Do not directly add raw BM25 and cosine scores: their scales differ. RRF merges ranks and provides a straightforward baseline. Define whether fusion operates on passages or documents, then deduplicate and cap repeated matches so long documents do not dominate results.
+
+## What qmd demonstrates
+
+Reference: [tobi/qmd](https://github.com/tobi/qmd). Findings reflect the main branch inspected during this investigation, not a pinned release or a local performance test.
+
+qmd uses SQLite FTS5 for lexical retrieval and sqlite-vec for dense vectors. Its hybrid pipeline probes BM25, optionally expands the query, routes lexical and semantic variants to their respective retrieval paths, merges results with RRF, then reranks selected passages and blends the ranking signals. Original-query retrieval lists receive extra weight. Final results are deduplicated by file.
+
+Useful ideas to adapt:
+
+- Split documents at meaningful structural boundaries and retain passage offsets.
+- Fingerprint embedding configuration, including model, formatting and chunking, to detect stale vectors.
+- Bound candidate counts and rerank relevant passages rather than entire long documents.
+- Keep indexing and embedding progress observable.
+- Provide retrieval diagnostics so relevance problems can be investigated.
+
+Source: [qmd indexing and retrieval implementation](https://github.com/tobi/qmd/blob/main/src/store.ts).
+
+qmd supports Node and Bun. Its package depends on better-sqlite3, sqlite-vec and node-llama-cpp. Fractal could integrate it through a subprocess or its MCP interface, but shipping it would add a JavaScript runtime, native dependencies and a separate inference lifecycle. It would also still require a PDF/Word extraction pipeline for our document scope.
+
+Sources: [package manifest](https://github.com/tobi/qmd/blob/main/package.json), [CLI, SDK and MCP documentation](https://github.com/tobi/qmd#readme).
+
+At inspection, its default models were EmbeddingGemma 300M for embedding, Qwen3 Reranker 0.6B for reranking, and a qmd 1.7B query-expansion model, using GGUF assets through llama.cpp. These assets cannot be loaded directly into Fractal's existing ONNX sessions. Reusing the same models would require a compatible inference backend or validated ONNX exports, plus model-specific redistribution review.
+
+Source: [qmd model configuration](https://github.com/tobi/qmd/blob/main/src/llm.ts).
+
+Recommendation: use qmd as a reference implementation and an evaluation baseline. Implement the initial retrieval pipeline in Fractal's Rust backend. Consider direct integration only if a prototype demonstrates that its relevance improvements justify the packaging and lifecycle costs. Preserve attribution if adapting code; qmd's code is [MIT licensed](https://github.com/tobi/qmd/blob/main/LICENSE), independently of model licenses.
+
+## Storage options considered
+
+| Option | Assessment |
+| --- | --- |
+| SQLite FTS5 + sqlite-vec | Natural fit for the earlier SQLite catalog. FTS5 supplies BM25 and sqlite-vec supplies vector retrieval; application code owns fusion. |
+| Tantivy + vector storage | Rust full-text engine worth considering if lexical requirements exceed the selected database's capabilities; adds index synchronization and lifecycle work. |
+| LanceDB | Now present in the working tree. Investigate native full-text/hybrid support in the exact Rust version before choosing an additional index. |
+
+Sources: [SQLite FTS5](https://www.sqlite.org/fts5.html), [sqlite-vec](https://github.com/asg017/sqlite-vec), [Tantivy](https://github.com/quickwit-oss/tantivy), [LanceDB hybrid search](https://docs.lancedb.com/search/hybrid-search).
+
+Fewer than 10,000 files does not establish vector-search cost: a large PDF collection may produce hundreds of thousands of passages. Measure passage count, vector dimensions, index size, indexing throughput and query latency on representative data.
+
+## Extraction and model candidates
+
+Evaluate [Kreuzberg's Rust API](https://docs.kreuzberg.dev/reference/api-rust/) as a native integration candidate. [Docling](https://docling-project.github.io/docling/) is another candidate for structured document conversion, with a separate runtime/deployment tradeoff. Neither was installed or benchmarked during this investigation.
+
+Start Word support with DOCX; treat legacy DOC as a separate compatibility decision. Detect scanned or image-only PDF pages and expose their OCR status. Preserve page numbers, headings and source offsets. Report encrypted, unreadable and unsupported files explicitly rather than silently treating them as empty documents.
+
+Text embedding candidates for evaluation:
+
+| Model | Reason to evaluate |
+| --- | --- |
+| [BGE-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) | Compact English baseline; 384 dimensions and a 512-token input limit. |
+| [EmbeddingGemma 300M](https://huggingface.co/google/embeddinggemma-300m) | Multilingual candidate used by qmd; validate deployment format and runtime compatibility. |
+| [Nomic Embed Text v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) | Longer-context candidate; evaluate quality, resource use and export compatibility. |
+| [BGE-M3](https://huggingface.co/BAAI/bge-m3) | Dense, sparse and multi-vector capabilities; defer its additional complexity until a baseline shows a need. |
+
+No model has been selected. Match passage sizes to the actual tokenizer and input limit, including required prefixes. Persist the model/profile and extraction/chunking versions so incompatible embeddings cannot mix.
+
+## UX and MCP implications
+
+- Offer image/document filtering and document result rows with a title, useful snippet and page or heading.
+- Keep fast search responsive; measure any expansion or reranking stage before enabling it for each live query.
+- Show indexing, embedding and OCR progress, including partial failures and missing requirements.
+- Keep image and document embedding spaces separate. A combined results view needs explicit ranking behavior; raw distances across different models are not comparable.
+- Decide explicitly whether MCP may return extracted document text. The current metadata/thumbnail boundary does not automatically authorize document-content exposure. Bound responses and preserve opaque identities and strict input validation.
+
+## Suggested validation and next decisions
+
+1. Confirm the final catalog backend and its supported Rust full-text APIs.
+2. Build a temporary extraction/indexing prototype covering all four requested formats, including scanned, encrypted and malformed examples.
+3. Create 50–100 representative queries with known relevant documents, including exact names, identifiers, paraphrases and mixed lexical/semantic queries.
+4. Compare BM25-only, vector-only and RRF hybrid results; measure ranking quality, latency, memory, index size and update/delete correctness.
+5. Compare with qmd on the same extracted text, documenting model and configuration differences.
+6. Add a bounded reranker only if measured relevance gains justify its latency and memory. Evaluate query expansion separately afterward.
+
+Open decisions: language coverage, legacy DOC support, OCR engine and activation policy, text embedding model, passage sizing, full-text storage integration, combined image/document ranking, and MCP content permissions.
+
+This summary records source review and architectural recommendations. It does not claim implemented document search, successful extraction tests, measured performance or validated model exports.

@@ -1,4 +1,4 @@
-//! Filesystem notifications enqueue rescans; only the main worker touches models/SQLite.
+//! Filesystem notifications enqueue rescans; only the main worker touches models/LanceDB.
 use anyhow::{Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{

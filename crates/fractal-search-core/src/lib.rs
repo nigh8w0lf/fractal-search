@@ -20,3 +20,6 @@ pub fn initialize_image_decoders() {
     static INITIALIZE: std::sync::Once = std::sync::Once::new();
     INITIALIZE.call_once(libheif_rs::integration::image::register_all_decoding_hooks);
 }
+
+#[cfg(feature = "catalog")]
+mod store;

@@ -32,7 +32,7 @@ cargo build -p fractal-search --bin fractal-search-mcp --locked
 target/debug/fractal-search-mcp --data-dir /absolute/path/to/fractal-search
 ```
 
-The default catalog is `$XDG_DATA_HOME/fractal-search/search.db` (normally `~/.local/share/fractal-search/search.db`). The process can run while the desktop service indexes the catalog. It opens SQLite read-only, validates the application/schema/model profile, and does not acquire the desktop service lock, migrate data, create folders or checkpoint the database. Missing or incompatible catalogs return visible tool errors.
+The default catalog is `$XDG_DATA_HOME/fractal-search/catalog.lancedb/` (normally `~/.local/share/fractal-search/catalog.lancedb/`). The process can run while the desktop service indexes the catalog. Each read pins a LanceDB table snapshot containing both metadata and vectors. It validates the schema/model profile and does not acquire the desktop service lock, create a catalog, write records or repair caches. Missing or incompatible catalogs return visible tool errors. This development format requires fresh indexing; no SQLite migration is provided.
 
 `--model-dir` overrides model selection. Otherwise the first semantic search reads `modelDirectory` from the plugin's `settings.json`, or uses `$XDG_CACHE_HOME/fractal-search/models/fgclip2-33f3b9d4` when no settings exist. Missing or malformed settings/assets fail visibly. No model files are downloaded by the MCP process. `--threads` accepts 1–64; the default is half the logical CPU count, rounded up and capped at six.
 

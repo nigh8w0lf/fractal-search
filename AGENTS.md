@@ -21,7 +21,7 @@ The root Cargo workspace contains `crates/fractal-search-core` and `quickshell-a
 - Reuse `ResultActions.qml` for **Open image** and **Show in folder**, including list-only/narrow results. Reuse `SearchConfirmationDialog.qml` for removal and Ctrl+Q/Stop service; Cancel is the default focus. Do not add a Browse all photos action. Current layouts are list-and-preview and list-only, not a grid.
 - Shared QML controls and `SearchTheme` use Omarchy Color/Style/font tokens. Register new components in `ui/qmldir`; packaging copies QML components automatically. Avoid duplicating styled controls or embedding runtime details in normal search flows.
 - `backend/src/daemon.rs` owns the resident socket service and worker process; `main.rs` owns command admission, settings and synchronous work. `models.rs`, `watch.rs` and `diagnostics.rs` handle setup, watching and dependency checks.
-- Core `catalog.rs` owns SQLite/sqlite-vec, asset IDs, caches and indexing. `runtime.rs` / `preprocess.rs` / `embeddings.rs` own model inference and preprocessing. `agent.rs` provides the read-only catalog API used by the MCP binary and its transport module.
+- Core `catalog.rs` owns asset IDs, caches and indexing; `store.rs` owns LanceDB metadata, vectors and snapshot queries. `runtime.rs` / `preprocess.rs` / `embeddings.rs` own model inference and preprocessing. `agent.rs` provides the read-only catalog API used by the MCP binary and its transport module.
 
 ## UI and lifecycle invariants
 
@@ -30,7 +30,7 @@ The root Cargo workspace contains `crates/fractal-search-core` and `quickshell-a
 - Release focus for external viewers and native pickers, then restore promptly on summon. Retest repeated viewer close/resummon with both hide-after-opening settings; delays here are a known regression risk.
 - Use `PortalFolderDialog.qml` and the native Rust picker. Do not instantiate QtQuick.Dialogs FolderDialog in the shared shell: its GTK/GVfs integration can abort the host. Cancellation must close the portal request; errors stay visible.
 - Parent item popups to the persistent canvas, close them before hiding, and restore search focus afterwards. Keep confirmations bounded and long content scrollable.
-- Hide/reload detaches UI without stopping indexing. Ctrl+Q asks to drain and stop the backend; the explicit plugin quit method is immediate admission to the same safe shutdown. Finish the active image, commit/checkpoint and release the worker before exit.
+- Hide/reload detaches UI without stopping indexing. Ctrl+Q asks to drain and stop the backend; the explicit plugin quit method is immediate admission to the same safe shutdown. Finish the active image, commit and release the worker before exit.
 - Completed notices can be dismissed, but skipped-file reports remain under Folders until the next scan and new errors must reappear. Never erase active progress to make the UI look idle.
 
 ## Data, inference and interface rules

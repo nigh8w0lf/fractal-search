@@ -86,6 +86,13 @@ def data(reply):
     return reply["result"]["structuredContent"]
 
 
+def catalog_hashes(catalog):
+    return {
+        str(path.relative_to(catalog)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (catalog / "catalog.lancedb").rglob("*") if path.is_file()
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("backend", type=pathlib.Path)
@@ -109,7 +116,8 @@ def main():
             assert indexed["indexed"] == 2, indexed
             # No agent operation may depend on originals, even for thumbnails.
             shutil.rmtree(photos)
-            original_hash = hashlib.sha256((catalog / "search.db").read_bytes()).hexdigest()
+            original_hashes = catalog_hashes(catalog)
+            assert original_hashes
             mcp = Mcp(binary, catalog, root / "missing-models", root / "metadata.log")
             tools = mcp.call("tools/list")["result"]["tools"]
             assert {tool["name"] for tool in tools} == {"status", "browse_assets", "search_assets", "get_asset_metadata", "get_thumbnail"}
@@ -138,7 +146,7 @@ def main():
             assert not any(str(root) in json.dumps(message) or "file://" in json.dumps(message) for message in mcp.history)
             mcp.stop()
             assert "Loaded text.onnx" not in (root / "metadata.log").read_text()
-            assert hashlib.sha256((catalog / "search.db").read_bytes()).hexdigest() == original_hash
+            assert catalog_hashes(catalog) == original_hashes
             # Server and desktop remain concurrent. Model loads only for search.
             mcp = Mcp(binary, catalog, models, root / "search.log")
             assert data(mcp.tool("status"))["textModelLoaded"] is False

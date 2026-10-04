@@ -1,6 +1,6 @@
 # Fractal Search
 
-A local image-search app for Omarchy Shell. Add photo folders, describe an image, and open a matching original in your viewer or file manager. The Quickshell panel uses native Rust FG-CLIP2 inference and a SQLite/sqlite-vec catalog. CPU and explicitly selected NVIDIA CUDA inference are supported. A separate read-only MCP server makes the indexed library available to agent clients.
+A local image-search app for Omarchy Shell. Add photo folders, describe an image, and open a matching original in your viewer or file manager. The Quickshell panel uses native Rust FG-CLIP2 inference and a LanceDB catalog. CPU and explicitly selected NVIDIA CUDA inference are supported. A separate read-only MCP server makes the indexed library available to agent clients.
 
 This repository is the complete standalone project: both Cargo workspace members, UI, installer and validation tools live here. The production runtime has no Python dependency. New contributors should read this file and [AGENTS.md](AGENTS.md); together they cover the product, architecture, workflow and constraints. Scoped instructions in [quickshell-app/AGENTS.md](quickshell-app/AGENTS.md) also apply when editing that directory.
 
@@ -95,7 +95,7 @@ Defaults below follow XDG configuration/data/cache roots:
 | --- | --- |
 | `~/.config/omarchy/plugins/fractal.search/` | Installed plugin and stable MCP launcher. |
 | `~/.config/systemd/user/fractal-search.service` | User service. |
-| `~/.local/share/fractal-search/` | `search.db`, `settings.json`, thumbnails, previews and service lock. |
+| `~/.local/share/fractal-search/` | `catalog.lancedb/`, `settings.json`, thumbnails, previews and service lock. |
 | `~/.local/share/fractal-search/runtime/<version>/` | Versioned runtime bundles. |
 | `~/.cache/fractal-search/models/fgclip2-33f3b9d4/` | Verified model assets. |
 | `$XDG_RUNTIME_DIR/fractal-search/backend.sock` | Private desktop socket. |
@@ -120,3 +120,11 @@ A source edit is not an installed update: rebuild/package/install to change the 
 - [Model contract and reference fixtures](docs/MODELS.md)
 
 This is a local development project. Model weights and generated bundles are not checked in. Public release/signing and redistribution review remain separate work; preserve [bundle notices](quickshell-app/packaging/NOTICE).
+
+## LanceDB catalog format
+
+LanceDB stores folder records, image metadata and normalized vectors in `catalog.lancedb/`. Each image update commits metadata and its vector together; folder removal commits the source and its images together. Read-only MCP queries pin a table snapshot. Search uses exact cosine distance with folder filtering before ranking.
+
+This development format has no SQLite migration. Use a fresh `--data-dir /absolute/new/catalog` and index the desired folders. The model profile and opaque asset identities are unchanged. Lance versions are retained for concurrent readers; automatic compaction/version cleanup is not implemented yet.
+
+Builds require Rust 1.91 or newer and the Protocol Buffers compiler (`protoc`). LanceDB is pinned to 0.37.1 with cloud/remote features disabled; 0.38.0 and 0.39.0 have an upstream local-only compilation error in their job error handling.

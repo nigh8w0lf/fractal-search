@@ -1,8 +1,8 @@
-//! Search-only SQLite catalog and incremental indexing. Originals are never modified.
+//! LanceDB catalog and incremental indexing. Originals are never modified.
+use crate::store::{image_filter, quote, Record, Store};
 use crate::{preprocess::decode_image, Embedder, EMBEDDING_DIM, MODEL_PROFILE};
 use anyhow::{ensure, Context, Result};
 use image::{codecs::webp::WebPEncoder, ExtendedColorType, RgbImage};
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -10,14 +10,12 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::OnceLock,
     time::{Instant, UNIX_EPOCH},
 };
 use url::Url;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-pub(crate) const APPLICATION_ID: i64 = 0x46535243;
 const MAX_FILES: usize = 250_000;
 const MAX_RESULTS: usize = 1000;
 const MAX_REPORTED_FAILURES: usize = 100;
@@ -136,32 +134,11 @@ struct Stamp {
 
 #[derive(Debug)]
 pub struct Catalog {
-    conn: Connection,
+    store: Store,
     thumbnails: PathBuf,
     previews: PathBuf,
 }
 
-pub(crate) fn register_vectors() -> Result<()> {
-    static REGISTER: OnceLock<Result<(), String>> = OnceLock::new();
-    REGISTER
-        .get_or_init(|| {
-            // sqlite-vec exports the SQLite extension entry point; SQLite retains it
-            // for every subsequently opened connection in this process.
-            let code = unsafe {
-                rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                    sqlite_vec::sqlite3_vec_init as *const (),
-                )))
-            };
-            if code == rusqlite::ffi::SQLITE_OK {
-                Ok(())
-            } else {
-                Err(format!("Register sqlite-vec: SQLite error {code}"))
-            }
-        })
-        .as_ref()
-        .map_err(|error| anyhow::anyhow!(error.clone()))?;
-    Ok(())
-}
 fn text_path(path: &Path) -> Result<&str> {
     path.to_str()
         .context("Image search requires UTF-8 filesystem paths")
@@ -190,7 +167,7 @@ fn validate_page(offset: usize, limit: usize) -> Result<()> {
     );
     Ok(())
 }
-pub(crate) fn vector_bytes(values: &[f32]) -> Result<Vec<u8>> {
+pub(crate) fn validate_embedding(values: &[f32]) -> Result<()> {
     ensure!(
         values.len() == EMBEDDING_DIM && values.iter().all(|v| v.is_finite()),
         "Invalid 768-D image-search embedding"
@@ -204,7 +181,7 @@ pub(crate) fn vector_bytes(values: &[f32]) -> Result<Vec<u8>> {
         (norm - 1.0).abs() < 0.0001,
         "Image-search embedding must be normalized (norm={norm})"
     );
-    Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+    Ok(())
 }
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension(format!("{}.part", Uuid::new_v4()));
@@ -257,89 +234,50 @@ fn thumbnail(image: &RgbImage) -> Result<Vec<u8>> {
 
 impl Catalog {
     pub fn open(data_dir: &Path) -> Result<Self> {
-        register_vectors()?;
         fs::create_dir_all(data_dir)
             .with_context(|| format!("Create search data directory {data_dir:?}"))?;
         let data_dir = data_dir.canonicalize()?;
-        let mut conn = Connection::open(data_dir.join("search.db"))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let id: i64 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version == 0 {
-            let tables: usize = conn.query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='table'",
-                [],
-                |r| r.get(0),
-            )?;
-            ensure!(
-                id == 0 && tables == 0,
-                "Refusing to initialize an existing unrelated database as an image-search catalog"
-            );
-            let tx = conn.transaction()?;
-            tx.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE sources (id INTEGER PRIMARY KEY, directory TEXT NOT NULL UNIQUE);
-                CREATE TABLE images (id INTEGER PRIMARY KEY, asset_id TEXT NOT NULL UNIQUE,
-                source_id INTEGER NOT NULL REFERENCES sources(id), path TEXT NOT NULL UNIQUE,
-                filename TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
-                bytes INTEGER NOT NULL, modified TEXT NOT NULL, thumbnail TEXT NOT NULL);
-                CREATE INDEX images_source ON images(source_id);
-                CREATE VIRTUAL TABLE image_vectors USING vec0(embedding float[768] distance_metric=cosine);
-                PRAGMA application_id=1179865667; PRAGMA user_version=1;")?;
-            tx.execute(
-                "INSERT INTO settings VALUES ('model_profile', ?1)",
-                [MODEL_PROFILE],
-            )?;
-            tx.commit()?;
-        } else {
-            ensure!(
-                id == APPLICATION_ID && version == 1,
-                "Unsupported or unrelated search catalog: application_id={id}, version={version}"
-            );
-            let profile: String = conn.query_row(
-                "SELECT value FROM settings WHERE key='model_profile'",
-                [],
-                |r| r.get(0),
-            )?;
-            ensure!(profile == MODEL_PROFILE, "Catalog embedding profile {profile:?} differs from {MODEL_PROFILE:?}; use a separate catalog and reindex");
-        }
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
-        )?;
+        let store = Store::open(&data_dir, false)?;
         let thumbnails = data_dir.join("thumbnails");
         let previews = data_dir.join("previews");
         fs::create_dir_all(&thumbnails)?;
         fs::create_dir_all(&previews)?;
         Ok(Self {
-            conn,
+            store,
             thumbnails,
             previews,
         })
     }
     pub fn status(&self) -> Result<CatalogStatus> {
-        let image_count = self
-            .conn
-            .query_row("SELECT count(*) FROM images", [], |r| r.get(0))?;
-        let sources = self.conn.prepare("SELECT s.id,s.directory,count(i.id) FROM sources s LEFT JOIN images i ON i.source_id=s.id GROUP BY s.id ORDER BY s.directory")?
-            .query_map([], |r| Ok(Source { id: r.get(0)?, directory: r.get(1)?, image_count: r.get(2)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let (image_count, rows) = self.store.status()?;
+        let mut sources = rows
+            .into_iter()
+            .map(|(row, image_count)| Source {
+                id: row.source_id,
+                directory: row.path,
+                image_count,
+            })
+            .collect::<Vec<_>>();
+        sources.sort_by(|a, b| a.directory.cmp(&b.directory));
         Ok(CatalogStatus {
             image_count,
             sources,
             model_profile: MODEL_PROFILE,
         })
     }
-    fn asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Asset, PathBuf)> {
-        Ok((
+    fn asset(row: Record) -> (Asset, PathBuf) {
+        (
             Asset {
-                asset_id: row.get(0)?,
-                filename: row.get(1)?,
-                path: row.get(2)?,
+                asset_id: row.asset_id,
+                filename: row.filename,
+                path: row.path,
                 thumbnail_url: String::new(),
-                width: row.get(4)?,
-                height: row.get(5)?,
+                width: row.width,
+                height: row.height,
                 similarity: None,
             },
-            PathBuf::from(row.get::<_, String>(3)?),
-        ))
+            PathBuf::from(row.thumbnail),
+        )
     }
     fn complete_asset(&self, (mut asset, thumbnail): (Asset, PathBuf)) -> Result<Asset> {
         ensure!(
@@ -356,11 +294,8 @@ impl Catalog {
             );
             // Repair the earlier square-cache format lazily, without loading
             // models or regenerating stored embeddings.
-            let (bytes, modified): (u64, String) = self.conn.query_row(
-                "SELECT bytes,modified FROM images WHERE asset_id=?1",
-                [&asset.asset_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
+            let record = self.store.asset(&asset.asset_id, false)?;
+            let (bytes, modified) = (record.bytes, record.modified);
             let original = Path::new(&asset.path);
             let indexed_stamp = Stamp { bytes, modified };
             ensure!(
@@ -386,15 +321,14 @@ impl Catalog {
     }
     pub fn source_directory(&self, source_id: i64) -> Result<PathBuf> {
         ensure!(source_id > 0, "Source ID must be positive");
-        self.conn
-            .query_row(
-                "SELECT directory FROM sources WHERE id=?1",
-                [source_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(PathBuf::from)
-            .context("Indexed folder does not exist")
+        let record = self
+            .store
+            .get(
+                &format!("kind = 'source' AND source_id = {source_id}"),
+                false,
+            )?
+            .context("Indexed folder does not exist")?;
+        Ok(PathBuf::from(record.path))
     }
     pub fn browse_source(
         &self,
@@ -406,16 +340,10 @@ impl Catalog {
         if let Some(id) = source_id {
             self.source_directory(id)?;
         }
-        let total = self.conn.query_row(
-            "SELECT count(*) FROM images WHERE (?1 IS NULL OR source_id=?1)",
-            [source_id],
-            |r| r.get(0),
-        )?;
-        let rows = self.conn.prepare("SELECT asset_id,filename,path,thumbnail,width,height FROM images WHERE (?3 IS NULL OR source_id=?3) ORDER BY filename COLLATE NOCASE,asset_id LIMIT ?1 OFFSET ?2")?
-            .query_map(params![limit as i64, offset as i64, source_id], Self::asset)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let (total, rows) = self.store.browse(offset, limit, source_id)?;
         let items = rows
             .into_iter()
-            .map(|r| self.complete_asset(r))
+            .map(|r| self.complete_asset(Self::asset(r)))
             .collect::<Result<_>>()?;
         Ok(Page {
             items,
@@ -440,34 +368,14 @@ impl Catalog {
         if let Some(id) = source_id {
             self.source_directory(id)?;
         }
-        let vector = vector_bytes(query_embedding)?;
-        // Apply the rowid constraint inside vec0's KNN query, before ranking;
-        // filtering the global top-k afterward would omit valid folder hits.
-        let sql = if source_id.is_some() {
-            "SELECT i.asset_id,i.filename,i.path,i.thumbnail,i.width,i.height,v.distance FROM image_vectors v JOIN images i ON i.id=v.rowid WHERE v.embedding MATCH ?1 AND k=?2 AND v.rowid IN (SELECT id FROM images WHERE source_id=?3) ORDER BY v.distance"
-        } else {
-            "SELECT i.asset_id,i.filename,i.path,i.thumbnail,i.width,i.height,v.distance FROM image_vectors v JOIN images i ON i.id=v.rowid WHERE v.embedding MATCH ?1 AND k=?2 ORDER BY v.distance"
-        };
-        let mut args = vec![
-            rusqlite::types::Value::Blob(vector),
-            rusqlite::types::Value::Integer(limit as i64),
-        ];
-        if let Some(id) = source_id {
-            args.push(rusqlite::types::Value::Integer(id));
-        }
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(args), |r| {
-                Ok((Self::asset(r)?, r.get::<_, f32>(6)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = self.store.search(query_embedding, limit, source_id)?;
         let mut assets = Vec::with_capacity(rows.len());
         for (asset, distance) in rows {
             ensure!(
                 distance.is_finite(),
                 "Vector search returned a non-finite distance"
             );
-            let mut asset = self.complete_asset(asset)?;
+            let mut asset = self.complete_asset(Self::asset(asset))?;
             asset.similarity = Some((1.0 - distance).clamp(-1.0, 1.0));
             assets.push(asset);
         }
@@ -479,56 +387,44 @@ impl Catalog {
         });
         Ok(assets)
     }
-    /// Remove this source's index and generated caches, never its originals.
-    /// Batches keep memory bounded and each committed batch keeps vectors and
-    /// metadata consistent even if a later cache deletion fails visibly.
+    /// Remove the source and its images in one Lance commit, then delete caches.
     pub fn remove_source(&mut self, source_id: i64) -> Result<usize> {
         self.source_directory(source_id)?;
-        let mut removed = 0;
-        loop {
-            let rows = self
-                .conn
-                .prepare("SELECT id,thumbnail,asset_id FROM images WHERE source_id=?1 LIMIT 1000")?
-                .query_map([source_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            if rows.is_empty() {
-                break;
-            }
-            let tx = self.conn.transaction()?;
-            for (id, _, _) in &rows {
-                tx.execute("DELETE FROM image_vectors WHERE rowid=?1", [id])?;
-                tx.execute("DELETE FROM images WHERE id=?1", [id])?;
-            }
-            tx.commit()?;
-            removed += rows.len();
-            for (_, thumbnail, asset_id) in rows {
-                self.remove_cache(Path::new(&thumbnail))?;
-                self.remove_cache(&self.previews.join(format!("{asset_id}.png")))?;
-            }
+        let rows = self
+            .store
+            .list(&image_filter(Some(source_id)), MAX_FILES + 1, false)?;
+        ensure!(rows.len() <= MAX_FILES, "Source exceeds image limit");
+        self.store.delete(&format!("source_id = {source_id}"))?;
+        for row in &rows {
+            self.remove_cache(Path::new(&row.thumbnail))?;
+            self.remove_cache(&self.previews.join(format!("{}.png", row.asset_id)))?;
         }
-        self.conn
-            .execute("DELETE FROM sources WHERE id=?1", [source_id])?;
-        Ok(removed)
+        Ok(rows.len())
     }
     fn source(&mut self, directory: &Path) -> Result<i64> {
-        for source in self.status()?.sources {
-            let other = Path::new(&source.directory);
+        let sources = self.store.list("kind = 'source'", MAX_FILES + 1, false)?;
+        ensure!(sources.len() < MAX_FILES, "Catalog source limit reached");
+        let mut id = 1;
+        for source in sources {
+            let other = Path::new(&source.path);
             if directory == other {
-                return Ok(source.id);
+                return Ok(source.source_id);
             }
-            ensure!(!directory.starts_with(other) && !other.starts_with(directory), "Folder overlaps an existing source: {}. Rescan the existing source or choose a separate folder", source.directory);
+            ensure!(!directory.starts_with(other) && !other.starts_with(directory), "Folder overlaps an existing source: {}. Rescan the existing source or choose a separate folder", source.path);
+            ensure!(
+                source.source_id > 0 && source.source_id < i64::from(i32::MAX),
+                "Invalid or exhausted catalog source IDs"
+            );
+            id = id.max(source.source_id + 1);
         }
-        self.conn.execute(
-            "INSERT INTO sources(directory) VALUES (?1)",
-            [text_path(directory)?],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        self.store.upsert(&Record {
+            kind: "source".into(),
+            asset_id: format!("source_{}", Uuid::new_v4()),
+            source_id: id,
+            path: text_path(directory)?.to_owned(),
+            ..Record::default()
+        })?;
+        Ok(id)
     }
     pub fn index<E: Embedder>(
         &mut self,
@@ -617,21 +513,17 @@ impl Catalog {
                     continue;
                 }
             };
-            let existing: Option<(i64, String, u64, String, String)> = self
-                .conn
-                .query_row(
-                    "SELECT id,asset_id,bytes,modified,thumbnail FROM images WHERE path=?1",
-                    [path_text],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                )
-                .optional()?;
+            let existing = self.store.get(
+                &format!("kind = 'image' AND path = {}", quote(path_text)),
+                false,
+            )?;
             let unchanged = existing
                 .as_ref()
-                .is_some_and(|row| row.2 == before.bytes && row.3 == before.modified);
+                .is_some_and(|row| row.bytes == before.bytes && row.modified == before.modified);
             if unchanged
                 && existing
                     .as_ref()
-                    .is_some_and(|row| Path::new(&row.4).is_file())
+                    .is_some_and(|row| Path::new(&row.thumbnail).is_file())
             {
                 state.unchanged += 1;
             } else {
@@ -645,14 +537,20 @@ impl Catalog {
                 };
                 let decode_ms = start.elapsed().as_secs_f64() * 1000.0;
                 let embedding = if unchanged {
-                    None
+                    let id = &existing
+                        .as_ref()
+                        .context("Unchanged image record is missing")?
+                        .asset_id;
+                    self.store
+                        .asset(id, true)?
+                        .embedding
+                        .context("Indexed image is missing its embedding")?
                 } else {
-                    Some(vector_bytes(
-                        &embedder
-                            .embed_image(&image)
-                            .with_context(|| format!("Embed image {path:?}"))?,
-                    )?)
+                    embedder
+                        .embed_image(&image)
+                        .with_context(|| format!("Embed image {path:?}"))?
                 };
+                validate_embedding(&embedding)?;
                 let source_check = stamp(path).and_then(|after| {
                     ensure!(before == after, "Image changed during indexing: {path:?}; rescan after it finishes changing");
                     Ok(())
@@ -664,7 +562,7 @@ impl Catalog {
                 }
                 let asset_id = existing
                     .as_ref()
-                    .map(|r| r.1.clone())
+                    .map(|r| r.asset_id.clone())
                     .unwrap_or_else(|| format!("asset_{}", Uuid::new_v4()));
                 let digest = format!(
                     "{:x}",
@@ -679,26 +577,24 @@ impl Catalog {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .context("Image has no UTF-8 filename")?;
-                let tx = self.conn.transaction()?;
-                tx.execute("INSERT INTO images(asset_id,source_id,path,filename,width,height,bytes,modified,thumbnail) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(path) DO UPDATE SET width=excluded.width,height=excluded.height,bytes=excluded.bytes,modified=excluded.modified,thumbnail=excluded.thumbnail",
-                    params![asset_id,source_id,path_text,filename,image.width(),image.height(),before.bytes,before.modified,text_path(&cache)?])?;
-                let row_id: i64 =
-                    tx.query_row("SELECT id FROM images WHERE path=?1", [path_text], |r| {
-                        r.get(0)
-                    })?;
-                if let Some(embedding) = embedding {
-                    tx.execute("DELETE FROM image_vectors WHERE rowid=?1", [row_id])?;
-                    tx.execute(
-                        "INSERT INTO image_vectors(rowid,embedding) VALUES (?1,?2)",
-                        params![row_id, embedding],
-                    )?;
-                }
-                tx.commit()?;
+                self.store.upsert(&Record {
+                    kind: "image".into(),
+                    asset_id: asset_id.clone(),
+                    source_id,
+                    path: path_text.to_owned(),
+                    filename: filename.to_owned(),
+                    width: image.width(),
+                    height: image.height(),
+                    bytes: before.bytes,
+                    modified: before.modified.clone(),
+                    thumbnail: text_path(&cache)?.to_owned(),
+                    embedding: Some(embedding),
+                })?;
                 if let Some(old) = existing
                     .as_ref()
-                    .filter(|r| r.4 != text_path(&cache).expect("validated cache path"))
+                    .filter(|r| r.thumbnail != text_path(&cache).expect("validated cache path"))
                 {
-                    self.remove_cache(Path::new(&old.4))?;
+                    self.remove_cache(Path::new(&old.thumbnail))?;
                 }
                 let preview = self.previews.join(format!("{asset_id}.png"));
                 self.remove_cache(&preview)?;
@@ -718,29 +614,27 @@ impl Catalog {
             .map(|p| text_path(p).map(str::to_owned))
             .collect::<Result<_>>()?;
         let previous = self
-            .conn
-            .prepare("SELECT id,path,thumbnail,asset_id FROM images WHERE source_id=?1")?
-            .query_map([source_id], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .store
+            .list(&image_filter(Some(source_id)), MAX_FILES + 1, false)?;
+        ensure!(previous.len() <= MAX_FILES, "Source exceeds image limit");
+        let stale = previous
+            .into_iter()
+            .filter(|row| !seen.contains(&row.path))
+            .collect::<Vec<_>>();
         let mut removed = 0;
-        for (id, path, thumbnail, asset_id) in previous {
-            if seen.contains(&path) {
-                continue;
+        for rows in stale.chunks(1000) {
+            let ids = rows
+                .iter()
+                .map(|row| quote(&row.asset_id))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.store
+                .delete(&format!("kind = 'image' AND asset_id IN ({ids})"))?;
+            for row in rows {
+                self.remove_cache(Path::new(&row.thumbnail))?;
+                self.remove_cache(&self.previews.join(format!("{}.png", row.asset_id)))?;
+                removed += 1;
             }
-            let tx = self.conn.transaction()?;
-            tx.execute("DELETE FROM image_vectors WHERE rowid=?1", [id])?;
-            tx.execute("DELETE FROM images WHERE id=?1", [id])?;
-            tx.commit()?;
-            self.remove_cache(Path::new(&thumbnail))?;
-            self.remove_cache(&self.previews.join(format!("{asset_id}.png")))?;
-            removed += 1;
         }
         state.stage = "complete";
         state.failure = None;
@@ -765,15 +659,14 @@ impl Catalog {
                 .context("Invalid asset identifier")?,
         )
         .context("Invalid asset UUID")?;
-        let (path, bytes, modified, width, height): (String, u64, String, u32, u32) = self
-            .conn
-            .query_row(
-                "SELECT path,bytes,modified,width,height FROM images WHERE asset_id=?1",
-                [asset_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .optional()?
-            .context("Image is not in the search catalog")?;
+        let record = self.store.asset(asset_id, false)?;
+        let (path, bytes, modified, width, height) = (
+            record.path,
+            record.bytes,
+            record.modified,
+            record.width,
+            record.height,
+        );
         let path = Path::new(&path);
         let indexed_stamp = Stamp { bytes, modified };
         ensure!(
@@ -810,15 +703,8 @@ impl Catalog {
         file_url(&preview)
     }
     pub fn original_url(&self, asset_id: &str) -> Result<String> {
-        let path: String = self
-            .conn
-            .query_row(
-                "SELECT path FROM images WHERE asset_id=?1",
-                [asset_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .context("Image is not in the search catalog")?;
+        crate::agent::validate_asset_id(asset_id)?;
+        let path = self.store.asset(asset_id, false)?.path;
         ensure!(
             Path::new(&path).is_file(),
             "Original image is missing: {path}"
@@ -826,13 +712,7 @@ impl Catalog {
         file_url(Path::new(&path))
     }
     pub fn checkpoint(&self) -> Result<()> {
-        let (busy, _, _): (i64, i64, i64) =
-            self.conn
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })?;
-        ensure!(busy == 0, "Search catalog checkpoint is busy");
-        Ok(())
+        self.store.checkpoint()
     }
 }
 
@@ -978,14 +858,6 @@ mod tests {
         assert!(blue.join("blue-a.png").exists() && blue.join("blue-b.png").exists());
         assert_eq!(catalog.status().unwrap().image_count, 1);
         assert_eq!(catalog.search(&query, 10).unwrap().len(), 1);
-        assert_eq!(
-            catalog
-                .conn
-                .query_row("SELECT count(*) FROM image_vectors", [], |row| row
-                    .get::<_, usize>(0))
-                .unwrap(),
-            1
-        );
         assert!(catalog.browse_source(0, 1, Some(blue_id)).is_err());
         assert!(catalog.search_source(&query, 1, Some(0)).is_err());
         assert!(catalog.remove_source(blue_id).is_err());
@@ -1078,7 +950,7 @@ mod tests {
         );
     }
     #[test]
-    fn catalog_rejects_bad_profiles_overlaps_and_unbounded_queries() {
+    fn catalog_rejects_missing_storage_overlaps_and_unbounded_queries() {
         let root = tempfile::tempdir().unwrap();
         let data = root.path().join("data");
         let photos = root.path().join("photos");
@@ -1108,18 +980,16 @@ mod tests {
                 .index(&directory, &mut model, || false, |_| Ok(()))
                 .is_err());
         }
-        catalog
-            .conn
-            .execute(
-                "UPDATE settings SET value='different' WHERE key='model_profile'",
-                [],
-            )
-            .unwrap();
         drop(catalog);
+        fs::rename(
+            data.join("catalog.lancedb/assets.lance"),
+            data.join("catalog.lancedb/missing.lance"),
+        )
+        .unwrap();
         assert!(Catalog::open(&data)
             .unwrap_err()
             .to_string()
-            .contains("profile"));
+            .contains("missing"));
     }
 
     #[test]

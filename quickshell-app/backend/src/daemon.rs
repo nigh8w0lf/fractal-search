@@ -586,7 +586,7 @@ mod tests {
         assert!(hub.pending.is_empty());
         let refresh = hub.admit(0, None, &json!({"type":"status"})).unwrap();
         assert!(hub
-            .receive(json!({"id":refresh["id"],"ok":false,"error":"SQLite failure"}))
+            .receive(json!({"id":refresh["id"],"ok":false,"error":"Catalog failure"}))
             .is_err());
     }
     #[test]

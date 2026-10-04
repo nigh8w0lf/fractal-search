@@ -351,7 +351,7 @@ unsafe extern "C" fn stop_signal(_: libc::c_int) {
 }
 fn install_signals() -> Result<()> {
     // AtomicBool is lock-free here; the handler allocates nothing and only asks
-    // the worker to finish its active image. Model/SQLite cleanup stays on main.
+    // the worker to finish its active image. Model/LanceDB cleanup stays on main.
     for signal in [libc::SIGTERM, libc::SIGINT] {
         ensure!(
             unsafe { libc::signal(signal, stop_signal as *const () as libc::sighandler_t) }

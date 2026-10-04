@@ -55,7 +55,8 @@ def main():
         enabled_link.parent.mkdir(parents=True)
         enabled_link.symlink_to(unit)
         assert 'KillMode=mixed' in unit.read_text()
-        catalog = data / 'fractal-search/search.db'
+        catalog = data / 'fractal-search/catalog.lancedb/assets.lance/marker'
+        catalog.parent.mkdir(parents=True)
         catalog.write_bytes(b'untouched catalog marker')
         install(extra=['--skip-shell'])
         assert catalog.read_bytes() == b'untouched catalog marker'
