@@ -133,6 +133,7 @@ struct UiSettings {
     result_layout: ResultLayout,
     watch_changes: bool,
     close_after_opening: bool,
+    image_batch_size: usize,
 }
 impl Default for UiSettings {
     fn default() -> Self {
@@ -141,6 +142,7 @@ impl Default for UiSettings {
             result_layout: ResultLayout::ListPreview,
             watch_changes: false,
             close_after_opening: true,
+            image_batch_size: 1,
         }
     }
 }
@@ -149,6 +151,10 @@ impl UiSettings {
         ensure!(
             (1..=100).contains(&self.top_matches),
             "Top matches must be between 1 and 100"
+        );
+        ensure!(
+            (1..=fractal_search_core::MAX_IMAGE_BATCH_SIZE).contains(&self.image_batch_size),
+            "Image batch size must be between 1 and 8"
         );
         Ok(())
     }
@@ -159,8 +165,22 @@ struct Settings {
     model_directory: PathBuf,
     // Old prototype settings stored only the model path. This is the explicit
     // migration for those files; malformed or partial UI settings still fail.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_saved_ui_settings")]
     ui: UiSettings,
+}
+
+fn deserialize_saved_ui_settings<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<UiSettings, D::Error> {
+    let mut value = Value::deserialize(deserializer)?;
+    // Migrate only the new field in complete saved preferences. Desktop
+    // requests still require every field; malformed old settings stay errors.
+    if let Some(fields) = value.as_object_mut() {
+        if !fields.contains_key("imageBatchSize") {
+            fields.insert("imageBatchSize".into(), json!(1));
+        }
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
 fn emit(output: &Output, value: &Value) -> Result<()> {
@@ -277,9 +297,10 @@ fn status(
     theme_file: &Path,
     threads: usize,
     settings: &UiSettings,
+    active_image_batch_size: usize,
 ) -> Result<Value> {
     Ok(
-        json!({"protocolVersion":1,"catalog":catalog.status()?,"modelDirectory":runtime.model_dir(),"modelsPresent":runtime.assets_present(),"modelLoaded":runtime.loaded(),"textModelLoaded":runtime.text_loaded(),"textModelWarming":false,"provider":runtime.provider().name(),"deviceId":runtime.provider().device_id(),"threads":threads,"themeFile":theme_file,"settings":settings}),
+        json!({"protocolVersion":1,"catalog":catalog.status()?,"modelDirectory":runtime.model_dir(),"modelsPresent":runtime.assets_present(),"modelLoaded":runtime.loaded(),"textModelLoaded":runtime.text_loaded(),"textModelWarming":false,"provider":runtime.provider().name(),"deviceId":runtime.provider().device_id(),"threads":threads,"themeFile":theme_file,"settings":settings,"activeImageBatchSize":active_image_batch_size}),
     )
 }
 
@@ -396,6 +417,7 @@ fn serve(options: Options) -> Result<()> {
     ui_settings
         .validate()
         .context("Invalid saved UI settings")?;
+    let image_batch_size = ui_settings.image_batch_size;
     let model_dir = match options
         .model_dir
         .or_else(|| saved.as_ref().map(|s| s.model_directory.clone()))
@@ -428,7 +450,14 @@ fn serve(options: Options) -> Result<()> {
     if options.mode == "status" {
         return emit(
             &output,
-            &status(&catalog, &runtime, &theme_file, threads, &ui_settings)?,
+            &status(
+                &catalog,
+                &runtime,
+                &theme_file,
+                threads,
+                &ui_settings,
+                image_batch_size,
+            )?,
         );
     }
     let mut watcher = None;
@@ -436,7 +465,14 @@ fn serve(options: Options) -> Result<()> {
     // Expose catalog/setup immediately while the worker prepares search.
     // Missing assets stay in explicit first-run setup; startup never downloads.
     let warm_search = options.warm_search && runtime.assets_present();
-    let mut initial_status = status(&catalog, &runtime, &theme_file, threads, &ui_settings)?;
+    let mut initial_status = status(
+        &catalog,
+        &runtime,
+        &theme_file,
+        threads,
+        &ui_settings,
+        image_batch_size,
+    )?;
     initial_status["textModelWarming"] = json!(warm_search);
     emit(&output, &json!({"event":"ready","payload":initial_status}))?;
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -564,7 +600,7 @@ fn serve(options: Options) -> Result<()> {
                                 &output,
                                 &json!({"event":"indexStarted","payload":{"directory":path}}),
                             )?;
-                            let result = catalog.index(&path, &mut runtime,
+                            let result = catalog.index_with_batch_size(&path, &mut runtime, image_batch_size,
                                 || cancelled.load(Ordering::Relaxed) || STOP.load(Ordering::Relaxed),
                                 |progress| emit(&output, &json!({"id":null,"event":"indexProgress","payload":progress})));
                             cancelled.store(false, Ordering::Relaxed);
@@ -611,7 +647,14 @@ fn serve(options: Options) -> Result<()> {
         let is_index = matches!(request.command, Command::Index { .. });
         let refresh_watch = is_index || matches!(request.command, Command::RemoveSource { .. });
         let result: Result<Value> = (|| match request.command {
-            Command::Status {} => status(&catalog, &runtime, &theme_file, threads, &ui_settings),
+            Command::Status {} => status(
+                &catalog,
+                &runtime,
+                &theme_file,
+                threads,
+                &ui_settings,
+                image_batch_size,
+            ),
             Command::Browse {
                 offset,
                 limit,
@@ -674,9 +717,10 @@ fn serve(options: Options) -> Result<()> {
             Command::Index { directory } => {
                 search_cache = None;
                 let path = local_path(&directory)?;
-                let result = catalog.index(
+                let result = catalog.index_with_batch_size(
                     &path,
                     &mut runtime,
+                    image_batch_size,
                     || cancelled.load(Ordering::Relaxed) || STOP.load(Ordering::Relaxed),
                     |progress| {
                         emit(
@@ -715,7 +759,14 @@ fn serve(options: Options) -> Result<()> {
                 )?;
                 ui_settings = settings;
                 watcher = replacement;
-                status(&catalog, &runtime, &theme_file, threads, &ui_settings)
+                status(
+                    &catalog,
+                    &runtime,
+                    &theme_file,
+                    threads,
+                    &ui_settings,
+                    image_batch_size,
+                )
             }
             Command::SetModelDirectory { directory } => {
                 let path = local_path(&directory)?.canonicalize()?;
@@ -731,7 +782,14 @@ fn serve(options: Options) -> Result<()> {
                 )?;
                 runtime = replacement;
                 search_cache = None;
-                status(&catalog, &runtime, &theme_file, threads, &ui_settings)
+                status(
+                    &catalog,
+                    &runtime,
+                    &theme_file,
+                    threads,
+                    &ui_settings,
+                    image_batch_size,
+                )
             }
             Command::InstallModels {} => {
                 models::install(
@@ -745,7 +803,14 @@ fn serve(options: Options) -> Result<()> {
                     },
                 )?;
                 runtime.verify()?;
-                status(&catalog, &runtime, &theme_file, threads, &ui_settings)
+                status(
+                    &catalog,
+                    &runtime,
+                    &theme_file,
+                    threads,
+                    &ui_settings,
+                    image_batch_size,
+                )
             }
             Command::Theme {} => theme(&theme_file),
             Command::Cancel {} | Command::Shutdown {} => {
@@ -905,6 +970,7 @@ mod tests {
                 result_layout: ResultLayout::List,
                 watch_changes: true,
                 close_after_opening: false,
+                image_batch_size: 4,
             },
         };
         save_settings(&path, &settings).unwrap();
@@ -918,8 +984,18 @@ mod tests {
         assert_eq!(reopened.ui, settings.ui);
         let legacy: Settings = serde_json::from_value(json!({"modelDirectory":"/models"})).unwrap();
         assert_eq!(legacy.ui, UiSettings::default());
-        // Only missing whole preferences in the old file migrate. Partial,
-        // unknown or invalid preferences must never be silently repaired.
+        let old_preferences = json!({"topMatches":20,"resultLayout":"list","watchChanges":true,"closeAfterOpening":false});
+        let migrated: Settings =
+            serde_json::from_value(json!({"modelDirectory":"/models","ui":old_preferences}))
+                .unwrap();
+        assert_eq!(migrated.ui.image_batch_size, 1);
+        assert_eq!(migrated.ui.top_matches, 20);
+        // The batch field migrates only in saved preferences, never requests.
+        assert!(serde_json::from_value::<Request>(
+            json!({"id":1,"command":{"type":"updateSettings","settings":old_preferences}})
+        )
+        .is_err());
+        // Partial, unknown or invalid existing preferences stay errors.
         assert!(serde_json::from_value::<Settings>(
             json!({"modelDirectory":"/models","ui":{"topMatches":12}})
         )
@@ -930,5 +1006,14 @@ mod tests {
         assert!(invalid.validate().is_err());
         invalid.top_matches = 101;
         assert!(invalid.validate().is_err());
+        invalid.top_matches = 6;
+        for size in [0, 9] {
+            invalid.image_batch_size = size;
+            assert!(invalid.validate().is_err());
+        }
+        for size in 1..=8 {
+            invalid.image_batch_size = size;
+            assert!(invalid.validate().is_ok());
+        }
     }
 }

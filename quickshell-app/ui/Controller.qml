@@ -34,6 +34,7 @@ Item {
     property bool searchWarming: false
     property bool indexing: false
     property bool closing: false
+    property bool restarting: false
     property bool previewLoading: false
     property string page: "summon"
     property string previousPage: "summon"
@@ -44,6 +45,7 @@ Item {
     property string pendingSearchText: ""
     property var reindexQueue: []
     readonly property var settings: status.settings
+    readonly property bool batchRestartRequired: ready && status.activeImageBatchSize !== settings.imageBatchSize
     readonly property color borderColor: Qt.rgba(foregroundColor.r, foregroundColor.g, foregroundColor.b, 0.25)
     readonly property string monoFont: SearchTheme.font.family
     property string errorMessage: ""
@@ -64,13 +66,15 @@ Item {
             modelsPresent: false,
             provider: "CPU",
             threads: 0,
+            activeImageBatchSize: 1,
             modelDirectory: "",
             themeFile: "",
             settings: {
                 topMatches: 6,
                 resultLayout: "listPreview",
                 watchChanges: false,
-                closeAfterOpening: true
+                closeAfterOpening: true,
+                imageBatchSize: 1
             }
         })
     property var progress: ({
@@ -96,7 +100,7 @@ Item {
         })
     readonly property color foregroundColor: colors.foreground
     readonly property color secondaryText: Qt.rgba(foregroundColor.r, foregroundColor.g, foregroundColor.b, 0.65)
-    readonly property bool busy: loading || indexing || installingModels || closing
+    readonly property bool busy: loading || indexing || installingModels || closing || restarting
     readonly property bool serviceRunning: worker.connected
     readonly property bool serviceStarting: !closing && ((starting && !ready) || searchWarming)
     readonly property string loadingMessage: serviceStarting || searchStarting ? "Starting search service…" : activeQuery.length ? "Searching your images…" : "Loading images…"
@@ -105,6 +109,7 @@ Item {
     signal stopped
     signal serviceFailed
     signal externalAppOpened
+    signal restartRequired
 
     RuntimeDiagnostics {
         id: runtimeDiagnostics
@@ -211,7 +216,8 @@ Item {
             if (message.event === "stopped") {
                 searchWarming = false;
                 stoppedCleanly = message.payload.clean;
-                closing = false;
+                if (!restarting)
+                    closing = false;
                 ready = false;
                 starting = false;
                 connectTimer.stop();
@@ -220,7 +226,7 @@ Item {
                 if (!stoppedCleanly) {
                     fail("The search service did not stop cleanly. Check journalctl --user -u " + serviceName);
                     serviceFailed();
-                } else {
+                } else if (!restarting) {
                     notice = "Search service stopped.";
                     dismiss();
                     stopped();
@@ -646,6 +652,8 @@ Item {
             app.loading = false;
             if (result) {
                 app.status = result;
+                if (changes.imageBatchSize !== undefined && app.batchRestartRequired)
+                    app.restartRequired();
                 if (changes.topMatches !== undefined)
                     app.browse(false);
             }
@@ -709,6 +717,18 @@ Item {
             type: "shutdown"
         }, function () {});
     }
+    function restartService() {
+        if (closing || restarting)
+            return;
+        if (!manageService) {
+            fail("Restart the isolated test backend to apply Image batch size.");
+            return;
+        }
+        restarting = true;
+        closing = true;
+        notice = "Finishing active work and restarting the search service…";
+        restarter.running = true;
+    }
     Timer {
         id: connectTimer
         interval: 250
@@ -724,6 +744,37 @@ Item {
             if (!worker.connected)
                 worker.connected = true;
         }
+    }
+    Process {
+        id: restarter
+        command: ["systemctl", "--user", "restart", app.serviceName]
+        stderr: StdioCollector {
+            id: restartError
+            waitForEnd: true
+        }
+        // qmllint disable signal-handler-parameters
+        onExited: exitCode => {
+            app.restarting = false;
+            app.closing = false;
+            if (exitCode !== 0) {
+                app.notice = "";
+                app.fail("Restarting the search service failed (code " + exitCode + "): " + restartError.text.trim());
+                app.serviceFailed();
+                return;
+            }
+            app.ready = false;
+            worker.connected = false;
+            app.loading = false;
+            app.indexing = false;
+            app.installingModels = false;
+            app.pending = {};
+            app.notice = "";
+            app.starting = true;
+            app.stoppedCleanly = false;
+            app.connectAttempts = 0;
+            connectTimer.start();
+        }
+        // qmllint enable signal-handler-parameters
     }
     Process {
         id: starter
@@ -778,7 +829,7 @@ Item {
                 app.indexing = false;
                 app.searchWarming = false;
                 app.installingModels = false;
-                if (!app.stoppedCleanly) {
+                if (!app.stoppedCleanly && !app.restarting) {
                     app.closing = false;
                     app.fail("Search service disconnected. Check journalctl --user -u " + app.serviceName + " and Retry.");
                     app.serviceFailed();
@@ -789,6 +840,8 @@ Item {
         // connectTimer. Once connected, errors are reported immediately.
         // qmllint disable signal-handler-parameters
         onError: error => {
+            if (app.restarting)
+                return;
             if (app.stoppedCleanly)
                 return;
             if (app.starting) {

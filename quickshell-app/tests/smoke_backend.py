@@ -150,7 +150,7 @@ def main():
         try:
             ready = service.until(lambda item: item.get("event") == "ready")["payload"]
             assert ready["catalog"]["imageCount"] == 0 and ready["modelLoaded"] is False
-            preferences = {"topMatches": 12, "resultLayout": "listPreview", "watchChanges": False, "closeAfterOpening": True}
+            preferences = {"topMatches": 6, "resultLayout": "listPreview", "watchChanges": False, "closeAfterOpening": True, "imageBatchSize": 1}
             assert ready["settings"] == preferences
             assert "Top matches" in service.call({"type": "updateSettings", "settings": {**preferences, "topMatches": 0}}, success=False)
             preferences.update(topMatches=20, resultLayout="list", closeAfterOpening=False)

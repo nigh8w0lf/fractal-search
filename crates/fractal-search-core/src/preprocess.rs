@@ -1,6 +1,7 @@
 //! Native input preparation for the experimental dynamic-patch FG-CLIP2 export.
 //! This module does not select a production provider or start a model service.
 
+use crate::MAX_IMAGE_BATCH_SIZE;
 use anyhow::{ensure, Context, Result};
 use image::{ColorType, DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbImage};
 use std::{
@@ -234,7 +235,7 @@ fn resize_rgb(image: &RgbImage, width: usize, height: usize) -> Vec<u8> {
 
 pub fn prepare_images(images: &[RgbImage]) -> Result<ImageInputs> {
     ensure!(
-        (1..=8).contains(&images.len()),
+        (1..=MAX_IMAGE_BATCH_SIZE).contains(&images.len()),
         "FG-CLIP2 image batches must contain 1..=8 images"
     );
     let budget = images

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import shutil
 import socket
 import stat
 import subprocess
@@ -79,6 +80,47 @@ def stop(process):
         process.wait(timeout=90)
 
 
+def check_catalog_reset(binary, root):
+    reset = root / 'reset'; reset.mkdir()
+    models = reset / 'empty-models'; models.mkdir()
+    catalog = reset / 'data' / 'catalog.lancedb'
+    catalog.mkdir(parents=True)
+    preferences = {'topMatches': 17, 'resultLayout': 'list', 'watchChanges': True, 'closeAfterOpening': False, 'imageBatchSize': 4}
+    for state in ['empty', 'removed', 'emptied']:
+        if state != 'empty':
+            shutil.rmtree(catalog)
+            if state == 'emptied':
+                catalog.mkdir()
+        process, client, path, log = launch(binary, models, reset)
+        try:
+            client.send(1, {'type': 'status'})
+            status = client.response(1)['result']
+            assert status['catalog']['imageCount'] == 0 and status['catalog']['sources'] == [], status
+            assert not status['modelLoaded'] and not status['modelsPresent'], status
+            if state == 'empty':
+                client.send(2, {'type': 'updateSettings', 'settings': preferences})
+                assert client.response(2)['result']['settings'] == preferences
+                client.send(5, {'type': 'status'})
+                assert client.response(5)['result']['activeImageBatchSize'] == 1
+                saved = (reset / 'data' / 'settings.json').read_bytes()
+            else:
+                assert status['settings'] == preferences
+                assert status['activeImageBatchSize'] == 4
+                assert (reset / 'data' / 'settings.json').read_bytes() == saved
+            client.send(3, {'type': 'browse'})
+            assert client.response(3)['result']['items'] == []
+            client.send(4, {'type': 'shutdown'})
+            client.response(4)
+            assert process.wait(timeout=15) == 0
+            assert (catalog / 'assets.lance').is_dir()
+        finally:
+            client.close(); stop(process); log.close()
+    log_text = (reset / 'daemon.log').read_text()
+    assert log_text.count('[Catalog] Creating empty catalog') == 3, log_text
+    assert '[Model] Loaded' not in log_text, log_text
+    print('Empty/deleted catalogs recreated on restart without models; settings preserved', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('binary', type=Path)
@@ -87,6 +129,7 @@ def main():
     binary, models = args.binary.resolve(), args.models.resolve()
     with tempfile.TemporaryDirectory(prefix='fractal-search-plugin-', dir='/tmp') as temp:
         root = Path(temp)
+        check_catalog_reset(binary, root)
         process, client, path, log = launch(binary, models, root)
         try:
             # Duplicate clients get an explicit error and do not kill the service.
@@ -96,6 +139,16 @@ def main():
             client.send(1, {'type': 'installModels'})
             assert client.response(1)['result']['modelsPresent']
             print('Verified existing model cache without redownload', flush=True)
+            preferences = {'topMatches': 6, 'resultLayout': 'listPreview', 'watchChanges': False, 'closeAfterOpening': True, 'imageBatchSize': 4}
+            client.send(7, {'type': 'updateSettings', 'settings': preferences})
+            saved = client.response(7)['result']
+            assert saved['settings']['imageBatchSize'] == 4 and saved['activeImageBatchSize'] == 1
+            client.send(8, {'type': 'shutdown'}); client.response(8)
+            assert process.wait(timeout=15) == 0
+            client.close(); log.close()
+            process, client, path, log = launch(binary, models, root)
+            client.send(7, {'type': 'status'})
+            assert client.response(7)['result']['activeImageBatchSize'] == 4
             images = root / 'photos'; images.mkdir()
             for i in range(5):
                 png(images / f'{i}.png', color=(i * 30, 80, 180))
@@ -130,6 +183,7 @@ def main():
             assert process.wait(timeout=15) == 0
             client.close()
             print('Real ONNX search/preview, strict requests and graceful stop passed', flush=True)
+            assert 'images=4 ' in (root / 'daemon.log').read_text(), (root / 'daemon.log').read_text()
             process, client, path, log = launch(binary, models, root)
             for i in range(5, 10):
                 png(images / f'{i}.png', color=(80, i * 10, 40))

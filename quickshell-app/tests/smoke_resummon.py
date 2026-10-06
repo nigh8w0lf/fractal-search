@@ -88,6 +88,29 @@ Path(os.environ['FRACTAL_RESUMMON_ROOT'], 'reveal.json').write_text(json.dumps(s
 print('()')
 ''')
         file_manager.chmod(0o755)
+        # Service management stays inside this private session. The fixture
+        # asks this test to restart its own backend and never calls systemd.
+        systemctl = backend_commands / 'systemctl'
+        systemctl.write_text("""#!/usr/bin/env python3
+import os, sys, time
+from pathlib import Path
+root = Path(os.environ['FRACTAL_RESUMMON_ROOT'])
+assert sys.argv[1] == '--user' and sys.argv[3] == 'fractal-search.service', sys.argv
+operation = sys.argv[2]
+if operation == 'is-enabled':
+    print('disabled'); sys.exit(1)
+if operation == 'start':
+    sys.exit(0)
+assert operation == 'restart', 'Refusing non-test service operation'
+if (root / 'restart.fail').exists():
+    print('Private restart fixture failed', file=sys.stderr); sys.exit(7)
+(root / 'restart.request').write_text('restart')
+deadline = time.monotonic() + 20
+while not (root / 'restart.complete').exists():
+    assert time.monotonic() < deadline, 'Private restart was not completed'
+    time.sleep(.02)
+""")
+        systemctl.chmod(0o755)
         env['PATH'] = str(backend_commands) + ':' + env['PATH']
         backend_root = root / 'backend'; backend_root.mkdir()
         backend, client, socket, log = launch(args.binary.resolve(), args.models.resolve(), backend_root, env)
@@ -104,7 +127,7 @@ print('()')
         panel_source = ui / 'SearchPanel.qml'
         panel_source.write_text(panel_source.read_text().replace('import QtQuick\n', 'import QtQuick\nimport QtTest\n').replace('id: panel', 'id: panel; TestCase { id: input; when: false }', 1).replace('ResultActions {', 'ResultActions { id: previewTestActions', 1).replace(
             'function refreshDiagnostics()',
-            'function scrollSettings(amount: real): void { settingsPage.testScroll.contentItem.contentY = amount; }\n        function clickTab(name: string): void { const button = input.findChild(settingsPage, name); if (!button) throw new Error("Missing tab " + name); input.mouseClick(button); }\n        function clickOpen(): void { const button = input.findChild(previewTestActions, "openImageButton"); if (!button) throw new Error("Missing open action"); input.mouseClick(button); }\n        function tabKey(key: int): void { input.keyClick(key); }\n        function clickReveal(): void { input.mouseClick(input.findChild(previewTestActions, "revealImageButton")); }\n        function toggleWatch(): void { input.mouseClick(input.findChild(settingsPage, "watchChangesToggle")); }\n        function refreshDiagnostics()'))
+            'function scrollSettings(amount: real): void { settingsPage.testScroll.contentItem.contentY = amount; }\n        function clickTab(name: string): void { const button = input.findChild(settingsPage, name); if (!button) throw new Error("Missing tab " + name); input.mouseClick(button); }\n        function clickOpen(): void { const button = input.findChild(previewTestActions, "openImageButton"); if (!button) throw new Error("Missing open action"); input.mouseClick(button); }\n        function tabKey(key: int): void { input.keyClick(key); }\n        function clickReveal(): void { input.mouseClick(input.findChild(previewTestActions, "revealImageButton")); }\n        function toggleWatch(): void { input.mouseClick(input.findChild(settingsPage, "watchChangesToggle")); }\n        function chooseImageBatch(size: int): void { const choice = input.findChild(settingsPage, "imageBatchSizeChoice"); if (!choice) throw new Error("Missing image batch size"); input.mouseClick(choice); input.keyClick(Qt.Key_Home); for (let n = 1; n < size; ++n) input.keyClick(Qt.Key_Down); input.keyClick(Qt.Key_Return); }\n        function clickRestartNow(): void { input.mouseClick(restartDialog.confirmButton); }\n        function refreshDiagnostics()'))
         # An opaque desktop window exercises remapping above another app.
         shell = ui / 'shell.qml'
         shell.write_text(shell.read_text().replace('ShellRoot {', '''ShellRoot {
@@ -206,6 +229,44 @@ with (root / 'viewer.log').open('a') as log:
         call('test', 'scrollSettings', '0')
         time.sleep(.2)
         subprocess.run(['grim', str(root / 'diagnostics-settings.png')], env=env, check=True, timeout=5)
+        call('test', 'scrollSettings', '150')
+        call('test', 'chooseImageBatch', '4')
+        pending_restart = wait(lambda s: s['restartConfirmationVisible'] and s['restartLaterFocused'])
+        assert pending_restart['settings']['imageBatchSize'] == 4 and pending_restart['activeImageBatchSize'] == 1, pending_restart
+        time.sleep(.2)
+        subprocess.run(['grim', str(root / 'batch-restart-prompt.png')], env=env, check=True, timeout=5)
+        call('test', 'resize', '480', '440')
+        time.sleep(.3)
+        subprocess.run(['grim', str(root / 'batch-restart-narrow.png')], env=env, check=True, timeout=5)
+        call('test', 'tabKey', str(0x01000004))  # Return chooses the focused Later action.
+        deferred = wait(lambda s: not s['restartConfirmationVisible'] and s['batchRestartRequired'])
+        assert deferred['activeImageBatchSize'] == 1 and backend.poll() is None
+        call('test', 'manageTestService', 'true')
+        (root / 'restart.fail').touch()
+        call('test', 'requestRestart')
+        wait(lambda s: s['restartConfirmationVisible'])
+        call('test', 'clickRestartNow')
+        failed = wait(lambda s: not s['restarting'] and 'Private restart fixture failed' in s['error'])
+        assert failed['activeImageBatchSize'] == 1 and failed['batchRestartRequired']
+        (root / 'restart.fail').unlink()
+        call('test', 'acknowledge')
+        call('test', 'requestRestart')
+        wait(lambda s: s['restartConfirmationVisible'])
+        call('test', 'clickRestartNow')
+        deadline = time.monotonic() + 5
+        while not (root / 'restart.request').exists():
+            assert time.monotonic() < deadline, (root / 'ui.log').read_text()
+            time.sleep(.02)
+        stop(backend)
+        assert backend.returncode == 0
+        backend, client, socket, log = launch(args.binary.resolve(), args.models.resolve(), backend_root, env)
+        children.append(backend); logs.append(log); client.close()
+        (root / 'restart.complete').touch()
+        restarted = wait(lambda s: s['ready'] and not s['loading'] and s['activeImageBatchSize'] == 4 and not s['batchRestartRequired'])
+        assert restarted['imageCount'] == 2 and restarted['visible']
+        call('test', 'manageTestService', 'false')
+        call('test', 'resize', '0', '0')
+        print('Batch size choice, Later focus, narrow prompt, restart failure and safe restart passed', flush=True)
         call('test', 'scrollSettings', '0')
         call('test', 'back')
 

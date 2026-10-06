@@ -9,6 +9,7 @@ Dialog {
     required property color borderColor
     required property string message
     required property string confirmText
+    property string cancelText: "Cancel"
     readonly property bool cancelFocused: cancelButton.activeFocus
     readonly property Item confirmButton: acceptButton
 
@@ -75,7 +76,7 @@ Dialog {
             spacing: Style.space(8)
             SearchButton {
                 id: cancelButton
-                text: "Cancel"
+                text: dialog.cancelText
                 colors: dialog.colors
                 implicitWidth: Math.max(Style.space(88), implicitContentWidth + leftPadding + rightPadding)
                 implicitHeight: Style.space(34)

@@ -26,6 +26,21 @@ loading a model or initializing a GPU. The normal status response reports
 retains the selected provider/device. The daemon explicitly forwards both to its
 resident worker.
 
+## Image batching
+
+Settings → Performance → **Image batch size** accepts 1–8 (default 1). Save it and choose **Restart now** to apply it, or **Later** to keep the running size until the next service start. Both manual and watched scans use that startup value. Compatible consecutive images share inference; tails and changes in patch budget produce smaller batches. GPU out-of-memory and other inference errors remain visible without retrying at a smaller size or on CPU.
+
+To verify every batch size against single-image embeddings on CPU and CUDA with synthetic images at 128 and 1024 patch budgets, use an existing verified cache and the provider library path:
+
+```bash
+env FRACTAL_SEARCH_BATCH_TEST_MODELS=/absolute/path/to/models \
+  LD_LIBRARY_PATH=/absolute/path/to/cuda-libraries:$PWD/target/debug \
+  cargo test --workspace --locked --features cuda \
+  image_batches_preserve_single_image_embeddings_on_cpu_and_cuda -- --ignored --nocapture
+```
+
+This opt-in check uses CUDA device 0 and requires host GPU access. It never opens a catalog or uses original photos.
+
 ## Build and install
 
 ```bash

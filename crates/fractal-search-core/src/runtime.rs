@@ -358,6 +358,9 @@ impl NativeRuntime {
 }
 
 impl Embedder for NativeRuntime {
+    fn embed_images(&mut self, images: &[image::RgbImage]) -> Result<Vec<Vec<f32>>> {
+        NativeRuntime::embed_images(self, images)
+    }
     fn embed_image(&mut self, image: &image::RgbImage) -> Result<Vec<f32>> {
         self.embed_images(std::slice::from_ref(image))?
             .into_iter()
@@ -404,6 +407,68 @@ impl Embedder for NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires FRACTAL_SEARCH_BATCH_TEST_MODELS and host CUDA access"]
+    fn image_batches_preserve_single_image_embeddings_on_cpu_and_cuda() {
+        let models = PathBuf::from(
+            std::env::var_os("FRACTAL_SEARCH_BATCH_TEST_MODELS")
+                .expect("Provide an existing verified model cache"),
+        );
+        for provider in [
+            ExecutionProvider::Cpu,
+            ExecutionProvider::Cuda { device_id: 0 },
+        ] {
+            let mut runtime = NativeRuntime::with_provider(models.clone(), 6, provider).unwrap();
+            for large in [false, true] {
+                let images = (0..crate::MAX_IMAGE_BATCH_SIZE)
+                    .map(|index| {
+                        let (width, height) = if large {
+                            if index % 2 == 0 {
+                                (640, 480)
+                            } else {
+                                (480, 640)
+                            }
+                        } else if index % 2 == 0 {
+                            (48, 32)
+                        } else {
+                            (1, 1024)
+                        };
+                        image::RgbImage::from_fn(width, height, |x, y| {
+                            image::Rgb([
+                                ((x + y + index as u32 * 23) % 256) as u8,
+                                ((x * 3 + index as u32 * 11) % 256) as u8,
+                                ((y * 7 + index as u32 * 19) % 256) as u8,
+                            ])
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let singles = images
+                    .iter()
+                    .map(|image| runtime.embed_image(image).unwrap())
+                    .collect::<Vec<_>>();
+                for size in 1..=crate::MAX_IMAGE_BATCH_SIZE {
+                    let vectors = runtime.embed_images(&images[..size]).unwrap();
+                    assert_eq!(vectors.len(), size);
+                    for (index, (actual, expected)) in vectors.iter().zip(&singles).enumerate() {
+                        assert_eq!(actual.len(), EMBEDDING_DIM);
+                        assert!(actual.iter().all(|value| value.is_finite()));
+                        let dot: f64 = actual
+                            .iter()
+                            .zip(expected)
+                            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                            .sum();
+                        let norm =
+                            |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+                        assert!((norm(actual) - 1.0).abs() < 0.001);
+                        let cosine = dot / (norm(actual) * norm(expected));
+                        assert!(cosine >= 0.9999, "provider={provider:?} large={large} batch={size} image={index} cosine={cosine}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn provider_options_are_explicit_and_validate_device_ids() {

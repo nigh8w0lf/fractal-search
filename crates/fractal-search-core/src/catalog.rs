@@ -1,6 +1,9 @@
 //! LanceDB catalog and incremental indexing. Originals are never modified.
 use crate::store::{image_filter, quote, Record, Store};
-use crate::{preprocess::decode_image, Embedder, EMBEDDING_DIM, MODEL_PROFILE};
+use crate::{
+    preprocess::{decode_image, patch_budget},
+    Embedder, EMBEDDING_DIM, MAX_IMAGE_BATCH_SIZE, MODEL_PROFILE,
+};
 use anyhow::{ensure, Context, Result};
 use image::{codecs::webp::WebPEncoder, ExtendedColorType, RgbImage};
 use serde::Serialize;
@@ -130,6 +133,77 @@ impl IndexProgress {
 struct Stamp {
     bytes: u64,
     modified: String,
+}
+
+struct PendingImage {
+    path: PathBuf,
+    before: Stamp,
+    existing: Option<Record>,
+    decode_ms: f64,
+    start: Instant,
+}
+
+struct IndexBatch {
+    source_id: i64,
+    images: Vec<RgbImage>,
+    pending: Vec<PendingImage>,
+    budget: Option<usize>,
+}
+
+impl IndexBatch {
+    fn flush<E: Embedder>(
+        &mut self,
+        catalog: &Catalog,
+        embedder: &mut E,
+        state: &mut IndexProgress,
+        failures: &mut Vec<IndexFailure>,
+        cancelled: &impl Fn() -> bool,
+        progress: &mut impl FnMut(&IndexProgress) -> Result<()>,
+    ) -> Result<bool> {
+        if self.images.is_empty() {
+            return Ok(cancelled());
+        }
+        if cancelled() {
+            return Ok(true);
+        }
+        let vectors = embedder.embed_images(&self.images).with_context(|| {
+            format!(
+                "Embed image batch of {} starting at {:?}; reduce Image batch size if device memory is insufficient",
+                self.images.len(), self.pending[0].path
+            )
+        })?;
+        ensure!(
+            vectors.len() == self.images.len(),
+            "Image batch returned {} embeddings for {} images",
+            vectors.len(),
+            self.images.len()
+        );
+        // Validate the entire inference result before committing any of it.
+        for vector in &vectors {
+            validate_embedding(vector)?;
+        }
+        let images = std::mem::take(&mut self.images);
+        let pending = std::mem::take(&mut self.pending);
+        self.budget = None;
+        for ((pending, image), vector) in pending.into_iter().zip(images).zip(vectors) {
+            state.failure = None;
+            state.filename = pending
+                .path
+                .file_name()
+                .context("Image filename missing")?
+                .to_string_lossy()
+                .into_owned();
+            catalog.finish_index_image(self.source_id, pending, &image, vector, state, failures)?;
+            progress(state)?;
+            // Native inference cannot be interrupted. Finish one image commit
+            // even if cancelled during inference, then discard the rest of the
+            // computed batch and never prune unvisited entries.
+            if cancelled() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[derive(Debug)]
@@ -431,8 +505,23 @@ impl Catalog {
         directory: &Path,
         embedder: &mut E,
         cancelled: impl Fn() -> bool,
+        progress: impl FnMut(&IndexProgress) -> Result<()>,
+    ) -> Result<IndexResult> {
+        self.index_with_batch_size(directory, embedder, 1, cancelled, progress)
+    }
+
+    pub fn index_with_batch_size<E: Embedder>(
+        &mut self,
+        directory: &Path,
+        embedder: &mut E,
+        batch_size: usize,
+        cancelled: impl Fn() -> bool,
         mut progress: impl FnMut(&IndexProgress) -> Result<()>,
     ) -> Result<IndexResult> {
+        ensure!(
+            (1..=MAX_IMAGE_BATCH_SIZE).contains(&batch_size),
+            "Image batch size must be between 1 and 8"
+        );
         let directory = directory
             .canonicalize()
             .with_context(|| format!("Resolve selected folder {directory:?}"))?;
@@ -493,21 +582,36 @@ impl Catalog {
         state.stage = "indexing";
         state.total = paths.len();
         progress(&state)?;
+        let mut batch = IndexBatch {
+            source_id,
+            images: Vec::with_capacity(batch_size),
+            pending: Vec::with_capacity(batch_size),
+            budget: None,
+        };
         for path in &paths {
             if cancelled() {
                 return Ok(state.result(0, true, failures));
             }
             let start = Instant::now();
-            state.failure = None;
-            state.filename = path
-                .file_name()
-                .context("Image filename missing")?
-                .to_string_lossy()
-                .into_owned();
             let path_text = text_path(path)?;
             let before = match stamp(path) {
                 Ok(stamp) => stamp,
                 Err(error) => {
+                    if batch.flush(
+                        self,
+                        embedder,
+                        &mut state,
+                        &mut failures,
+                        &cancelled,
+                        &mut progress,
+                    )? {
+                        return Ok(state.result(0, true, failures));
+                    }
+                    state.filename = path
+                        .file_name()
+                        .context("Image filename missing")?
+                        .to_string_lossy()
+                        .into_owned();
                     state.record_failure(path, error, &mut failures);
                     progress(&state)?;
                     continue;
@@ -525,86 +629,134 @@ impl Catalog {
                     .as_ref()
                     .is_some_and(|row| Path::new(&row.thumbnail).is_file())
             {
+                if batch.flush(
+                    self,
+                    embedder,
+                    &mut state,
+                    &mut failures,
+                    &cancelled,
+                    &mut progress,
+                )? {
+                    return Ok(state.result(0, true, failures));
+                }
+                state.failure = None;
+                state.filename = path
+                    .file_name()
+                    .context("Image filename missing")?
+                    .to_string_lossy()
+                    .into_owned();
                 state.unchanged += 1;
-            } else {
-                let image = match decode_image(path) {
-                    Ok(image) => image,
-                    Err(error) => {
-                        state.record_failure(path, error, &mut failures);
-                        progress(&state)?;
-                        continue;
+                state.current += 1;
+                progress(&state)?;
+                continue;
+            }
+            let image = match decode_image(path) {
+                Ok(image) => image,
+                Err(error) => {
+                    if batch.flush(
+                        self,
+                        embedder,
+                        &mut state,
+                        &mut failures,
+                        &cancelled,
+                        &mut progress,
+                    )? {
+                        return Ok(state.result(0, true, failures));
                     }
-                };
-                let decode_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let embedding = if unchanged {
-                    let id = &existing
-                        .as_ref()
-                        .context("Unchanged image record is missing")?
-                        .asset_id;
-                    self.store
-                        .asset(id, true)?
-                        .embedding
-                        .context("Indexed image is missing its embedding")?
-                } else {
-                    embedder
-                        .embed_image(&image)
-                        .with_context(|| format!("Embed image {path:?}"))?
-                };
-                validate_embedding(&embedding)?;
-                let source_check = stamp(path).and_then(|after| {
-                    ensure!(before == after, "Image changed during indexing: {path:?}; rescan after it finishes changing");
-                    Ok(())
-                });
-                if let Err(error) = source_check {
+                    state.filename = path
+                        .file_name()
+                        .context("Image filename missing")?
+                        .to_string_lossy()
+                        .into_owned();
                     state.record_failure(path, error, &mut failures);
                     progress(&state)?;
                     continue;
                 }
-                let asset_id = existing
-                    .as_ref()
-                    .map(|r| r.asset_id.clone())
-                    .unwrap_or_else(|| format!("asset_{}", Uuid::new_v4()));
-                let digest = format!(
-                    "{:x}",
-                    Sha256::digest(format!("{}:{}", before.bytes, before.modified).as_bytes())
-                );
-                let cache = self
-                    .thumbnails
-                    .join(format!("{asset_id}-{}.webp", &digest[..16]));
-                let thumb_start = Instant::now();
-                write_atomic(&cache, &thumbnail(&image)?)?;
-                let filename = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .context("Image has no UTF-8 filename")?;
-                self.store.upsert(&Record {
-                    kind: "image".into(),
-                    asset_id: asset_id.clone(),
-                    source_id,
-                    path: path_text.to_owned(),
-                    filename: filename.to_owned(),
-                    width: image.width(),
-                    height: image.height(),
-                    bytes: before.bytes,
-                    modified: before.modified.clone(),
-                    thumbnail: text_path(&cache)?.to_owned(),
-                    embedding: Some(embedding),
-                })?;
-                if let Some(old) = existing
-                    .as_ref()
-                    .filter(|r| r.thumbnail != text_path(&cache).expect("validated cache path"))
-                {
-                    self.remove_cache(Path::new(&old.thumbnail))?;
+            };
+            let pending = PendingImage {
+                path: path.clone(),
+                before,
+                existing,
+                decode_ms: start.elapsed().as_secs_f64() * 1000.0,
+                start,
+            };
+            if unchanged {
+                if batch.flush(
+                    self,
+                    embedder,
+                    &mut state,
+                    &mut failures,
+                    &cancelled,
+                    &mut progress,
+                )? {
+                    return Ok(state.result(0, true, failures));
                 }
-                let preview = self.previews.join(format!("{asset_id}.png"));
-                self.remove_cache(&preview)?;
-                state.indexed += 1;
-                eprintln!("[Index] path={path:?} dimensions={}x{} decode_ms={decode_ms:.1} thumbnail_and_store_ms={:.1} total_ms={:.1} embedding_reused={unchanged}", image.width(), image.height(), thumb_start.elapsed().as_secs_f64()*1000.0, start.elapsed().as_secs_f64()*1000.0);
+                let id = &pending
+                    .existing
+                    .as_ref()
+                    .context("Unchanged image record is missing")?
+                    .asset_id;
+                let vector = self
+                    .store
+                    .asset(id, true)?
+                    .embedding
+                    .context("Indexed image is missing its embedding")?;
+                state.failure = None;
+                state.filename = path
+                    .file_name()
+                    .context("Image filename missing")?
+                    .to_string_lossy()
+                    .into_owned();
+                self.finish_index_image(
+                    source_id,
+                    pending,
+                    &image,
+                    vector,
+                    &mut state,
+                    &mut failures,
+                )?;
+                progress(&state)?;
+                continue;
             }
-            state.current += 1;
-            progress(&state)?;
+            let budget = patch_budget(image.width(), image.height())?;
+            // prepare_images uses a shared patch budget. Only group images
+            // with the same individual budget to preserve existing embeddings.
+            if batch.budget.is_some_and(|previous| previous != budget)
+                && batch.flush(
+                    self,
+                    embedder,
+                    &mut state,
+                    &mut failures,
+                    &cancelled,
+                    &mut progress,
+                )?
+            {
+                return Ok(state.result(0, true, failures));
+            }
+            batch.budget = Some(budget);
+            batch.images.push(image);
+            batch.pending.push(pending);
+            if batch.images.len() == batch_size
+                && batch.flush(
+                    self,
+                    embedder,
+                    &mut state,
+                    &mut failures,
+                    &cancelled,
+                    &mut progress,
+                )?
+            {
+                return Ok(state.result(0, true, failures));
+            }
         }
-        if cancelled() {
+        if batch.flush(
+            self,
+            embedder,
+            &mut state,
+            &mut failures,
+            &cancelled,
+            &mut progress,
+        )? {
             return Ok(state.result(0, true, failures));
         }
         // Only a completed traversal may prune missing files. Known files that
@@ -640,6 +792,79 @@ impl Catalog {
         state.failure = None;
         progress(&state)?;
         Ok(state.result(removed, false, failures))
+    }
+    fn finish_index_image(
+        &self,
+        source_id: i64,
+        pending: PendingImage,
+        image: &RgbImage,
+        embedding: Vec<f32>,
+        state: &mut IndexProgress,
+        failures: &mut Vec<IndexFailure>,
+    ) -> Result<()> {
+        validate_embedding(&embedding)?;
+        let PendingImage {
+            path,
+            before,
+            existing,
+            decode_ms,
+            start,
+        } = pending;
+        let source_check = stamp(&path).and_then(|after| {
+            ensure!(
+                before == after,
+                "Image changed during indexing: {path:?}; rescan after it finishes changing"
+            );
+            Ok(())
+        });
+        if let Err(error) = source_check {
+            state.record_failure(&path, error, failures);
+            return Ok(());
+        }
+        let asset_id = existing
+            .as_ref()
+            .map(|r| r.asset_id.clone())
+            .unwrap_or_else(|| format!("asset_{}", Uuid::new_v4()));
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(format!("{}:{}", before.bytes, before.modified).as_bytes())
+        );
+        let cache = self
+            .thumbnails
+            .join(format!("{asset_id}-{}.webp", &digest[..16]));
+        let thumb_start = Instant::now();
+        write_atomic(&cache, &thumbnail(image)?)?;
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("Image has no UTF-8 filename")?;
+        self.store.upsert(&Record {
+            kind: "image".into(),
+            asset_id: asset_id.clone(),
+            source_id,
+            path: text_path(&path)?.to_owned(),
+            filename: filename.to_owned(),
+            width: image.width(),
+            height: image.height(),
+            bytes: before.bytes,
+            modified: before.modified.clone(),
+            thumbnail: text_path(&cache)?.to_owned(),
+            embedding: Some(embedding),
+        })?;
+        if let Some(old) = existing
+            .as_ref()
+            .filter(|r| r.thumbnail != text_path(&cache).expect("validated cache path"))
+        {
+            self.remove_cache(Path::new(&old.thumbnail))?;
+        }
+        self.remove_cache(&self.previews.join(format!("{asset_id}.png")))?;
+        state.indexed += 1;
+        state.current += 1;
+        let reused = existing
+            .as_ref()
+            .is_some_and(|row| row.bytes == before.bytes && row.modified == before.modified);
+        eprintln!("[Index] path={path:?} dimensions={}x{} decode_ms={decode_ms:.1} thumbnail_and_store_ms={:.1} total_ms={:.1} embedding_reused={reused}", image.width(), image.height(), thumb_start.elapsed().as_secs_f64()*1000.0, start.elapsed().as_secs_f64()*1000.0);
+        Ok(())
     }
     fn remove_cache(&self, path: &Path) -> Result<()> {
         ensure!(
@@ -724,6 +949,9 @@ mod tests {
         images: usize,
     }
     impl Embedder for FakeEmbedder {
+        fn embed_images(&mut self, images: &[RgbImage]) -> Result<Vec<Vec<f32>>> {
+            images.iter().map(|image| self.embed_image(image)).collect()
+        }
         fn embed_image(&mut self, image: &RgbImage) -> Result<Vec<f32>> {
             self.images += 1;
             let mut v = vec![0.; EMBEDDING_DIM];
@@ -738,6 +966,188 @@ mod tests {
         RgbImage::from_pixel(48, 32, image::Rgb(color))
             .save(path)
             .unwrap();
+    }
+    struct BatchEmbedder<'a> {
+        model: FakeEmbedder,
+        calls: Vec<Vec<usize>>,
+        cancel: Option<&'a std::cell::Cell<bool>>,
+        invalid_output: bool,
+    }
+    impl Embedder for BatchEmbedder<'_> {
+        fn embed_image(&mut self, _: &RgbImage) -> Result<Vec<f32>> {
+            bail!("Indexer must call batch inference")
+        }
+        fn embed_images(&mut self, images: &[RgbImage]) -> Result<Vec<Vec<f32>>> {
+            let budgets = images
+                .iter()
+                .map(|image| patch_budget(image.width(), image.height()))
+                .collect::<Result<Vec<_>>>()?;
+            assert!(budgets.iter().all(|budget| *budget == budgets[0]));
+            self.calls.push(budgets);
+            if let Some(cancel) = self.cancel {
+                cancel.set(true);
+            }
+            let mut vectors = self.model.embed_images(images)?;
+            if self.invalid_output {
+                vectors.pop();
+            }
+            Ok(vectors)
+        }
+        fn embed_text(&mut self, _: &str) -> Result<Vec<f32>> {
+            bail!("test embedder has no text model")
+        }
+    }
+    fn batch_embedder() -> BatchEmbedder<'static> {
+        BatchEmbedder {
+            model: FakeEmbedder { images: 0 },
+            calls: vec![],
+            cancel: None,
+            invalid_output: false,
+        }
+    }
+    #[test]
+    fn indexing_batches_respect_the_limit_flush_tails_and_reuse_embeddings() {
+        for size in [1, 2, 3, 8] {
+            let root = tempfile::tempdir().unwrap();
+            let photos = root.path().join("photos");
+            fs::create_dir(&photos).unwrap();
+            for index in 0..10 {
+                save(&photos.join(format!("{index:02}.png")), [255, 0, 0]);
+            }
+            let mut catalog = Catalog::open(&root.path().join("data")).unwrap();
+            let mut model = batch_embedder();
+            let result = catalog
+                .index_with_batch_size(&photos, &mut model, size, || false, |_| Ok(()))
+                .unwrap();
+            assert_eq!(result.indexed, 10);
+            assert_eq!(
+                model.calls.iter().map(Vec::len).collect::<Vec<_>>(),
+                (0..10)
+                    .collect::<Vec<_>>()
+                    .chunks(size)
+                    .map(<[_]>::len)
+                    .collect::<Vec<_>>()
+            );
+            let calls = model.calls.len();
+            let first = catalog.browse(0, 10).unwrap().items[0].clone();
+            let thumbnail = Url::parse(&first.thumbnail_url)
+                .unwrap()
+                .to_file_path()
+                .unwrap();
+            fs::remove_file(thumbnail).unwrap();
+            let repaired = catalog
+                .index_with_batch_size(&photos, &mut model, size, || false, |_| Ok(()))
+                .unwrap();
+            assert_eq!((repaired.indexed, repaired.unchanged), (1, 9));
+            assert_eq!(model.calls.len(), calls);
+            assert_eq!(
+                catalog.browse(0, 10).unwrap().items[0].asset_id,
+                first.asset_id
+            );
+        }
+    }
+    #[test]
+    fn indexing_batches_keep_individual_patch_budgets_and_report_corrupt_files() {
+        let root = tempfile::tempdir().unwrap();
+        let photos = root.path().join("photos");
+        fs::create_dir(&photos).unwrap();
+        for (index, width, height) in [
+            (0, 48, 32),
+            (1, 1, 1024),
+            (2, 200, 200),
+            (3, 240, 200),
+            (5, 640, 480),
+        ] {
+            RgbImage::from_pixel(width, height, image::Rgb([255, 0, 0]))
+                .save(photos.join(format!("{index}.png")))
+                .unwrap();
+        }
+        fs::write(photos.join("4.png"), "corrupt").unwrap();
+        let mut catalog = Catalog::open(&root.path().join("data")).unwrap();
+        let mut model = batch_embedder();
+        let result = catalog
+            .index_with_batch_size(&photos, &mut model, 8, || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!((result.indexed, result.failed), (5, 1));
+        assert_eq!(model.calls, [vec![128, 128], vec![256, 256], vec![1024]]);
+        for size in [0, 9] {
+            assert!(catalog
+                .index_with_batch_size(&photos, &mut model, size, || false, |_| Ok(()))
+                .is_err());
+        }
+    }
+    #[test]
+    fn cancellation_during_batch_inference_commits_one_image_and_never_prunes() {
+        let root = tempfile::tempdir().unwrap();
+        let photos = root.path().join("photos");
+        fs::create_dir(&photos).unwrap();
+        for index in 0..5 {
+            save(&photos.join(format!("{index}.png")), [255, 0, 0]);
+        }
+        let mut catalog = Catalog::open(&root.path().join("data")).unwrap();
+        catalog
+            .index(
+                &photos,
+                &mut FakeEmbedder { images: 0 },
+                || false,
+                |_| Ok(()),
+            )
+            .unwrap();
+        let assets = catalog.browse(0, 10).unwrap().items;
+        fs::remove_file(photos.join("4.png")).unwrap();
+        for index in 0..4 {
+            save(&photos.join(format!("{index}.png")), [0, 0, 255]);
+        }
+        let cancel = std::cell::Cell::new(false);
+        let mut model = BatchEmbedder {
+            cancel: Some(&cancel),
+            ..batch_embedder()
+        };
+        let result = catalog
+            .index_with_batch_size(&photos, &mut model, 4, || cancel.get(), |_| Ok(()))
+            .unwrap();
+        assert!(result.cancelled);
+        assert_eq!((result.indexed, result.removed), (1, 0));
+        assert_eq!(model.calls.len(), 1);
+        assert_eq!(catalog.status().unwrap().image_count, 5);
+        assert_eq!(
+            catalog
+                .store
+                .asset(&assets[0].asset_id, true)
+                .unwrap()
+                .embedding
+                .unwrap()[1],
+            1.
+        );
+        assert_eq!(
+            catalog
+                .store
+                .asset(&assets[1].asset_id, true)
+                .unwrap()
+                .embedding
+                .unwrap()[0],
+            1.
+        );
+    }
+    #[test]
+    fn invalid_batch_outputs_are_fatal_without_partial_commits_or_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let photos = root.path().join("photos");
+        fs::create_dir(&photos).unwrap();
+        for index in 0..4 {
+            save(&photos.join(format!("{index}.png")), [255, 0, 0]);
+        }
+        let mut catalog = Catalog::open(&root.path().join("data")).unwrap();
+        let mut model = BatchEmbedder {
+            invalid_output: true,
+            ..batch_embedder()
+        };
+        let error = catalog
+            .index_with_batch_size(&photos, &mut model, 4, || false, |_| Ok(()))
+            .unwrap_err();
+        assert!(error.to_string().contains("3 embeddings for 4 images"));
+        assert_eq!(model.calls.len(), 1);
+        assert_eq!(catalog.status().unwrap().image_count, 0);
     }
     #[test]
     fn cached_images_preserve_aspect_ratio_and_repair_legacy_square_files() {
@@ -1135,6 +1545,9 @@ mod tests {
             path: PathBuf,
         }
         impl Embedder for ChangingEmbedder {
+            fn embed_images(&mut self, images: &[RgbImage]) -> Result<Vec<Vec<f32>>> {
+                images.iter().map(|image| self.embed_image(image)).collect()
+            }
             fn embed_image(&mut self, image: &RgbImage) -> Result<Vec<f32>> {
                 if self.model.images == 0 {
                     fs::write(&self.path, b"changed while embedding").unwrap();
@@ -1216,6 +1629,9 @@ mod tests {
     fn model_and_cache_failures_still_abort_instead_of_skipping_images() {
         struct FailingEmbedder;
         impl Embedder for FailingEmbedder {
+            fn embed_images(&mut self, _: &[RgbImage]) -> Result<Vec<Vec<f32>>> {
+                bail!("model inference failed")
+            }
             fn embed_image(&mut self, _: &RgbImage) -> Result<Vec<f32>> {
                 bail!("model inference failed")
             }

@@ -12,6 +12,7 @@ ColumnLayout {
     signal chooseModel
     signal showSkippedFiles
     signal stopService
+    signal restartService
     signal removeFolder(int sourceId, string directory)
     spacing: Style.space(20)
 
@@ -370,6 +371,51 @@ ColumnLayout {
                 AcceleratorSection {
                     Layout.fillWidth: true
                     app: page.app
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(6)
+                    RowLayout {
+                        Layout.fillWidth: true
+                        SearchText {
+                            text: "Image batch size"
+                            color: page.app.colors.foreground
+                            Layout.fillWidth: true
+                        }
+                        SearchChoice {
+                            objectName: "imageBatchSizeChoice"
+                            colors: page.app.colors
+                            model: ["1", "2", "3", "4", "5", "6", "7", "8"]
+                            implicitWidth: Style.space(90)
+                            currentIndex: page.app.settings.imageBatchSize - 1
+                            enabled: page.app.ready && !page.app.busy
+                            onActivated: page.app.updateSettings({imageBatchSize: currentIndex + 1})
+                        }
+                    }
+                    SearchText {
+                        Layout.fillWidth: true
+                        text: "Maximum images processed together during indexing. Larger batches use more memory. Restart Fractal Search to apply changes."
+                        color: page.app.secondaryText
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: SearchTheme.font.bodySmall
+                    }
+                    RowLayout {
+                        visible: page.app.batchRestartRequired
+                        Layout.fillWidth: true
+                        SearchText {
+                            Layout.fillWidth: true
+                            text: "Restart required · currently " + page.app.status.activeImageBatchSize + " image(s) per batch"
+                            color: page.app.secondaryText
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: SearchTheme.font.bodySmall
+                        }
+                        SearchButton {
+                            text: "Restart"
+                            colors: page.app.colors
+                            enabled: page.app.ready && !page.app.busy
+                            onClicked: page.restartService()
+                        }
+                    }
                 }
                 Rectangle {
                     Layout.fillWidth: true

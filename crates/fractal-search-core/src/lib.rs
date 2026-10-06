@@ -9,10 +9,12 @@ pub mod preprocess;
 pub mod runtime;
 
 pub const EMBEDDING_DIM: usize = 768;
+pub const MAX_IMAGE_BATCH_SIZE: usize = 8;
 pub const MODEL_PROFILE: &str = "fgclip2-base-33f3b9d4-dynamic-torch291-short64-v1";
 
 pub trait Embedder {
     fn embed_image(&mut self, image: &image::RgbImage) -> anyhow::Result<Vec<f32>>;
+    fn embed_images(&mut self, images: &[image::RgbImage]) -> anyhow::Result<Vec<Vec<f32>>>;
     fn embed_text(&mut self, query: &str) -> anyhow::Result<Vec<f32>>;
 }
 

@@ -193,17 +193,49 @@ impl Store {
                 .context("Start LanceDB runtime")?,
         };
         store.runtime.block_on(async {
-            if !store.path.exists() {
+            // An absent or completely empty directory has no catalog to open.
+            // Inspect it explicitly so permissions and dangling symlinks cannot
+            // be mistaken for first-run state. Never repair partial storage.
+            let empty = match std::fs::symlink_metadata(&store.path) {
+                Ok(metadata) => {
+                    ensure!(
+                        metadata.is_dir() && !metadata.file_type().is_symlink(),
+                        "LanceDB catalog must contain real directories, not symlinks"
+                    );
+                    std::fs::read_dir(&store.path)
+                        .with_context(|| format!("Read catalog directory {:?}", store.path))?
+                        .next()
+                        .transpose()
+                        .context("Inspect catalog directory entry")?
+                        .is_none()
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Inspect catalog directory {:?}", store.path));
+                }
+            };
+            if empty {
                 ensure!(
                     !read_only,
                     "Search catalog is unavailable; index a folder in Fractal Search first"
                 );
                 ensure!(
-                    !data.join("search.db").exists(),
+                    !data.join("search.db").try_exists().context("Inspect old development catalog")?,
                     "Old development catalog detected; use a fresh data directory and reindex"
                 );
-                let db = lancedb::connect(store.uri()?).execute().await?;
-                db.create_empty_table("assets", schema()).execute().await?;
+                eprintln!(
+                    "[Catalog] Creating empty catalog at {:?}; add folders in Fractal Search to index images",
+                    store.path
+                );
+                let db = lancedb::connect(store.uri()?)
+                    .execute()
+                    .await
+                    .context("Connect to empty LanceDB catalog")?;
+                db.create_empty_table("assets", schema())
+                    .execute()
+                    .await
+                    .context("Create empty LanceDB catalog")?;
             }
             store.table().await?;
             Ok::<_, anyhow::Error>(())
@@ -216,7 +248,7 @@ impl Store {
     async fn table(&self) -> Result<Table> {
         for path in [&self.path, &self.path.join("assets.lance")] {
             let metadata = std::fs::symlink_metadata(path)
-                .context("LanceDB catalog is missing; use a fresh data directory and reindex")?;
+                .context("LanceDB catalog storage is missing; stop and reopen Fractal Search; only absent or empty catalog directories can be recreated")?;
             ensure!(
                 metadata.is_dir() && !metadata.file_type().is_symlink(),
                 "LanceDB catalog must contain real directories, not symlinks"
@@ -504,6 +536,110 @@ mod tests {
                 .len(),
             1
         );
+    }
+    #[test]
+    fn writer_recreates_removed_or_empty_catalog_on_reopen() {
+        for keep_directory in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("catalog.lancedb");
+            let writer = Store::open(root.path(), false).unwrap();
+            writer.upsert(&image("old", 0)).unwrap();
+            drop(writer);
+            std::fs::remove_dir_all(&path).unwrap();
+            if keep_directory {
+                std::fs::create_dir(&path).unwrap();
+            }
+            let before = contents(root.path());
+            assert!(Store::open(root.path(), true).is_err());
+            assert_eq!(contents(root.path()), before);
+
+            let writer = Store::open(root.path(), false).unwrap();
+            let (images, sources) = writer.status().unwrap();
+            assert_eq!(images, 0);
+            assert!(sources.is_empty());
+            assert!(writer.browse(0, 10, None).unwrap().1.is_empty());
+            assert!(writer.get("asset_id = 'old'", false).unwrap().is_none());
+            writer.upsert(&image("new", 1)).unwrap();
+            writer.checkpoint().unwrap();
+            drop(writer);
+            assert_eq!(
+                Store::open(root.path(), false).unwrap().status().unwrap().0,
+                1
+            );
+        }
+    }
+    #[test]
+    fn partial_catalogs_and_legacy_databases_fail_without_repair() {
+        for entry in ["unrelated-file", "assets.lance"] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("catalog.lancedb");
+            std::fs::create_dir(&path).unwrap();
+            if entry == "assets.lance" {
+                std::fs::create_dir(path.join(entry)).unwrap();
+            } else {
+                std::fs::write(path.join(entry), "keep").unwrap();
+            }
+            let before = contents(root.path());
+            for read_only in [false, true] {
+                assert!(Store::open(root.path(), read_only).is_err());
+                assert_eq!(contents(root.path()), before);
+            }
+        }
+        for keep_directory in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            if keep_directory {
+                std::fs::create_dir(root.path().join("catalog.lancedb")).unwrap();
+            }
+            std::fs::write(root.path().join("search.db"), "old catalog").unwrap();
+            let before = contents(root.path());
+            assert!(Store::open(root.path(), false)
+                .unwrap_err()
+                .to_string()
+                .contains("Old development catalog"));
+            assert_eq!(contents(root.path()), before);
+        }
+    }
+    #[test]
+    fn removed_catalog_is_not_recreated_during_an_active_session() {
+        let root = tempfile::tempdir().unwrap();
+        let writer = Store::open(root.path(), false).unwrap();
+        let reader = Store::open(root.path(), true).unwrap();
+        std::fs::remove_dir_all(root.path().join("catalog.lancedb")).unwrap();
+        for store in [&writer, &reader] {
+            assert!(store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("stop and reopen"));
+            assert!(!root.path().join("catalog.lancedb").exists());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn catalog_symlinks_and_files_fail_without_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let path = root.path().join("catalog.lancedb");
+        for target_exists in [false, true] {
+            if target_exists {
+                std::fs::create_dir(&target).unwrap();
+            }
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            for read_only in [false, true] {
+                assert!(Store::open(root.path(), read_only)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not symlinks"));
+            }
+            assert!(!target_exists || std::fs::read_dir(&target).unwrap().next().is_none());
+            assert!(target_exists || !target.exists());
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::write(&path, "keep").unwrap();
+        for read_only in [false, true] {
+            assert!(Store::open(root.path(), read_only).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep");
+        }
     }
     #[test]
     fn missing_and_incompatible_catalogs_fail_without_repair() {

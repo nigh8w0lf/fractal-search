@@ -10,11 +10,13 @@ This repository is the complete standalone project: both Cargo workspace members
 - **Results:** a thumbnail list and selected-image preview, friendly folder names, an All folders filter, and explicit **Open image** / **Show in folder** buttons. Preferences offers list-and-preview or list-only layout; narrow windows use the list with actions beneath it. A photo grid is not implemented.
 - **Settings → Folders:** add folders, see image counts, remove a folder from the index, rescan folders, keep folders up to date and review skipped files. Removing a folder preserves originals and asks for confirmation.
 - **Settings → Preferences:** prepare search at login, hide after opening a photo, maximum results (default 6) and result layout.
-- **Settings → Performance:** model setup, a compact Accelerator section, shortcut setup and Stop service. Accelerator checks GPU requirements automatically when shown, displays actual CPU/GPU activity, and greys out an unavailable GPU. Details expands the report; Copy diagnostics prepares it to share with your agent. Availability does not mean active GPU inference and never changes the configured provider.
+- **Settings → Performance:** model setup, a compact Accelerator section, image batch size, shortcut setup and Stop service. Accelerator checks GPU requirements automatically when shown, displays actual CPU/GPU activity, and greys out an unavailable GPU. Details expands the report; Copy diagnostics prepares it to share with your agent. Availability does not mean active GPU inference and never changes the configured provider.
 
 Up/Down selects results, Enter opens the selection, Ctrl+Enter shows it in the file manager, and Ctrl+, opens Settings. Escape goes back or hides the panel. Ctrl+Q asks to stop the service; Cancel is focused by default, using the same confirmation component as folder removal. Left/Right switches a focused settings tab. All panels follow Omarchy's theme and font tokens.
 
 Hiding or reloading the UI keeps the backend and indexing alive. Stopping the service drains active work and saves the catalog; summoning starts it again. **Prepare search at login** controls the actual systemd user-unit enabled state and preloads only text inference. Vision loads lazily for indexing.
+
+**Image batch size** accepts 1–8 (default 1) for CPU and GPU indexing. Larger batches use more memory. Saving a change prompts **Restart now** or **Later**; the running service keeps its current size until restarted. Restart now safely drains indexing and reconnects the panel. Compatible consecutive images share a batch; changes in patch budget, skipped/unchanged files and the final partial batch can produce smaller batches. Inference errors never trigger retries at a smaller size or on another provider.
 
 ## Build, install and open
 
@@ -101,6 +103,8 @@ Defaults below follow XDG configuration/data/cache roots:
 | `$XDG_RUNTIME_DIR/fractal-search/backend.sock` | Private desktop socket. |
 
 Provider/device/private-library settings are preserved in the installed `.fractal-search-runtime.json`. UI preferences and model location persist in the data directory; login registration lives in systemd. Uninstall preserves the catalog and model cache. Never use these live paths for tests.
+
+At startup, the desktop backend creates an empty catalog if `catalog.lancedb/` is absent or completely empty, and logs its creation. If you delete the catalog while the service is running, stop and reopen Fractal Search to recreate it, then add folders and index them again. Settings and model caches are retained. A partially deleted, corrupt or incompatible catalog produces an error instead of being replaced; the read-only MCP server never creates a catalog.
 
 ```bash
 systemctl --user status fractal-search.service

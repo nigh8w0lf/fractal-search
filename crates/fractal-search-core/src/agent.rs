@@ -305,6 +305,9 @@ mod tests {
     use std::fs;
     struct Fake;
     impl Embedder for Fake {
+        fn embed_images(&mut self, images: &[image::RgbImage]) -> Result<Vec<Vec<f32>>> {
+            images.iter().map(|image| self.embed_image(image)).collect()
+        }
         fn embed_image(&mut self, _: &image::RgbImage) -> Result<Vec<f32>> {
             let mut v = vec![0.; EMBEDDING_DIM];
             v[0] = 1.;

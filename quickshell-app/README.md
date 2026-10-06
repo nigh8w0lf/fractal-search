@@ -12,7 +12,7 @@ Settings has three tabs:
 
 - **Folders:** add search folders, see their image counts, rescan, keep folders up to date, review skipped files, or remove a folder from the index. Removal always asks for confirmation and preserves originals.
 - **Preferences:** prepare search at login, hide after opening a photo, and choose the result count and layout.
-- **Performance:** set up the search engine, inspect GPU requirements, copy diagnostics, configure a launcher shortcut, and stop the service safely.
+- **Performance:** set up the search engine, inspect GPU requirements, copy diagnostics, choose image batch size, configure a launcher shortcut, and stop the service safely.
 
 The tabs remain visible while their contents scroll. Left/Right switches a focused tab. All panels use the active Omarchy theme; confirmations share the same component and default to Cancel.
 
@@ -39,6 +39,8 @@ Use **Set up model** on first open to download the pinned assets (~1.14 GB) with
 `--model-dir PATH` and `--threads N` can configure a development installation. CPU is the default; the thread default is half the available logical CPUs, rounded up and capped at six. Providers are never silently selected. The installed service prepares the text-search model in the background on startup; the vision model loads only when indexing needs it. Loaded models remain resident while the backend runs. Standalone developer commands retain lazy loading unless passed `--warm-search`.
 
 ### CUDA acceleration and diagnostics
+
+Performance also offers **Image batch size**, from 1 to 8 with a default of 1, for both CPU and CUDA indexing. Saving it prompts **Restart now** or **Later**; the current worker keeps its active size until restart, and a pending change remains visible. Restart now drains the current image and reconnects without closing the desktop shell. Larger batches use more memory; only consecutive images with matching individual patch budgets share inference, preserving the existing catalog profile. Skipped/unchanged files and batch tails can produce smaller batches. Inference failures stay fatal without batch-size or provider retries.
 
 Build a CUDA-capable bundle and explicitly select NVIDIA inference:
 
@@ -115,6 +117,8 @@ The card appears after Qt has submitted its first correctly sized buffer. The na
 
 Default runtime data lives in `$XDG_DATA_HOME/fractal-search/` (normally `~/.local/share/fractal-search/`): `catalog.lancedb/`, `settings.json`, `service.lock`, `thumbnails/` and `previews/`. A process lock prevents two services opening the same catalog. Do not select this directory or one of its ancestors as an image source. Models default to `$XDG_CACHE_HOME/fractal-search/models/fgclip2-33f3b9d4/`.
 
+The desktop backend creates and logs an empty catalog at startup when `catalog.lancedb/` is missing or completely empty. After deleting a catalog from a running service, stop and reopen Fractal Search, then add and index folders again; settings and model caches remain intact. Partial deletion, corruption and incompatible schemas remain visible errors. The read-only MCP server never creates or repairs a catalog.
+
 The 768-dimensional catalog records profile `fgclip2-base-33f3b9d4-dynamic-torch291-short64-v1`. It pins the export and the existing Torch 2.9.1 preprocessing behavior, including narrow-image positional interpolation. A different profile requires a separate catalog and reindexing; existing vectors are never silently mixed. Model assets and licensing are described in the [model manifest](../crates/fractal-search-core/models/fgclip2.json) and [model guide](../docs/MODELS.md).
 
 ## Desktop transport
@@ -132,7 +136,7 @@ Uncached semantic searches emit `searchProgress` events with the request `id` an
 Responses have `id`, `ok` and `result` or `error`. Events have `event` and `payload`; `indexProgress` also includes the indexing request ID. DTO fields use camelCase. Commands are `status`, `browse`, `search`, `index`, `preview`, `originalUrl`, `reveal`, `setModelDirectory`, `updateSettings`, `removeSource`, `theme`, `installModels`, `cancel`, `shutdown`. Directory arguments accept absolute local paths or local `file:` URLs. `status` is also a one-shot CLI mode that does not load models.
 
 
-`status.settings` contains `topMatches` (1–100, default 6), `resultLayout` (`listPreview` or `list`), `watchChanges` (default false), and `closeAfterOpening` (default true). `updateSettings` requires all four fields under `settings` and returns full status. These preferences persist alongside the configured model directory. `browse` and `search` accept an optional `sourceId` (null means all folders). `search` accepts `maxResults` (1–1,000); the UI supplies its top-match preference. `removeSource` requires a numeric `sourceId` and returns `{removed: imageCount}`. `reveal` requires `assetId` and uses the desktop file-manager interface to select the original; unsupported reveal operations fail visibly.
+`status.settings` contains `topMatches` (1–100, default 6), `resultLayout` (`listPreview` or `list`), `watchChanges` (default false), `closeAfterOpening` (default true), and `imageBatchSize` (1–8, default 1). `status.activeImageBatchSize` reports the size captured at worker startup. `updateSettings` requires all five fields under `settings` and returns full status; a batch-size change is saved without changing the running worker. These preferences persist alongside the configured model directory. `browse` and `search` accept an optional `sourceId` (null means all folders). `search` accepts `maxResults` (1–1,000); the UI supplies its top-match preference. `removeSource` requires a numeric `sourceId` and returns `{removed: imageCount}`. `reveal` requires `assetId` and uses the desktop file-manager interface to select the original; unsupported reveal operations fail visibly.
 
 When enabled, recursive folder watching coalesces changes and scans after a brief debounce. Background scans emit `indexStarted` with `{directory}`, `indexProgress` with `id: null`, `indexFinished` with the index result, or `indexError` with `{directory, error}`. Watch setup and runtime failures are reported; the app does not silently disable watching.
 Index progress includes `failed` and a `failure: {path, error}` on each skipped-file event. An index result includes `failed`, the first 100 `failures`, and `failuresOmitted`; `ok: true` means the scan completed or was cancelled, and callers must inspect these counts. Every skipped file is also logged to stderr. Reported error messages are bounded to 2,048 UTF-8 bytes plus an explicit truncation notice; full errors remain in stderr. The UI retains the bounded report across browsing/search until the next scan.
