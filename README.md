@@ -132,3 +132,7 @@ LanceDB stores folder records, image metadata and normalized vectors in `catalog
 This development format has no SQLite migration. Use a fresh `--data-dir /absolute/new/catalog` and index the desired folders. The model profile and opaque asset identities are unchanged. Lance versions are retained for concurrent readers; automatic compaction/version cleanup is not implemented yet.
 
 Builds require Rust 1.91 or newer and the Protocol Buffers compiler (`protoc`). LanceDB is pinned to 0.37.1 with cloud/remote features disabled; 0.38.0 and 0.39.0 have an upstream local-only compilation error in their job error handling.
+
+## Media in source control
+
+Image and video files are excluded from Git. Keep screen captures, design images and library media outside the tracked source. The tiny synthetic corrupt-JPEG regression fixture is stored as hexadecimal text and reconstructed by tests in temporary directories, so fresh clones do not require any image assets.

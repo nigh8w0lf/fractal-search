@@ -201,8 +201,8 @@ def main():
             png(corrupt / "a-valid.png")
             (corrupt / "b-bad.webp").write_bytes(b"not an image")
             png(corrupt / "d-valid.png", color=(20, 60, 210))
-            jpeg_fixture = pathlib.Path(__file__).resolve().parents[2] / "crates/fractal-search-core/tests/fixtures/jpeg-extraneous-byte.jpg"
-            shutil.copyfile(jpeg_fixture, corrupt / "c-corrupt.jpg")
+            jpeg_fixture = pathlib.Path(__file__).resolve().parents[2] / "crates/fractal-search-core/tests/fixtures/jpeg-extraneous-byte.jpg.hex"
+            (corrupt / "c-corrupt.jpg").write_bytes(bytes.fromhex(jpeg_fixture.read_text(encoding="ascii")))
             expected_failures = 2
             index_id = service.send({"type": "index", "directory": str(corrupt)})
             failure_event = service.until(

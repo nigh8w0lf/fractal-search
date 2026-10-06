@@ -1410,11 +1410,11 @@ mod tests {
         fs::create_dir(&photos).unwrap();
         save(&photos.join("a-valid.png"), [255, 0, 0]);
         let jpeg = photos.join("b-corrupt.jpg");
-        fs::write(
-            &jpeg,
-            include_bytes!("../tests/fixtures/jpeg-extraneous-byte.jpg"),
-        )
-        .unwrap();
+        let jpeg_bytes: Vec<u8> = include_str!("../tests/fixtures/jpeg-extraneous-byte.jpg.hex")
+            .split_ascii_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).expect("invalid synthetic JPEG fixture hex"))
+            .collect();
+        fs::write(&jpeg, jpeg_bytes).unwrap();
         fs::write(photos.join("c-invalid.webp"), b"not an image").unwrap();
         save(&photos.join("d-valid.png"), [0, 0, 255]);
         let mut catalog = Catalog::open(&root.path().join("data")).unwrap();
