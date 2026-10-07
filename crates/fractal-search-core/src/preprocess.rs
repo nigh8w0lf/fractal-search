@@ -871,4 +871,47 @@ mod tests {
         assert!(tokenizer.encode(" ").is_err());
         assert!(tokenizer.encode(&"a".repeat(MAX_TEXT_BYTES + 1)).is_err());
     }
+
+    #[test]
+    fn nonzero_audio_matches_independent_numpy_math_golden() {
+        // Fresh Gemma4AudioFeatureExtractor reference: Transformers 5.19.0,
+        // NumPy 2.5.2, pinned EmbeddingGemma 2 processor configuration at
+        // daa72c51243991dfcaf9f9137d2c573d8f7790c0. Pass [samples] at 16 kHz,
+        // truncation=false, padding="longest", pad_to_multiple_of=128.
+        // Waveform: x[i] = f32(i / 160.0 - 0.5), for i=0..=160, using f64
+        // arithmetic before conversion. This exercises nonzero Hann/FFT/mel
+        // arithmetic, which the silence regression cannot distinguish.
+        let samples: Vec<f32> = (0..=160)
+            .map(|i| (f64::from(i) / 160.0 - 0.5) as f32)
+            .collect();
+        let inputs = prepare_audio(&samples).unwrap();
+        assert_eq!(inputs.num_frames, 1);
+        assert_eq!(inputs.num_soft_tokens, 1);
+        assert_eq!(inputs.input_features_mask, [true]);
+        assert_eq!(inputs.input_features.len(), AUDIO_FEATURE_DIM);
+        let expected: [(usize, f32); 12] = [
+            (0, -6.9077554),
+            (1, 2.5745747),
+            (2, 1.388844),
+            (10, 1.042859),
+            (24, 0.9314934),
+            (27, 0.55618936),
+            (28, 0.7939004),
+            (29, 0.62345433),
+            (40, 0.38172242),
+            (64, 0.08495763),
+            (96, 0.042850018),
+            (127, 0.2909508),
+        ];
+        // Allow small libm/FFT rounding differences, not preprocessing drift.
+        for (bin, expected) in expected {
+            let actual = inputs.input_features[bin];
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "mel bin {bin}: {actual} != {expected}"
+            );
+        }
+        let total: f64 = inputs.input_features.iter().map(|&v| f64::from(v)).sum();
+        assert!((total - 45.76704395469278).abs() < 1e-4);
+    }
 }

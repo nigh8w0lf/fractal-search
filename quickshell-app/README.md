@@ -191,7 +191,24 @@ python3 quickshell-app/tests/smoke_backend.py \
 
 Omit `--fixtures` to use generated PNG inputs and the small synthetic corrupt-JPEG fixture only. Its hexadecimal text is decoded into the temporary test directory; no image fixture is tracked in Git. The script tests indexing, search pagination, preview dimensions, incremental rescans, missing-thumbnail repair, corrupt-file continuation and repair (including a JPEG extraneous-byte warning), saved preferences, folder-filtered ranking, source removal, native file-change watching, strict requests, cancellation, catalog locking, shutdown/reopen and EOF drain. All runtime catalogs and images are created under `/tmp` and removed afterward.
 
-### Historical validation before the model replacement
+#### Fresh reconstructed-source validation (2026-10-07)
+
+This implementation was reconstructed after a temporary workspace was removed. The checks below were rerun against the reconstructed source; earlier results were not reused as evidence.
+
+- Default and CUDA-feature all-target checks passed. Each workspace test suite passed **107 tests**, with one environment-blocked Unix-socket failure and three tests ignored by default. All 84 non-ignored core tests passed, including ten hybrid regressions. The complete suite still exits nonzero because the supported permission retry also returned `Operation not permitted` for the private Unix socket
+- The opt-in real FFmpeg catalog segmentation and pinned-tokenizer tests passed separately
+- Native preprocessing passed all 39 fresh fixtures, including image batch eight. Native CPU inference passed 38 cases / 39 embeddings across all modalities: minimum reference cosine `0.999999999992`, maximum component error `5.96e-7`. Inference image batches were at most two
+- Real multimodal/hybrid, backend lifecycle and read-only MCP checks passed, including failed-file preservation, cold/warm loading, cancellation, watching, shutdown/reopen, EOF/SIGTERM and cached access after originals were removed
+- End-to-end retrieval comparison passed 153 scores from 17 synthetic images and nine queries: maximum score error `2.45e-7`, nine of nine top-1 matches, 100% top-five overlap and no inversions beyond tolerance
+- Formatting, whitespace, Python/Bash syntax, eight downloader tests and the actual Controller JavaScript regression harness passed
+
+The cloud workspace used Rust 1.99 and CPU ONNX Runtime 1.22.0. Validation-only CLI settings disabled dependency optimization, debug information and incremental artifacts to reduce rebuild cost; production manifests, dependency versions, features and assertions were unchanged. Unoptimized SHA-256 caused an initial cold-start harness timeout, so normal level-two optimization was restored only for `sha2:0.10.9`; identical digests and eight model/hash tests were verified. Final backend/MCP/retrieval checks used those rebuilt binaries. The full suites, native parity and multimodal checks preceded this build-profile adjustment and cover unchanged source.
+
+A separate initial five-image indexing request exceeded the generic 60-second metadata deadline while progressing normally. Only that long-running request now uses the retrieval comparator's bounded 300-second async wait. Every assertion and all other metadata/cancellation deadlines remain unchanged; the full lifecycle rerun passed.
+
+Native Quickshell/Omarchy rendering/input, actual CUDA hardware/provider placement, GPU-ready packaging, full batch-eight inference, release performance and large-corpus relevance/storage/latency remain unverified. CUDA-feature checks used CPU ORT; Node/static checks are not render tests. Synthetic parity compares HF preprocessing plus the pinned ONNX export, not the original Google training checkpoint or a labeled relevance benchmark.
+
+## Historical validation before the model replacement
 
 The following dated results describe earlier source revisions and the previous model. They are retained as history only and do not validate the reconstructed EmbeddingGemma 2 multimodal/hybrid source. Current build, inference and native UI checks must be rerun.
 
