@@ -1,8 +1,10 @@
 //! LanceDB catalog and incremental indexing. Originals are never modified.
-use crate::store::{image_filter, quote, Record, Store};
+use crate::media::{self, MediaKind, PreparedMedia};
+#[cfg(test)]
+use crate::store::MAX_TEXT_EXCERPT_BYTES;
+use crate::store::{asset_filter, quote, Record, Store};
 use crate::{
-    preprocess::{decode_image, patch_budget},
-    Embedder, EMBEDDING_DIM, MAX_IMAGE_BATCH_SIZE, MODEL_PROFILE,
+    preprocess::decode_image, Embedder, EMBEDDING_DIM, MAX_IMAGE_BATCH_SIZE, MODEL_PROFILE,
 };
 use anyhow::{ensure, Context, Result};
 use image::{codecs::webp::WebPEncoder, ExtendedColorType, RgbImage};
@@ -29,12 +31,14 @@ const MAX_FAILURE_MESSAGE_BYTES: usize = 2048;
 pub struct Source {
     pub id: i64,
     pub directory: String,
-    pub image_count: usize,
+    pub asset_count: usize,
+    pub file_count: usize,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogStatus {
-    pub image_count: usize,
+    pub asset_count: usize,
+    pub file_count: usize,
     pub sources: Vec<Source>,
     pub model_profile: &'static str,
 }
@@ -47,7 +51,14 @@ pub struct Asset {
     pub thumbnail_url: String,
     pub width: u32,
     pub height: u32,
+    pub media_kind: String,
+    pub segment_index: u32,
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+    pub text_excerpt: Option<String>,
     pub similarity: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid_score: Option<f64>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,7 +108,7 @@ impl IndexProgress {
         failures: &mut Vec<IndexFailure>,
     ) {
         let mut message = format!("{error:#}");
-        eprintln!("[Index] Skipped image {path:?}: {message}");
+        eprintln!("[Index] Skipped file {path:?}: {message}");
         if message.len() > MAX_FAILURE_MESSAGE_BYTES {
             let mut end = MAX_FAILURE_MESSAGE_BYTES;
             while !message.is_char_boundary(end) {
@@ -147,7 +158,6 @@ struct IndexBatch {
     source_id: i64,
     images: Vec<RgbImage>,
     pending: Vec<PendingImage>,
-    budget: Option<usize>,
 }
 
 impl IndexBatch {
@@ -184,7 +194,6 @@ impl IndexBatch {
         }
         let images = std::mem::take(&mut self.images);
         let pending = std::mem::take(&mut self.pending);
-        self.budget = None;
         for ((pending, image), vector) in pending.into_iter().zip(images).zip(vectors) {
             state.failure = None;
             state.filename = pending
@@ -215,7 +224,7 @@ pub struct Catalog {
 
 fn text_path(path: &Path) -> Result<&str> {
     path.to_str()
-        .context("Image search requires UTF-8 filesystem paths")
+        .context("Media search requires UTF-8 filesystem paths")
 }
 fn file_url(path: &Path) -> Result<String> {
     Url::from_file_path(path)
@@ -223,12 +232,12 @@ fn file_url(path: &Path) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("Cannot create file URL for {path:?}"))
 }
 fn stamp(path: &Path) -> Result<Stamp> {
-    let metadata = fs::metadata(path).with_context(|| format!("Inspect image {path:?}"))?;
-    ensure!(metadata.is_file(), "Image is not a regular file: {path:?}");
+    let metadata = fs::metadata(path).with_context(|| format!("Inspect media {path:?}"))?;
+    ensure!(metadata.is_file(), "Media is not a regular file: {path:?}");
     let time = metadata
         .modified()?
         .duration_since(UNIX_EPOCH)
-        .context("Image modification time predates Unix epoch")?;
+        .context("Media modification time predates Unix epoch")?;
     Ok(Stamp {
         bytes: metadata.len(),
         modified: format!("{}.{}", time.as_secs(), time.subsec_nanos()),
@@ -243,8 +252,13 @@ fn validate_page(offset: usize, limit: usize) -> Result<()> {
 }
 pub(crate) fn validate_embedding(values: &[f32]) -> Result<()> {
     ensure!(
-        values.len() == EMBEDDING_DIM && values.iter().all(|v| v.is_finite()),
-        "Invalid 768-D image-search embedding"
+        values.len() == EMBEDDING_DIM,
+        "Search embedding must have {EMBEDDING_DIM} dimensions, got {}",
+        values.len()
+    );
+    ensure!(
+        values.iter().all(|v| v.is_finite()),
+        "Search embedding contains a non-finite value"
     );
     let norm: f64 = values
         .iter()
@@ -253,7 +267,7 @@ pub(crate) fn validate_embedding(values: &[f32]) -> Result<()> {
         .sqrt();
     ensure!(
         (norm - 1.0).abs() < 0.0001,
-        "Image-search embedding must be normalized (norm={norm})"
+        "Search embedding must be normalized (norm={norm})"
     );
     Ok(())
 }
@@ -285,6 +299,13 @@ fn bounded_dimensions(width: u32, height: u32, max_side: u32) -> (u32, u32) {
     }
     let scale = |side| (u64::from(side) * u64::from(max_side) / u64::from(longest)).max(1) as u32;
     (scale(width), scale(height))
+}
+
+fn cache_is_current(row: &Record) -> bool {
+    row.thumbnail.as_ref().is_none_or(|cache| {
+        image::image_dimensions(cache)
+            .is_ok_and(|dimensions| dimensions == bounded_dimensions(row.width, row.height, 384))
+    })
 }
 
 fn bounded_thumbnail(image: &RgbImage, max_side: u32) -> RgbImage {
@@ -323,23 +344,25 @@ impl Catalog {
         })
     }
     pub fn status(&self) -> Result<CatalogStatus> {
-        let (image_count, rows) = self.store.status()?;
+        let (asset_count, file_count, rows) = self.store.status()?;
         let mut sources = rows
             .into_iter()
-            .map(|(row, image_count)| Source {
+            .map(|(row, asset_count, file_count)| Source {
                 id: row.source_id,
                 directory: row.path,
-                image_count,
+                asset_count,
+                file_count,
             })
             .collect::<Vec<_>>();
         sources.sort_by(|a, b| a.directory.cmp(&b.directory));
         Ok(CatalogStatus {
-            image_count,
+            asset_count,
+            file_count,
             sources,
             model_profile: MODEL_PROFILE,
         })
     }
-    fn asset(row: Record) -> (Asset, PathBuf) {
+    fn asset(row: Record) -> (Asset, Option<PathBuf>) {
         (
             Asset {
                 asset_id: row.asset_id,
@@ -348,45 +371,32 @@ impl Catalog {
                 thumbnail_url: String::new(),
                 width: row.width,
                 height: row.height,
+                media_kind: row.media_kind,
+                segment_index: row.segment_index,
+                start_ms: row.start_ms,
+                end_ms: row.end_ms,
+                text_excerpt: row.text_excerpt,
                 similarity: None,
+                hybrid_score: None,
             },
-            PathBuf::from(row.thumbnail),
+            row.thumbnail.map(PathBuf::from),
         )
     }
-    fn complete_asset(&self, (mut asset, thumbnail): (Asset, PathBuf)) -> Result<Asset> {
+    fn complete_asset(&self, (mut asset, thumbnail): (Asset, Option<PathBuf>)) -> Result<Asset> {
+        let Some(thumbnail) = thumbnail else {
+            return Ok(asset);
+        };
         ensure!(
-            thumbnail.starts_with(&self.thumbnails) && thumbnail.is_file(),
+            thumbnail.parent() == Some(self.thumbnails.as_path()) && thumbnail.is_file(),
             "Thumbnail is unavailable for {}; rescan its folder",
-            asset.path
+            asset.filename
         );
         let dimensions = image::image_dimensions(&thumbnail)
             .with_context(|| format!("Read cached thumbnail dimensions {thumbnail:?}"))?;
-        if dimensions != bounded_dimensions(asset.width, asset.height, 384) {
-            ensure!(
-                dimensions == (384, 384),
-                "Cached thumbnail dimensions are invalid: {thumbnail:?}; rescan its source folder"
-            );
-            // Repair the earlier square-cache format lazily, without loading
-            // models or regenerating stored embeddings.
-            let record = self.store.asset(&asset.asset_id, false)?;
-            let (bytes, modified) = (record.bytes, record.modified);
-            let original = Path::new(&asset.path);
-            let indexed_stamp = Stamp { bytes, modified };
-            ensure!(
-                stamp(original)? == indexed_stamp,
-                "Image changed since indexing; rescan its folder before repairing its thumbnail"
-            );
-            let image = decode_image(original)?;
-            ensure!(
-                stamp(original)? == indexed_stamp,
-                "Image changed while repairing its thumbnail; rescan its folder"
-            );
-            write_atomic(&thumbnail, &self::thumbnail(&image)?)?;
-            eprintln!(
-                "[Cache] Repaired legacy square thumbnail for {:?}",
-                asset.asset_id
-            );
-        }
+        ensure!(
+            dimensions == bounded_dimensions(asset.width, asset.height, 384),
+            "Cached thumbnail dimensions are invalid; rescan its source folder"
+        );
         asset.thumbnail_url = file_url(&thumbnail)?;
         Ok(asset)
     }
@@ -410,11 +420,22 @@ impl Catalog {
         limit: usize,
         source_id: Option<i64>,
     ) -> Result<Page> {
+        self.browse_filtered(offset, limit, source_id, None)
+    }
+    pub fn browse_filtered(
+        &self,
+        offset: usize,
+        limit: usize,
+        source_id: Option<i64>,
+        media_kind: Option<MediaKind>,
+    ) -> Result<Page> {
         validate_page(offset, limit)?;
         if let Some(id) = source_id {
             self.source_directory(id)?;
         }
-        let (total, rows) = self.store.browse(offset, limit, source_id)?;
+        let (total, rows) = self
+            .store
+            .browse_filtered(offset, limit, source_id, media_kind)?;
         let items = rows
             .into_iter()
             .map(|r| self.complete_asset(Self::asset(r)))
@@ -435,6 +456,27 @@ impl Catalog {
         limit: usize,
         source_id: Option<i64>,
     ) -> Result<Vec<Asset>> {
+        self.search_results("", query_embedding, limit, source_id, None)
+    }
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        limit: usize,
+        source_id: Option<i64>,
+        media_kind: Option<MediaKind>,
+    ) -> Result<Vec<Asset>> {
+        crate::agent::validate_query(query)?;
+        self.search_results(query, query_embedding, limit, source_id, media_kind)
+    }
+    fn search_results(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        limit: usize,
+        source_id: Option<i64>,
+        media_kind: Option<MediaKind>,
+    ) -> Result<Vec<Asset>> {
         ensure!(
             (1..=MAX_RESULTS).contains(&limit),
             "Search result limit must be between 1 and {MAX_RESULTS}"
@@ -442,37 +484,33 @@ impl Catalog {
         if let Some(id) = source_id {
             self.source_directory(id)?;
         }
-        let rows = self.store.search(query_embedding, limit, source_id)?;
-        let mut assets = Vec::with_capacity(rows.len());
-        for (asset, distance) in rows {
-            ensure!(
-                distance.is_finite(),
-                "Vector search returned a non-finite distance"
-            );
-            let mut asset = self.complete_asset(Self::asset(asset))?;
-            asset.similarity = Some((1.0 - distance).clamp(-1.0, 1.0));
-            assets.push(asset);
-        }
-        assets.sort_by(|a, b| {
-            b.similarity
-                .expect("search score")
-                .total_cmp(&a.similarity.expect("search score"))
-                .then(a.asset_id.cmp(&b.asset_id))
-        });
-        Ok(assets)
+        let hits =
+            self.store
+                .search_filtered(query, query_embedding, limit, source_id, media_kind)?;
+        hits.into_iter()
+            .map(|hit| {
+                let mut asset = self.complete_asset(Self::asset(hit.row))?;
+                asset.similarity = Some((1.0 - hit.distance).clamp(-1.0, 1.0));
+                asset.hybrid_score = hit.hybrid_score;
+                Ok(asset)
+            })
+            .collect()
     }
     /// Remove the source and its images in one Lance commit, then delete caches.
     pub fn remove_source(&mut self, source_id: i64) -> Result<usize> {
         self.source_directory(source_id)?;
         let rows = self
             .store
-            .list(&image_filter(Some(source_id)), MAX_FILES + 1, false)?;
-        ensure!(rows.len() <= MAX_FILES, "Source exceeds image limit");
+            .list(&asset_filter(Some(source_id)), MAX_FILES + 1, false)?;
+        ensure!(rows.len() <= MAX_FILES, "Source exceeds segment limit");
         self.store.delete(&format!("source_id = {source_id}"))?;
         for row in &rows {
-            self.remove_cache(Path::new(&row.thumbnail))?;
+            if let Some(cache) = &row.thumbnail {
+                self.remove_cache(Path::new(cache))?;
+            }
             self.remove_cache(&self.previews.join(format!("{}.png", row.asset_id)))?;
         }
+        self.store.checkpoint()?;
         Ok(rows.len())
     }
     fn source(&mut self, directory: &Path) -> Result<i64> {
@@ -535,7 +573,7 @@ impl Catalog {
             .context("Catalog data path missing")?;
         ensure!(
             !data_dir.starts_with(&directory) && !directory.starts_with(data_dir),
-            "Choose an image folder outside the search application's data directory"
+            "Choose a media folder outside the search application's data directory"
         );
         let source_id = self.source(&directory)?;
         let mut state = IndexProgress {
@@ -560,22 +598,13 @@ impl Catalog {
             if !entry.file_type().is_file() {
                 continue;
             }
-            let extension = entry
-                .path()
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !matches!(
-                extension.as_str(),
-                "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "heic" | "heif"
-            ) {
+            if media::kind_for_path(entry.path()).is_none() {
                 continue;
             }
             paths.push(entry.path().canonicalize()?);
             ensure!(
                 paths.len() <= MAX_FILES,
-                "Folder scan exceeded {MAX_FILES} images; select a smaller folder"
+                "Folder scan exceeded {MAX_FILES} files; select a smaller folder"
             );
         }
         paths.sort();
@@ -586,7 +615,6 @@ impl Catalog {
             source_id,
             images: Vec::with_capacity(batch_size),
             pending: Vec::with_capacity(batch_size),
-            budget: None,
         };
         for path in &paths {
             if cancelled() {
@@ -617,18 +645,59 @@ impl Catalog {
                     continue;
                 }
             };
-            let existing = self.store.get(
-                &format!("kind = 'image' AND path = {}", quote(path_text)),
+            let existing_rows = self.store.list(
+                &format!(
+                    "kind = 'asset' AND source_id = {source_id} AND path = {}",
+                    quote(path_text)
+                ),
+                MAX_FILES + 1,
                 false,
             )?;
+            ensure!(
+                existing_rows.len() <= MAX_FILES,
+                "File exceeds segment limit"
+            );
+            if media::kind_for_path(path) != Some(MediaKind::Image) {
+                if batch.flush(
+                    self,
+                    embedder,
+                    &mut state,
+                    &mut failures,
+                    &cancelled,
+                    &mut progress,
+                )? {
+                    return Ok(state.result(0, true, failures));
+                }
+                state.failure = None;
+                state.filename = path
+                    .file_name()
+                    .context("Media filename missing")?
+                    .to_string_lossy()
+                    .into_owned();
+                if self.index_media_file(
+                    source_id,
+                    path,
+                    before,
+                    existing_rows,
+                    embedder,
+                    &mut state,
+                    &mut failures,
+                    &cancelled,
+                )? {
+                    return Ok(state.result(0, true, failures));
+                }
+                progress(&state)?;
+                continue;
+            }
+            ensure!(
+                existing_rows.len() <= 1,
+                "Image has multiple indexed segments"
+            );
+            let existing = existing_rows.into_iter().next();
             let unchanged = existing
                 .as_ref()
                 .is_some_and(|row| row.bytes == before.bytes && row.modified == before.modified);
-            if unchanged
-                && existing
-                    .as_ref()
-                    .is_some_and(|row| Path::new(&row.thumbnail).is_file())
-            {
+            if unchanged && existing.as_ref().is_some_and(|row| cache_is_current(row)) {
                 if batch.flush(
                     self,
                     embedder,
@@ -718,22 +787,8 @@ impl Catalog {
                 progress(&state)?;
                 continue;
             }
-            let budget = patch_budget(image.width(), image.height())?;
-            // prepare_images uses a shared patch budget. Only group images
-            // with the same individual budget to preserve existing embeddings.
-            if batch.budget.is_some_and(|previous| previous != budget)
-                && batch.flush(
-                    self,
-                    embedder,
-                    &mut state,
-                    &mut failures,
-                    &cancelled,
-                    &mut progress,
-                )?
-            {
-                return Ok(state.result(0, true, failures));
-            }
-            batch.budget = Some(budget);
+            // EmbeddingGemma2 pads every image to the same 2520-patch budget,
+            // so consecutive images can share a batch regardless of dimensions.
             batch.images.push(image);
             batch.pending.push(pending);
             if batch.images.len() == batch_size
@@ -767,12 +822,15 @@ impl Catalog {
             .collect::<Result<_>>()?;
         let previous = self
             .store
-            .list(&image_filter(Some(source_id)), MAX_FILES + 1, false)?;
-        ensure!(previous.len() <= MAX_FILES, "Source exceeds image limit");
+            .list(&asset_filter(Some(source_id)), MAX_FILES + 1, false)?;
+        ensure!(previous.len() <= MAX_FILES, "Source exceeds segment limit");
         let stale = previous
             .into_iter()
             .filter(|row| !seen.contains(&row.path))
             .collect::<Vec<_>>();
+        if cancelled() {
+            return Ok(state.result(0, true, failures));
+        }
         let mut removed = 0;
         for rows in stale.chunks(1000) {
             let ids = rows
@@ -781,17 +839,238 @@ impl Catalog {
                 .collect::<Vec<_>>()
                 .join(",");
             self.store
-                .delete(&format!("kind = 'image' AND asset_id IN ({ids})"))?;
+                .delete(&format!("kind = 'asset' AND asset_id IN ({ids})"))?;
             for row in rows {
-                self.remove_cache(Path::new(&row.thumbnail))?;
+                if let Some(cache) = &row.thumbnail {
+                    self.remove_cache(Path::new(cache))?;
+                }
                 self.remove_cache(&self.previews.join(format!("{}.png", row.asset_id)))?;
                 removed += 1;
             }
         }
+        // Only completed traversals refresh the derived text index. Individual
+        // file commits (including interrupted scans) are searchable immediately.
+        self.store.checkpoint()?;
         state.stage = "complete";
         state.failure = None;
         progress(&state)?;
         Ok(state.result(removed, false, failures))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn index_media_file<E: Embedder>(
+        &self,
+        source_id: i64,
+        path: &Path,
+        before: Stamp,
+        existing: Vec<Record>,
+        embedder: &mut E,
+        state: &mut IndexProgress,
+        failures: &mut Vec<IndexFailure>,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<bool> {
+        let unchanged = !existing.is_empty()
+            && existing
+                .iter()
+                .all(|row| row.bytes == before.bytes && row.modified == before.modified);
+        if unchanged && existing.iter().all(cache_is_current) {
+            state.unchanged += 1;
+            state.current += 1;
+            return Ok(cancelled());
+        }
+        let info = match media::inspect(path) {
+            Ok(info) => info,
+            Err(error) => {
+                state.record_failure(path, error, failures);
+                return Ok(cancelled());
+            }
+        };
+        let specs = match media::segments(path, &info) {
+            Ok(specs) if !specs.is_empty() => specs,
+            Ok(_) => {
+                state.record_failure(
+                    path,
+                    anyhow::anyhow!("File contains no indexable segments"),
+                    failures,
+                );
+                return Ok(cancelled());
+            }
+            Err(error) => {
+                state.record_failure(path, error, failures);
+                return Ok(cancelled());
+            }
+        };
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Media has no UTF-8 filename")?;
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(format!("{}:{}", before.bytes, before.modified).as_bytes())
+        );
+        let mut rows = Vec::with_capacity(specs.len());
+        let mut thumbnails = Vec::new();
+        for spec in specs {
+            if cancelled() {
+                return Ok(true);
+            }
+            let prepared = match media::decode_segment(path, &info, &spec) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    state.record_failure(path, error, failures);
+                    return Ok(cancelled());
+                }
+            };
+            if cancelled() {
+                return Ok(true);
+            }
+            // Modality-local indices survive soundtrack additions/removals and
+            // slight tail-boundary changes when a file grows or shrinks.
+            let old = existing.iter().find(|row| {
+                row.media_kind == spec.kind.as_str() && row.segment_index == spec.index
+            });
+            let asset_id = old
+                .map(|row| row.asset_id.clone())
+                .unwrap_or_else(|| format!("asset_{}", Uuid::new_v4()));
+            let embedding = if unchanged && old.is_some() {
+                self.store
+                    .asset(&old.expect("matched unchanged segment").asset_id, true)?
+                    .embedding
+                    .context("Indexed segment is missing its embedding")?
+            } else {
+                match &prepared {
+                    PreparedMedia::Text { title, text } => embedder.embed_document(title, text),
+                    PreparedMedia::Audio { samples } => embedder.embed_audio(samples),
+                    PreparedMedia::Video { frames } => embedder.embed_video(frames),
+                }
+                .with_context(|| {
+                    format!(
+                        "Embed {} segment {} of {path:?}",
+                        spec.kind.as_str(),
+                        spec.index
+                    )
+                })?
+            };
+            validate_embedding(&embedding)?;
+            // A multi-segment file is one unit: cancellation never publishes a
+            // partial document, clip, or soundtrack, or removes its old rows.
+            if cancelled() {
+                return Ok(true);
+            }
+            let (width, height, cache) = match prepared {
+                PreparedMedia::Video { frames } => {
+                    let frame = frames
+                        .first()
+                        .context("Decoded video segment has no frames")?;
+                    let cache = self
+                        .thumbnails
+                        .join(format!("{asset_id}-{}.webp", &digest[..16]));
+                    thumbnails.push((cache.clone(), thumbnail(frame)?));
+                    (
+                        frame.width(),
+                        frame.height(),
+                        Some(text_path(&cache)?.to_owned()),
+                    )
+                }
+                PreparedMedia::Text { .. } | PreparedMedia::Audio { .. } => (0, 0, None),
+            };
+            // Full passage is private index content; the display excerpt stays
+            // separately bounded and never includes the filename or directory.
+            let indexed_text = spec.text.as_ref().map(|text| format!("{filename}\n{text}"));
+            let text_excerpt = spec
+                .text
+                .as_deref()
+                .map(crate::store::text_excerpt)
+                .map(str::to_owned);
+            rows.push(Record {
+                kind: "asset".into(),
+                asset_id,
+                source_id,
+                path: text_path(path)?.to_owned(),
+                filename: filename.to_owned(),
+                width,
+                height,
+                bytes: before.bytes,
+                modified: before.modified.clone(),
+                thumbnail: cache,
+                media_kind: spec.kind.as_str().into(),
+                segment_index: spec.index,
+                start_ms: spec.start_ms,
+                end_ms: spec.end_ms,
+                text_excerpt,
+                indexed_text,
+                embedding: Some(embedding),
+            });
+        }
+        let check = || {
+            stamp(path).and_then(|after| {
+                ensure!(
+                    after == before,
+                    "File changed during indexing: {path:?}; rescan after it finishes changing"
+                );
+                Ok(())
+            })
+        };
+        if let Err(error) = check() {
+            state.record_failure(path, error, failures);
+            return Ok(cancelled());
+        }
+        if cancelled() {
+            return Ok(true);
+        }
+        // Cache files are staged only after every segment has decoded and passed
+        // the vector contract. Old cache names remain valid until the commit.
+        for (cache, bytes) in &thumbnails {
+            if let Err(error) = write_atomic(cache, bytes) {
+                self.discard_staged_thumbnails(&thumbnails, &existing)?;
+                return Err(error).context("Write indexed segment thumbnail");
+            }
+        }
+        if cancelled() {
+            self.discard_staged_thumbnails(&thumbnails, &existing)?;
+            return Ok(true);
+        }
+        if let Err(error) = check() {
+            self.discard_staged_thumbnails(&thumbnails, &existing)?;
+            state.record_failure(path, error, failures);
+            return Ok(false);
+        }
+        if let Err(error) = self.store.replace_file(source_id, text_path(path)?, &rows) {
+            self.discard_staged_thumbnails(&thumbnails, &existing)?;
+            return Err(error);
+        }
+        let retained = rows
+            .iter()
+            .filter_map(|row| row.thumbnail.as_deref())
+            .collect::<HashSet<_>>();
+        for old in existing {
+            if let Some(cache) = old
+                .thumbnail
+                .as_deref()
+                .filter(|cache| !retained.contains(cache))
+            {
+                self.remove_cache(Path::new(cache))?;
+            }
+            self.remove_cache(&self.previews.join(format!("{}.png", old.asset_id)))?;
+        }
+        state.indexed += 1;
+        state.current += 1;
+        Ok(cancelled())
+    }
+    fn discard_staged_thumbnails(
+        &self,
+        staged: &[(PathBuf, Vec<u8>)],
+        existing: &[Record],
+    ) -> Result<()> {
+        for (path, _) in staged {
+            if !existing.iter().any(|row| {
+                row.thumbnail
+                    .as_deref()
+                    .is_some_and(|old| Path::new(old) == path)
+            }) {
+                self.remove_cache(path)?;
+            }
+        }
+        Ok(())
     }
     fn finish_index_image(
         &self,
@@ -834,28 +1113,50 @@ impl Catalog {
             .join(format!("{asset_id}-{}.webp", &digest[..16]));
         let thumb_start = Instant::now();
         write_atomic(&cache, &thumbnail(image)?)?;
+        if let Err(error) = stamp(&path).and_then(|after| {
+            ensure!(
+                before == after,
+                "Image changed while preparing its thumbnail; rescan its folder"
+            );
+            Ok(())
+        }) {
+            if existing.as_ref().and_then(|row| row.thumbnail.as_deref())
+                != Some(text_path(&cache)?)
+            {
+                self.remove_cache(&cache)?;
+            }
+            state.record_failure(&path, error, failures);
+            return Ok(());
+        }
         let filename = path
             .file_name()
             .and_then(|s| s.to_str())
             .context("Image has no UTF-8 filename")?;
-        self.store.upsert(&Record {
-            kind: "image".into(),
-            asset_id: asset_id.clone(),
+        self.store.replace_file(
             source_id,
-            path: text_path(&path)?.to_owned(),
-            filename: filename.to_owned(),
-            width: image.width(),
-            height: image.height(),
-            bytes: before.bytes,
-            modified: before.modified.clone(),
-            thumbnail: text_path(&cache)?.to_owned(),
-            embedding: Some(embedding),
-        })?;
-        if let Some(old) = existing
-            .as_ref()
-            .filter(|r| r.thumbnail != text_path(&cache).expect("validated cache path"))
-        {
-            self.remove_cache(Path::new(&old.thumbnail))?;
+            text_path(&path)?,
+            &[Record {
+                kind: "asset".into(),
+                media_kind: "image".into(),
+                asset_id: asset_id.clone(),
+                source_id,
+                path: text_path(&path)?.to_owned(),
+                filename: filename.to_owned(),
+                width: image.width(),
+                height: image.height(),
+                bytes: before.bytes,
+                modified: before.modified.clone(),
+                thumbnail: Some(text_path(&cache)?.to_owned()),
+                embedding: Some(embedding),
+                ..Record::default()
+            }],
+        )?;
+        if let Some(old) = existing.as_ref().filter(|r| {
+            r.thumbnail.as_deref() != Some(text_path(&cache).expect("validated cache path"))
+        }) {
+            if let Some(cache) = &old.thumbnail {
+                self.remove_cache(Path::new(cache))?;
+            }
         }
         self.remove_cache(&self.previews.join(format!("{asset_id}.png")))?;
         state.indexed += 1;
@@ -885,6 +1186,7 @@ impl Catalog {
         )
         .context("Invalid asset UUID")?;
         let record = self.store.asset(asset_id, false)?;
+        ensure!(record.media_kind == "image", "Full previews are available only for images; use the video thumbnail or open the original file");
         let (path, bytes, modified, width, height) = (
             record.path,
             record.bytes,
@@ -899,19 +1201,14 @@ impl Catalog {
             "Image changed since indexing; rescan its folder before previewing it"
         );
         let preview = self.previews.join(format!("{asset_id}.png"));
-        let repair_square = if preview.is_file() {
+        if preview.is_file() {
             let dimensions = image::image_dimensions(&preview)
                 .with_context(|| format!("Read cached preview dimensions {preview:?}"))?;
-            let outdated = dimensions != bounded_dimensions(width, height, 1600);
             ensure!(
-                !outdated || dimensions == (1600, 1600),
-                "Cached preview dimensions are invalid: {preview:?}; rescan its source folder"
+                dimensions == bounded_dimensions(width, height, 1600),
+                "Cached preview dimensions are invalid; rescan its source folder"
             );
-            outdated
         } else {
-            false
-        };
-        if !preview.is_file() || repair_square {
             let image = decode_image(path)?;
             let pixels = bounded_thumbnail(&image, 1600);
             let mut bytes = std::io::Cursor::new(Vec::new());
@@ -921,9 +1218,6 @@ impl Catalog {
                 "Image changed while generating its preview; rescan its folder"
             );
             write_atomic(&preview, &bytes.into_inner())?;
-            if repair_square {
-                eprintln!("[Cache] Repaired legacy square preview for {asset_id:?}");
-            }
         }
         file_url(&preview)
     }
@@ -932,7 +1226,7 @@ impl Catalog {
         let path = self.store.asset(asset_id, false)?.path;
         ensure!(
             Path::new(&path).is_file(),
-            "Original image is missing: {path}"
+            "Original media file is missing: {path}"
         );
         file_url(Path::new(&path))
     }
@@ -944,6 +1238,7 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preprocess::patch_budget;
     use anyhow::bail;
     struct FakeEmbedder {
         images: usize,
@@ -972,6 +1267,7 @@ mod tests {
         calls: Vec<Vec<usize>>,
         cancel: Option<&'a std::cell::Cell<bool>>,
         invalid_output: bool,
+        invalid_embedding: Option<Vec<f32>>,
     }
     impl Embedder for BatchEmbedder<'_> {
         fn embed_image(&mut self, _: &RgbImage) -> Result<Vec<f32>> {
@@ -982,7 +1278,7 @@ mod tests {
                 .iter()
                 .map(|image| patch_budget(image.width(), image.height()))
                 .collect::<Result<Vec<_>>>()?;
-            assert!(budgets.iter().all(|budget| *budget == budgets[0]));
+            assert!(budgets.iter().all(|budget| *budget == 2520));
             self.calls.push(budgets);
             if let Some(cancel) = self.cancel {
                 cancel.set(true);
@@ -990,6 +1286,9 @@ mod tests {
             let mut vectors = self.model.embed_images(images)?;
             if self.invalid_output {
                 vectors.pop();
+            }
+            if let Some(vector) = &self.invalid_embedding {
+                *vectors.last_mut().expect("nonempty batch") = vector.clone();
             }
             Ok(vectors)
         }
@@ -1003,6 +1302,7 @@ mod tests {
             calls: vec![],
             cancel: None,
             invalid_output: false,
+            invalid_embedding: None,
         }
     }
     #[test]
@@ -1047,7 +1347,7 @@ mod tests {
         }
     }
     #[test]
-    fn indexing_batches_keep_individual_patch_budgets_and_report_corrupt_files() {
+    fn indexing_batches_mix_dimensions_with_fixed_patch_budget_and_report_corrupt_files() {
         let root = tempfile::tempdir().unwrap();
         let photos = root.path().join("photos");
         fs::create_dir(&photos).unwrap();
@@ -1069,7 +1369,7 @@ mod tests {
             .index_with_batch_size(&photos, &mut model, 8, || false, |_| Ok(()))
             .unwrap();
         assert_eq!((result.indexed, result.failed), (5, 1));
-        assert_eq!(model.calls, [vec![128, 128], vec![256, 256], vec![1024]]);
+        assert_eq!(model.calls, [vec![2520; 4], vec![2520]]);
         for size in [0, 9] {
             assert!(catalog
                 .index_with_batch_size(&photos, &mut model, size, || false, |_| Ok(()))
@@ -1109,7 +1409,7 @@ mod tests {
         assert!(result.cancelled);
         assert_eq!((result.indexed, result.removed), (1, 0));
         assert_eq!(model.calls.len(), 1);
-        assert_eq!(catalog.status().unwrap().image_count, 5);
+        assert_eq!(catalog.status().unwrap().asset_count, 5);
         assert_eq!(
             catalog
                 .store
@@ -1147,10 +1447,10 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("3 embeddings for 4 images"));
         assert_eq!(model.calls.len(), 1);
-        assert_eq!(catalog.status().unwrap().image_count, 0);
+        assert_eq!(catalog.status().unwrap().asset_count, 0);
     }
     #[test]
-    fn cached_images_preserve_aspect_ratio_and_repair_legacy_square_files() {
+    fn cached_images_preserve_aspect_ratio_and_reject_wrong_thumbnail_dimensions() {
         let root = tempfile::tempdir().unwrap();
         let photos = root.path().join("photos");
         fs::create_dir(&photos).unwrap();
@@ -1196,7 +1496,10 @@ mod tests {
             );
             RgbImage::new(384, 384).save(&thumbnail).unwrap();
             RgbImage::new(1600, 1600).save(&preview).unwrap();
-            catalog.browse(0, 10).unwrap();
+            assert!(catalog.browse(0, 10).is_err());
+            catalog
+                .index(&photos, &mut model, || false, |_| Ok(()))
+                .unwrap();
             catalog.preview(&asset.asset_id).unwrap();
             assert_eq!(
                 image::image_dimensions(&thumbnail).unwrap(),
@@ -1266,7 +1569,7 @@ mod tests {
         assert_eq!(catalog.remove_source(blue_id).unwrap(), 2);
         assert!(!thumbnail.exists() && !preview.exists());
         assert!(blue.join("blue-a.png").exists() && blue.join("blue-b.png").exists());
-        assert_eq!(catalog.status().unwrap().image_count, 1);
+        assert_eq!(catalog.status().unwrap().asset_count, 1);
         assert_eq!(catalog.search(&query, 10).unwrap().len(), 1);
         assert!(catalog.browse_source(0, 1, Some(blue_id)).is_err());
         assert!(catalog.search_source(&query, 1, Some(0)).is_err());
@@ -1331,7 +1634,7 @@ mod tests {
                 .unwrap()
                 .cancelled
         );
-        assert_eq!(catalog.status().unwrap().image_count, 2);
+        assert_eq!(catalog.status().unwrap().asset_count, 2);
         assert_eq!(
             catalog
                 .index(&photos, &mut model, || false, |_| Ok(()))
@@ -1355,7 +1658,7 @@ mod tests {
                 .unwrap()
                 .status()
                 .unwrap()
-                .image_count,
+                .asset_count,
             1
         );
     }
@@ -1525,7 +1828,7 @@ mod tests {
         assert!(result.cancelled);
         assert_eq!((result.unchanged, result.failed, result.removed), (1, 1, 0));
         assert_eq!(result.failures.len(), 1);
-        assert_eq!(catalog.status().unwrap().image_count, 3);
+        assert_eq!(catalog.status().unwrap().asset_count, 3);
 
         save(&photos.join("b-existing.png"), [0, 0, 255]);
         let result = catalog
@@ -1584,7 +1887,7 @@ mod tests {
             .unwrap();
         assert_eq!((result.indexed, result.failed, result.removed), (1, 2, 0));
         assert!(result.failures[0].path.ends_with("a-vanished.png"));
-        assert!(result.failures[0].error.contains("Inspect image"));
+        assert!(result.failures[0].error.contains("Inspect media"));
         assert!(result.failures[1].error.contains("changed during indexing"));
         assert_eq!(
             catalog.browse(0, 100).unwrap().items[0].filename,
@@ -1622,7 +1925,7 @@ mod tests {
         assert_eq!(result.failures.len(), MAX_REPORTED_FAILURES);
         assert_eq!(result.failures_omitted, 2);
         assert_eq!(model.images, 0);
-        assert_eq!(catalog.status().unwrap().image_count, 0);
+        assert_eq!(catalog.status().unwrap().asset_count, 0);
     }
 
     #[test]
@@ -1675,6 +1978,531 @@ mod tests {
             )
             .is_err());
         assert_eq!(skipped, 0);
-        assert_eq!(catalog.status().unwrap().image_count, 0);
+        assert_eq!(catalog.status().unwrap().asset_count, 0);
+    }
+    struct DocumentEmbedder<'a> {
+        calls: usize,
+        fail_at: Option<usize>,
+        invalid_at: Option<usize>,
+        cancel: Option<&'a std::cell::Cell<bool>>,
+        mutate: Option<PathBuf>,
+    }
+    impl Embedder for DocumentEmbedder<'_> {
+        fn embed_images(&mut self, _: &[RgbImage]) -> Result<Vec<Vec<f32>>> {
+            bail!("Unexpected image model")
+        }
+        fn embed_image(&mut self, _: &RgbImage) -> Result<Vec<f32>> {
+            bail!("Unexpected image model")
+        }
+        fn embed_text(&mut self, _: &str) -> Result<Vec<f32>> {
+            bail!("Documents must use the document task prefix")
+        }
+        fn embed_document(&mut self, title: &str, text: &str) -> Result<Vec<f32>> {
+            assert!(!title.is_empty() && !text.is_empty());
+            self.calls += 1;
+            if self.fail_at == Some(self.calls) {
+                bail!("Synthetic document model failure");
+            }
+            if let Some(cancel) = self.cancel {
+                cancel.set(true);
+            }
+            if let Some(path) = self.mutate.take() {
+                fs::write(path, b"Changed during inference")?;
+            }
+            if self.invalid_at == Some(self.calls) {
+                return Ok(vec![f32::NAN; EMBEDDING_DIM]);
+            }
+            let mut vector = vec![0.; EMBEDDING_DIM];
+            vector[2] = 1.;
+            Ok(vector)
+        }
+    }
+    fn document_embedder() -> DocumentEmbedder<'static> {
+        DocumentEmbedder {
+            calls: 0,
+            fail_at: None,
+            invalid_at: None,
+            cancel: None,
+            mutate: None,
+        }
+    }
+    fn text_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Catalog) {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("documents");
+        fs::create_dir(&source).unwrap();
+        let path = source.join("chapter.txt");
+        fs::write(
+            &path,
+            "A searchable document passage with bounded UTF-8 text. ".repeat(500),
+        )
+        .unwrap();
+        let catalog = Catalog::open(&root.path().join("data")).unwrap();
+        (root, source, path, catalog)
+    }
+    #[test]
+    fn text_scope_finds_full_passages_and_titles_without_exposing_private_index_content() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("private-document-directory");
+        fs::create_dir(&source).unwrap();
+        let passage = format!("{} privatefullpassagebeacon", "ordinary text ".repeat(190));
+        fs::write(source.join("filenamebeacon.md"), &passage).unwrap();
+        fs::write(source.join("other.txt"), "Unrelated passage").unwrap();
+        let data = root.path().join("data");
+        let mut catalog = Catalog::open(&data).unwrap();
+        catalog
+            .index(&source, &mut document_embedder(), || false, |_| Ok(()))
+            .unwrap();
+        let mut vector = vec![0.0; EMBEDDING_DIM];
+        vector[2] = 1.0;
+        let original = catalog
+            .browse_filtered(0, 100, None, Some(MediaKind::Text))
+            .unwrap();
+        assert_eq!(original.total, 2);
+        assert!(original
+            .items
+            .iter()
+            .all(|asset| asset.text_excerpt.as_ref().unwrap().len() <= MAX_TEXT_EXCERPT_BYTES));
+        assert!(!serde_json::to_string(&original)
+            .unwrap()
+            .contains("privatefullpassagebeacon"));
+        let before_semantic = catalog.search(&vector, 100).unwrap();
+        assert!(before_semantic
+            .iter()
+            .all(|asset| asset.hybrid_score.is_none()));
+        let agent = crate::agent::AgentCatalog::open(&data).unwrap();
+        // Search has no dependency on the originals after the atomic row commit.
+        fs::remove_dir_all(&source).unwrap();
+        for query in ["privatefullpassagebeacon", "filenamebeacon"] {
+            let desktop = catalog
+                .search_filtered(query, &vector, 100, None, Some(MediaKind::Text))
+                .unwrap();
+            let remote = agent
+                .search_filtered(query, &vector, 100, Some(MediaKind::Text))
+                .unwrap();
+            assert_eq!(desktop[0].filename, "filenamebeacon.md");
+            assert_eq!(desktop[0].asset_id, remote[0].asset_id);
+            assert_eq!(
+                desktop
+                    .iter()
+                    .map(|asset| &asset.asset_id)
+                    .collect::<Vec<_>>(),
+                remote
+                    .iter()
+                    .map(|asset| &asset.asset_id)
+                    .collect::<Vec<_>>()
+            );
+            assert!(desktop
+                .windows(2)
+                .all(|pair| pair[0].hybrid_score >= pair[1].hybrid_score));
+            assert!(remote
+                .iter()
+                .all(|asset| asset.similarity.unwrap() > 0.9999));
+            let json = serde_json::to_string(&remote).unwrap();
+            for private in [
+                "indexed_text",
+                "indexedText",
+                "privatefullpassagebeacon",
+                "private-document-directory",
+                "\"path\"",
+                "file://",
+            ] {
+                assert!(!json.contains(private), "Metadata leaked {private}");
+            }
+            assert!(json.contains("hybridScore"));
+        }
+        assert_eq!(
+            agent
+                .browse_filtered(0, 10, Some(MediaKind::Text))
+                .unwrap()
+                .total,
+            2
+        );
+        assert_eq!(
+            agent
+                .browse_filtered(0, 10, Some(MediaKind::Image))
+                .unwrap()
+                .total,
+            0
+        );
+        let after_semantic = catalog
+            .search_filtered("privatefullpassagebeacon", &vector, 100, None, None)
+            .unwrap();
+        assert_eq!(
+            before_semantic
+                .iter()
+                .map(|asset| &asset.asset_id)
+                .collect::<Vec<_>>(),
+            after_semantic
+                .iter()
+                .map(|asset| &asset.asset_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(after_semantic
+            .iter()
+            .all(|asset| asset.hybrid_score.is_none()));
+    }
+    #[test]
+    fn text_segments_have_stable_ids_bounded_metadata_and_atomic_replacement() {
+        let (_root, source, path, mut catalog) = text_fixture();
+        let mut model = document_embedder();
+        let indexed = catalog
+            .index(&source, &mut model, || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(indexed.indexed, 1);
+        let first = catalog.browse(0, 100).unwrap();
+        assert!(first.total > 1 && first.total <= 100);
+        assert_eq!(model.calls, first.total);
+        for asset in &first.items {
+            crate::agent::validate_asset_id(&asset.asset_id).unwrap();
+            assert_eq!(asset.media_kind, "text");
+            assert_eq!((asset.width, asset.height), (0, 0));
+            assert!(asset.thumbnail_url.is_empty());
+            assert!(asset.start_ms.is_none() && asset.end_ms.is_none());
+            assert!(asset.text_excerpt.as_ref().unwrap().len() <= MAX_TEXT_EXCERPT_BYTES);
+            assert!(catalog.preview(&asset.asset_id).is_err());
+            assert_eq!(
+                Url::parse(&catalog.original_url(&asset.asset_id).unwrap())
+                    .unwrap()
+                    .to_file_path()
+                    .unwrap(),
+                path
+            );
+        }
+        let status = catalog.status().unwrap();
+        assert_eq!((status.asset_count, status.file_count), (first.total, 1));
+        assert_eq!(
+            (status.sources[0].asset_count, status.sources[0].file_count),
+            (first.total, 1)
+        );
+        let same = catalog
+            .index(&source, &mut model, || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(same.unchanged, 1);
+        assert_eq!(model.calls, first.total);
+        let first_id = first
+            .items
+            .iter()
+            .find(|asset| asset.segment_index == 0)
+            .unwrap()
+            .asset_id
+            .clone();
+        fs::write(&path, "A shorter replacement document.").unwrap();
+        catalog
+            .index(&source, &mut model, || false, |_| Ok(()))
+            .unwrap();
+        let after = catalog.browse(0, 100).unwrap();
+        assert_eq!(after.total, 1);
+        assert_eq!(after.items[0].asset_id, first_id);
+        let mut query = vec![0.; EMBEDDING_DIM];
+        query[2] = 1.;
+        assert_eq!(catalog.search(&query, 10).unwrap()[0].asset_id, first_id);
+        fs::remove_file(path).unwrap();
+        let removed = catalog
+            .index(&source, &mut model, || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(removed.removed, 1);
+        assert_eq!(catalog.status().unwrap().file_count, 0);
+    }
+    #[test]
+    fn text_model_failure_invalid_vector_cancellation_and_change_preserve_all_old_segments() {
+        let (_root, source, path, mut catalog) = text_fixture();
+        catalog
+            .index(&source, &mut document_embedder(), || false, |_| Ok(()))
+            .unwrap();
+        let original = serde_json::to_string(&catalog.browse(0, 100).unwrap()).unwrap();
+        for invalid in [false, true] {
+            fs::write(&path, "A new longer replacement passage. ".repeat(1000)).unwrap();
+            let mut model = document_embedder();
+            if invalid {
+                model.invalid_at = Some(2);
+            } else {
+                model.fail_at = Some(2);
+            }
+            assert!(catalog
+                .index(&source, &mut model, || false, |_| Ok(()))
+                .is_err());
+            assert_eq!(model.calls, 2);
+            assert_eq!(
+                serde_json::to_string(&catalog.browse(0, 100).unwrap()).unwrap(),
+                original
+            );
+        }
+        let cancel = std::cell::Cell::new(false);
+        let mut model = DocumentEmbedder {
+            cancel: Some(&cancel),
+            ..document_embedder()
+        };
+        let stopped = catalog
+            .index(&source, &mut model, || cancel.get(), |_| Ok(()))
+            .unwrap();
+        assert!(stopped.cancelled);
+        assert_eq!((stopped.indexed, stopped.removed), (0, 0));
+        assert_eq!(
+            serde_json::to_string(&catalog.browse(0, 100).unwrap()).unwrap(),
+            original
+        );
+        let mut model = DocumentEmbedder {
+            mutate: Some(path.clone()),
+            ..document_embedder()
+        };
+        let changed = catalog
+            .index(&source, &mut model, || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!((changed.failed, changed.indexed), (1, 0));
+        assert_eq!(
+            serde_json::to_string(&catalog.browse(0, 100).unwrap()).unwrap(),
+            original
+        );
+        fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        let corrupt = catalog
+            .index(&source, &mut document_embedder(), || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!((corrupt.failed, corrupt.indexed), (1, 0));
+        assert_eq!(
+            serde_json::to_string(&catalog.browse(0, 100).unwrap()).unwrap(),
+            original
+        );
+    }
+    #[test]
+    fn cancelling_multisegment_file_never_prunes_an_unvisited_missing_file() {
+        let (_root, source, path, mut catalog) = text_fixture();
+        let missing = source.join("z.txt");
+        fs::write(&missing, "Retain this indexed file.").unwrap();
+        catalog
+            .index(&source, &mut document_embedder(), || false, |_| Ok(()))
+            .unwrap();
+        let original = serde_json::to_string(&catalog.browse(0, 100).unwrap()).unwrap();
+        fs::remove_file(missing).unwrap();
+        fs::write(&path, "Changed text. ".repeat(1000)).unwrap();
+        let cancel = std::cell::Cell::new(false);
+        let mut model = DocumentEmbedder {
+            cancel: Some(&cancel),
+            ..document_embedder()
+        };
+        let stopped = catalog
+            .index(&source, &mut model, || cancel.get(), |_| Ok(()))
+            .unwrap();
+        assert!(stopped.cancelled);
+        assert_eq!(stopped.removed, 0);
+        assert_eq!(
+            serde_json::to_string(&catalog.browse(0, 100).unwrap()).unwrap(),
+            original
+        );
+        assert_eq!(catalog.status().unwrap().file_count, 2);
+    }
+    struct MediaEmbedder {
+        audio_calls: usize,
+        video_calls: usize,
+    }
+    impl Embedder for MediaEmbedder {
+        fn embed_images(&mut self, _: &[RgbImage]) -> Result<Vec<Vec<f32>>> {
+            bail!("Unexpected image embedding")
+        }
+        fn embed_image(&mut self, _: &RgbImage) -> Result<Vec<f32>> {
+            bail!("Unexpected image embedding")
+        }
+        fn embed_text(&mut self, _: &str) -> Result<Vec<f32>> {
+            bail!("Unexpected query embedding")
+        }
+        fn embed_audio(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
+            assert!(samples.len() > 160 && samples.len() <= 30 * 16_000);
+            assert!(samples.iter().all(|sample| sample.is_finite()));
+            self.audio_calls += 1;
+            let mut vector = vec![0.; EMBEDDING_DIM];
+            vector[3] = 1.;
+            Ok(vector)
+        }
+        fn embed_video(&mut self, frames: &[RgbImage]) -> Result<Vec<f32>> {
+            assert!(!frames.is_empty() && frames.len() <= 30);
+            self.video_calls += 1;
+            let mut vector = vec![0.; EMBEDDING_DIM];
+            vector[4] = 1.;
+            Ok(vector)
+        }
+    }
+    #[test]
+    #[ignore = "requires installed ffmpeg and ffprobe; uses only temporary generated media and fake embeddings"]
+    fn native_audio_video_and_soundtrack_segments_share_one_catalog() {
+        use std::process::Command;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("media");
+        fs::create_dir(&source).unwrap();
+        let video = source.join("movie.mkv");
+        let created = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=32x24:r=1:d=31",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=16000:duration=31",
+                "-t",
+                "31",
+                "-c:v",
+                "ffv1",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(created.success());
+        let audio = source.join("speech.wav");
+        let created = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=220:sample_rate=16000:duration=31",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&audio)
+            .status()
+            .unwrap();
+        assert!(created.success());
+        let data = root.path().join("data");
+        let mut catalog = Catalog::open(&data).unwrap();
+        let mut model = MediaEmbedder {
+            audio_calls: 0,
+            video_calls: 0,
+        };
+        let result = catalog
+            .index(&source, &mut model, || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!((result.indexed, result.failed), (2, 0));
+        assert_eq!((model.audio_calls, model.video_calls), (4, 2));
+        let status = catalog.status().unwrap();
+        assert_eq!((status.asset_count, status.file_count), (6, 2));
+        let page = catalog.browse(0, 100).unwrap();
+        for asset in &page.items {
+            assert_eq!(
+                asset.start_ms,
+                Some(u64::from(asset.segment_index) * 30_000)
+            );
+            assert!(asset.end_ms.unwrap() > asset.start_ms.unwrap());
+            assert!(asset.text_excerpt.is_none());
+            if asset.media_kind == "video" {
+                assert_eq!((asset.width, asset.height), (32, 24));
+                assert!(asset.thumbnail_url.starts_with("file://"));
+            } else {
+                assert_eq!(asset.media_kind, "audio");
+                assert_eq!((asset.width, asset.height), (0, 0));
+                assert!(asset.thumbnail_url.is_empty());
+            }
+        }
+        let mut query = vec![0.; EMBEDDING_DIM];
+        query[3] = 1.;
+        assert!(catalog
+            .search(&query, 4)
+            .unwrap()
+            .iter()
+            .all(|asset| asset.media_kind == "audio"));
+        // Shortening only the soundtrack creates a tiny tail and changes its
+        // segment boundary. The (modality, index) UUID must remain stable.
+        let replaced = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=32x24:r=1:d=31",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=16000:duration=30.001",
+                "-t",
+                "31",
+                "-c:v",
+                "ffv1",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(replaced.success());
+        let updated = catalog
+            .index(&source, &mut model, || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            (updated.indexed, updated.unchanged, updated.failed),
+            (1, 1, 0)
+        );
+        let after = catalog.browse(0, 100).unwrap();
+        for old in page
+            .items
+            .iter()
+            .filter(|asset| asset.filename == "movie.mkv")
+        {
+            let new = after
+                .items
+                .iter()
+                .find(|asset| {
+                    asset.filename == old.filename
+                        && asset.media_kind == old.media_kind
+                        && asset.segment_index == old.segment_index
+                })
+                .unwrap();
+            assert_eq!(new.asset_id, old.asset_id);
+            if new.media_kind == "audio" && new.segment_index == 1 {
+                assert!(new.start_ms.unwrap() < old.start_ms.unwrap());
+                assert_eq!(new.end_ms, Some(30_001));
+            }
+        }
+        fs::remove_dir_all(&source).unwrap();
+        let agent = crate::agent::AgentCatalog::open(&data).unwrap();
+        for asset in agent.browse(0, 100).unwrap().items {
+            if let Some(handle) = asset.thumbnail_handle {
+                assert!(!agent.thumbnail(&handle).unwrap().is_empty());
+            }
+            assert!(asset.start_ms.is_some() && asset.end_ms.is_some());
+        }
+    }
+
+    // Catalog module test, retained verbatim from the initial visible multimodal source
+    // except the later recorded image_count -> asset_count field rename.
+    #[test]
+    fn invalid_batch_embeddings_are_fatal_without_partial_commits_or_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let photos = root.path().join("photos");
+        fs::create_dir(&photos).unwrap();
+        for index in 0..4 {
+            save(&photos.join(format!("{index}.png")), [255, 0, 0]);
+        }
+        let mut catalog = Catalog::open(&root.path().join("data")).unwrap();
+        for vector in [
+            vec![],
+            vec![1.; EMBEDDING_DIM - 1],
+            vec![1.; EMBEDDING_DIM + 1],
+            vec![0.; EMBEDDING_DIM],
+            vec![1.; EMBEDDING_DIM],
+            vec![f32::NAN; EMBEDDING_DIM],
+            vec![f32::INFINITY; EMBEDDING_DIM],
+            vec![f32::NEG_INFINITY; EMBEDDING_DIM],
+        ] {
+            let mut model = BatchEmbedder {
+                invalid_embedding: Some(vector),
+                ..batch_embedder()
+            };
+            let error = catalog
+                .index_with_batch_size(&photos, &mut model, 4, || false, |_| Ok(()))
+                .unwrap_err();
+            assert!(error.to_string().contains("embedding"));
+            assert_eq!(model.calls.len(), 1);
+            assert_eq!(catalog.status().unwrap().asset_count, 0);
+            assert!(fs::read_dir(&catalog.thumbnails).unwrap().next().is_none());
+        }
     }
 }

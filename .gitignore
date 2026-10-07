@@ -26,6 +26,7 @@ venv/
 *.db-shm
 *.db-wal
 *.onnx
+*.onnx_data
 *.pt
 *.pth
 *.ckpt
@@ -78,3 +79,15 @@ venv/
 *.[oO][gG][vV]
 *.3[gG][pP]
 *.3[gG]2
+
+# Audio originals remain local.
+*.[wW][aA][vV]
+*.[fF][lL][aA][cC]
+*.[mM][pP]3
+*.[mM]4[aA]
+*.[aA][aA][cC]
+*.[oO][gG][gG]
+*.[oO][pP][uU][sS]
+*.[aA][iI][fF]
+*.[aA][iI][fF][fF]
+*.[wW][mM][aA]

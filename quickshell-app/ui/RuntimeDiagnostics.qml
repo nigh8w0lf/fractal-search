@@ -47,7 +47,8 @@ Item {
         process.running = true;
     }
     function formatReport(value) {
-        const lines = ["Fractal Search CUDA diagnostics", "Provider: " + value.selectedProvider + (value.selectedDeviceId !== null ? " · device " + value.selectedDeviceId : ""), "CUDA-enabled build: " + (value.cudaEnabledBuild ? "yes" : "no"), "Platform: " + value.platform, "", value.summary, "", "NVIDIA driver: " + value.nvidiaDriver.state + " — " + value.nvidiaDriver.detail];
+        const lines = ["Fractal Search runtime diagnostics", "Provider: " + value.selectedProvider + (value.selectedDeviceId !== null ? " · device " + value.selectedDeviceId : ""), "CUDA-enabled build: " + (value.cudaEnabledBuild ? "yes" : "no"), "Platform: " + value.platform, "", value.summary, "", "NVIDIA driver: " + value.nvidiaDriver.state + " — " + value.nvidiaDriver.detail];
+        lines.push("", "Media decoder tools: " + (value.mediaToolsAvailable ? "available; codecs and inference unverified" : "unavailable"), "ffmpeg: " + value.ffmpeg.state + " — " + value.ffmpeg.detail, "ffprobe: " + value.ffprobe.state + " — " + value.ffprobe.detail);
         value.gpus.forEach(gpu => lines.push("GPU " + gpu.index + ": " + gpu.name + " · driver " + gpu.driverVersion));
         lines.push("", "Optional CUDA toolkit: " + value.cudaToolkit.detail, "", "Linker cache: " + value.linkerCache.detail, "CUDA provider: " + value.providerDependencies.detail, "", "Required libraries:");
         value.libraries.forEach(library => {
@@ -73,7 +74,7 @@ Item {
                     if (diagnostics.report !== null || data.length > 65536)
                         throw new Error("Invalid or oversized accelerator diagnostic response.");
                     const value = JSON.parse(data);
-                    if (value.schemaVersion !== 1 || typeof value.checksPassed !== "boolean" || typeof value.summary !== "string" || !Array.isArray(value.libraries) || !Array.isArray(value.gpus) || !Array.isArray(value.probeErrors) || !Array.isArray(value.installSteps) || !Array.isArray(value.librarySearchLocations) || !value.nvidiaDriver || !value.cudaToolkit || !value.linkerCache || !value.providerDependencies)
+                    if (value.schemaVersion !== 1 || typeof value.checksPassed !== "boolean" || typeof value.summary !== "string" || !Array.isArray(value.libraries) || !Array.isArray(value.gpus) || !Array.isArray(value.probeErrors) || !Array.isArray(value.installSteps) || !Array.isArray(value.librarySearchLocations) || !value.nvidiaDriver || !value.cudaToolkit || !value.linkerCache || !value.providerDependencies || !value.ffmpeg || !value.ffprobe || typeof value.mediaToolsAvailable !== "boolean")
                         throw new Error("Incompatible accelerator diagnostic response. Reinstall the plugin.");
                     diagnostics.report = value;
                 } catch (error) {
@@ -102,10 +103,10 @@ Item {
     }
     Timer {
         id: timeout
-        interval: 20000
+        interval: 30000
         onTriggered: {
             diagnostics.checking = false;
-            diagnostics.fail("Accelerator diagnostics exceeded 20 seconds. Check NVIDIA driver utilities and library access, then refresh.");
+            diagnostics.fail("Accelerator diagnostics exceeded 30 seconds. Check NVIDIA driver utilities and library access, then refresh.");
             process.running = false;
         }
     }

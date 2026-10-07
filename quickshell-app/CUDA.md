@@ -12,10 +12,9 @@ Device IDs are rejected for CPU selection. Unknown providers, unavailable CUDA
 build support, missing libraries and invalid GPUs fail visibly; the runtime never
 retries a failed CUDA session on CPU.
 
-CUDA accelerates the native FG-CLIP2 vision and text ONNX sessions. Decoding,
+CUDA accelerates the native EmbeddingGemma 2 vision, audio and shared/text ONNX sessions. Decoding,
 patch preparation, tokenization and LanceDB retrieval remain on CPU. ONNX Runtime
-also deliberately places small vision shape/control operations on CPU; startup
-logs state this. The validation below verifies that matrix and attention kernels
+may place small shape/control operations on CPU; actual placement must be verified. The validation below verifies that matrix and attention kernels
 execute on CUDA in both models. TF32 is disabled to preserve the FP32 embedding
 profile. Existing CPU embeddings use the same profile; changing providers does
 not require a reindex.
@@ -82,7 +81,7 @@ outside the loader path are distinguished from libraries that were not found.
 The `nvcc` compiler is optional. Passing this preflight does not claim successful
 model inference; use the real smoke check below to establish that.
 
-## Temporary development dependencies
+## Historical temporary development dependencies
 
 The 2026-10-02 validation used the following pinned NVIDIA wheels from PyPI. These
 provide native runtime libraries only; Python is not an inference dependency.
@@ -131,12 +130,12 @@ cargo test --locked -p fractal-search-core --features cuda
 
 env LD_LIBRARY_PATH=/tmp/fractal-search-cuda-deps/lib:"$PWD/target/debug/examples" \
   target/debug/examples/validate_cuda \
-  "$HOME/.cache/fractal-search/models/fgclip2-33f3b9d4" \
+  "$HOME/.cache/fractal-search/models/embeddinggemma2-daa72c51" \
   /tmp/fractal-search-cuda-validation
 
 env LD_LIBRARY_PATH=/tmp/fractal-search-cuda-deps/lib:"$PWD/target/debug" \
   python3 quickshell-app/tests/smoke_cuda.py target/debug/fractal-search \
-  "$HOME/.cache/fractal-search/models/fgclip2-33f3b9d4"
+  "$HOME/.cache/fractal-search/models/embeddinggemma2-daa72c51"
 ```
 
 Choose a new benchmark output directory each time. The explicit `target/debug`
@@ -145,7 +144,7 @@ libraries sit beside them but are loaded dynamically. The packaged launchers
 configure this path automatically.
 
 `validate_cuda` creates three synthetic PNG images, compares CPU/CUDA normalized
-vectors for single images, a mixed-shape batch and three queries, and requires
+vectors for single images, a mixed-shape batch, queries, documents, audio and video, and requires
 cosine similarity of at least 0.9999. It records five warmed image/query calls,
 writes `report.json`, and examines actual ORT profiles to reject CPU matrix or
 attention execution in the CUDA sessions. Profiling is opt-in for this benchmark;
@@ -187,3 +186,5 @@ valid results/environment, subprocess failure, malformed or oversized output,
 a missing executable and the 20-second timeout. Full QML lint passed. The real
 host CLI preflight reported all nine required libraries visible on driver
 610.57.04; sandboxed NVML access correctly produced an inconclusive result.
+
+Historical GPU measurements above used the previous model. They do not validate EmbeddingGemma 2 placement, parity, memory or latency. All three graphs must pass a new actual-GPU run. Warmed timing fields still cover image/query calls only.

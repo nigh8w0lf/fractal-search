@@ -1,7 +1,8 @@
 //! Read-only, bounded views of the Quickshell catalog for local agent clients.
 //! Never delegates to Catalog: its display helpers may repair caches from originals.
 use crate::{
-    store::{Record, Store},
+    media::MediaKind,
+    store::{Record, Store, MAX_TEXT_EXCERPT_BYTES},
     MODEL_PROFILE,
 };
 use anyhow::{ensure, Context, Result};
@@ -24,9 +25,16 @@ pub struct AssetMetadata {
     pub filename: String,
     pub width: u32,
     pub height: u32,
-    pub thumbnail_handle: String,
+    pub media_kind: String,
+    pub segment_index: u32,
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+    pub text_excerpt: Option<String>,
+    pub thumbnail_handle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub similarity: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid_score: Option<f64>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,7 +47,8 @@ pub struct AssetPage {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentStatus {
-    pub image_count: usize,
+    pub asset_count: usize,
+    pub file_count: usize,
     pub source_count: usize,
     pub model_profile: &'static str,
 }
@@ -91,21 +100,31 @@ impl AgentCatalog {
         })
     }
     pub fn status(&self) -> Result<AgentStatus> {
-        let (image_count, sources) = database(self.store.status())?;
+        let (asset_count, file_count, sources) = database(self.store.status())?;
         Ok(AgentStatus {
-            image_count,
+            asset_count,
+            file_count,
             source_count: sources.len(),
             model_profile: MODEL_PROFILE,
         })
     }
     fn row(row: Record) -> AssetMetadata {
         AssetMetadata {
-            thumbnail_handle: format!("thumbnail_{}", row.asset_id),
+            thumbnail_handle: row
+                .thumbnail
+                .as_ref()
+                .map(|_| format!("thumbnail_{}", row.asset_id)),
+            media_kind: row.media_kind,
+            segment_index: row.segment_index,
+            start_ms: row.start_ms,
+            end_ms: row.end_ms,
+            text_excerpt: row.text_excerpt,
             asset_id: row.asset_id,
             filename: row.filename,
             width: row.width,
             height: row.height,
             similarity: None,
+            hybrid_score: None,
         }
     }
     fn validate(asset: AssetMetadata) -> Result<AssetMetadata> {
@@ -120,19 +139,50 @@ impl AgentCatalog {
                     .any(|c| c.is_control() || c == '/' || c == '\\'),
             "Invalid indexed filename; repair in Fractal Search"
         );
+        let visual = matches!(asset.media_kind.as_str(), "image" | "video");
         ensure!(
-            asset.width > 0
-                && asset.height > 0
-                && asset.width <= 65536
-                && asset.height <= 65536
-                && u64::from(asset.width) * u64::from(asset.height) <= 100_000_000,
-            "Invalid indexed image dimensions"
+            matches!(
+                asset.media_kind.as_str(),
+                "image" | "text" | "audio" | "video"
+            ),
+            "Invalid indexed media kind"
+        );
+        ensure!(
+            if visual {
+                asset.width > 0
+                    && asset.height > 0
+                    && asset.width <= 65536
+                    && asset.height <= 65536
+                    && u64::from(asset.width) * u64::from(asset.height) <= 100_000_000
+            } else {
+                asset.width == 0 && asset.height == 0
+            },
+            "Invalid indexed media dimensions"
+        );
+        ensure!(
+            asset.thumbnail_handle.is_some() == visual,
+            "Invalid indexed thumbnail metadata"
+        );
+        ensure!(
+            asset
+                .text_excerpt
+                .as_ref()
+                .is_none_or(|text| text.len() <= MAX_TEXT_EXCERPT_BYTES && !text.contains('\0')),
+            "Invalid indexed text excerpt"
         );
         Ok(asset)
     }
     pub fn browse(&self, offset: usize, limit: usize) -> Result<AssetPage> {
+        self.browse_filtered(offset, limit, None)
+    }
+    pub fn browse_filtered(
+        &self,
+        offset: usize,
+        limit: usize,
+        media_kind: Option<MediaKind>,
+    ) -> Result<AssetPage> {
         validate_page(offset, limit)?;
-        let (total, rows) = database(self.store.browse(offset, limit, None))?;
+        let (total, rows) = database(self.store.browse_filtered(offset, limit, None, media_kind))?;
         let items = rows
             .into_iter()
             .map(|row| Self::validate(Self::row(row)))
@@ -149,21 +199,38 @@ impl AgentCatalog {
         Self::validate(Self::row(database(self.store.asset(asset_id, false))?))
     }
     pub fn search(&self, embedding: &[f32], limit: usize) -> Result<Vec<AssetMetadata>> {
+        self.search_results("", embedding, limit, None)
+    }
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        embedding: &[f32],
+        limit: usize,
+        media_kind: Option<MediaKind>,
+    ) -> Result<Vec<AssetMetadata>> {
+        validate_query(query)?;
+        self.search_results(query, embedding, limit, media_kind)
+    }
+    fn search_results(
+        &self,
+        query: &str,
+        embedding: &[f32],
+        limit: usize,
+        media_kind: Option<MediaKind>,
+    ) -> Result<Vec<AssetMetadata>> {
         validate_page(0, limit)?;
-        let hits = database(self.store.search(embedding, limit, None))?;
-        let mut items = Vec::with_capacity(limit);
-        for (row, distance) in hits {
-            let mut asset = Self::validate(Self::row(row))?;
-            asset.similarity = Some((1.0 - distance).clamp(-1.0, 1.0));
-            items.push(asset);
-        }
-        items.sort_by(|a, b| {
-            b.similarity
-                .unwrap()
-                .total_cmp(&a.similarity.unwrap())
-                .then(a.asset_id.cmp(&b.asset_id))
-        });
-        Ok(items)
+        let hits = database(
+            self.store
+                .search_filtered(query, embedding, limit, None, media_kind),
+        )?;
+        hits.into_iter()
+            .map(|hit| {
+                let mut asset = Self::validate(Self::row(hit.row))?;
+                asset.similarity = Some((1.0 - hit.distance).clamp(-1.0, 1.0));
+                asset.hybrid_score = hit.hybrid_score;
+                Ok(asset)
+            })
+            .collect()
     }
     pub fn thumbnail(&self, handle: &str) -> Result<Vec<u8>> {
         let id = handle
@@ -171,7 +238,10 @@ impl AgentCatalog {
             .context("Invalid thumbnail handle")?;
         validate_asset_id(id)?;
         let record = database(self.store.asset(id, false))?;
-        let cache = record.thumbnail.clone();
+        let cache = record
+            .thumbnail
+            .clone()
+            .context("This asset has no visual thumbnail")?;
         let asset = Self::validate(Self::row(record))?;
         let cache = Path::new(&cache);
         ensure!(
@@ -340,7 +410,10 @@ mod tests {
         assert!(!json.contains(&root.path().display().to_string()));
         let asset = &page.items[0];
         assert_eq!(agent.metadata(&asset.asset_id).unwrap().filename, "red.png");
-        assert!(!agent.thumbnail(&asset.thumbnail_handle).unwrap().is_empty());
+        assert!(!agent
+            .thumbnail(asset.thumbnail_handle.as_deref().unwrap())
+            .unwrap()
+            .is_empty());
         let mut embedding = vec![0.; EMBEDDING_DIM];
         embedding[0] = 1.;
         assert_eq!(
@@ -386,31 +459,51 @@ mod tests {
         use std::os::unix::fs::symlink;
         let (root, _desktop, agent) = fixture();
         let asset = agent.browse(0, 1).unwrap().items.remove(0);
-        let cache = agent.store.asset(&asset.asset_id, false).unwrap().thumbnail;
+        let cache = agent
+            .store
+            .asset(&asset.asset_id, false)
+            .unwrap()
+            .thumbnail
+            .unwrap();
         let outside = root.path().join("private-originals/red.png");
         fs::remove_file(&cache).unwrap();
         symlink(&outside, &cache).unwrap();
-        assert!(agent.thumbnail(&asset.thumbnail_handle).is_err());
+        assert!(agent
+            .thumbnail(asset.thumbnail_handle.as_deref().unwrap())
+            .is_err());
         fs::remove_file(&cache).unwrap();
         fs::hard_link(&outside, &cache).unwrap();
-        assert!(agent.thumbnail(&asset.thumbnail_handle).is_err());
+        assert!(agent
+            .thumbnail(asset.thumbnail_handle.as_deref().unwrap())
+            .is_err());
         let writer = Store::open(&root.path().join("data"), false).unwrap();
         writer.update_for_test(&asset.asset_id, "thumbnail", outside.to_str().unwrap());
-        assert!(agent.thumbnail(&asset.thumbnail_handle).is_err());
+        assert!(agent
+            .thumbnail(asset.thumbnail_handle.as_deref().unwrap())
+            .is_err());
     }
     #[test]
     fn missing_or_legacy_thumbnail_never_reads_original_or_repairs() {
         let (_root, _desktop, agent) = fixture();
         let asset = agent.browse(0, 1).unwrap().items.remove(0);
-        let cache = agent.store.asset(&asset.asset_id, false).unwrap().thumbnail;
+        let cache = agent
+            .store
+            .asset(&asset.asset_id, false)
+            .unwrap()
+            .thumbnail
+            .unwrap();
         image::RgbImage::from_pixel(384, 384, image::Rgb([0, 0, 0]))
             .save(&cache)
             .unwrap();
         let before = fs::read(&cache).unwrap();
-        assert!(agent.thumbnail(&asset.thumbnail_handle).is_err());
+        assert!(agent
+            .thumbnail(asset.thumbnail_handle.as_deref().unwrap())
+            .is_err());
         assert_eq!(before, fs::read(&cache).unwrap());
         fs::remove_file(&cache).unwrap();
-        assert!(agent.thumbnail(&asset.thumbnail_handle).is_err());
+        assert!(agent
+            .thumbnail(asset.thumbnail_handle.as_deref().unwrap())
+            .is_err());
         assert!(!Path::new(&cache).exists());
     }
 
@@ -418,7 +511,12 @@ mod tests {
     fn returned_thumbnail_strips_nonpixel_riff_payloads() {
         let (_root, _desktop, agent) = fixture();
         let asset = agent.browse(0, 1).unwrap().items.remove(0);
-        let cache = agent.store.asset(&asset.asset_id, false).unwrap().thumbnail;
+        let cache = agent
+            .store
+            .asset(&asset.asset_id, false)
+            .unwrap()
+            .thumbnail
+            .unwrap();
         let mut bytes = fs::read(&cache).unwrap();
         let secret = b"private-metadata";
         bytes.extend_from_slice(b"JUNK");
@@ -427,7 +525,9 @@ mod tests {
         let riff_size = (bytes.len() - 8) as u32;
         bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
         fs::write(&cache, &bytes).unwrap();
-        let returned = agent.thumbnail(&asset.thumbnail_handle).unwrap();
+        let returned = agent
+            .thumbnail(asset.thumbnail_handle.as_deref().unwrap())
+            .unwrap();
         assert!(!returned
             .windows(secret.len())
             .any(|window| window == secret));
@@ -438,10 +538,96 @@ mod tests {
     fn cached_thumbnail_byte_limit_and_corruption_fail_visibly() {
         let (_root, _desktop, agent) = fixture();
         let asset = agent.browse(0, 1).unwrap().items.remove(0);
-        let cache = agent.store.asset(&asset.asset_id, false).unwrap().thumbnail;
+        let cache = agent
+            .store
+            .asset(&asset.asset_id, false)
+            .unwrap()
+            .thumbnail
+            .unwrap();
         fs::write(&cache, vec![0; MAX_THUMBNAIL_BYTES + 1]).unwrap();
-        assert!(agent.thumbnail(&asset.thumbnail_handle).is_err());
+        assert!(agent
+            .thumbnail(asset.thumbnail_handle.as_deref().unwrap())
+            .is_err());
         fs::write(&cache, b"not a WebP").unwrap();
-        assert!(agent.thumbnail(&asset.thumbnail_handle).is_err());
+        assert!(agent
+            .thumbnail(asset.thumbnail_handle.as_deref().unwrap())
+            .is_err());
+    }
+    #[test]
+    fn nonvisual_metadata_and_search_use_only_indexed_excerpts_after_originals_are_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        fs::create_dir(&data).unwrap();
+        let originals = root.path().join("private-originals");
+        fs::create_dir(&originals).unwrap();
+        fs::write(originals.join("notes.txt"), "indexed document").unwrap();
+        let store = Store::open(&data, false).unwrap();
+        let id = format!("asset_{}", Uuid::new_v4());
+        let mut vector = vec![0.; EMBEDDING_DIM];
+        vector[0] = 1.;
+        store
+            .replace_file(
+                1,
+                originals.join("notes.txt").to_str().unwrap(),
+                &[Record {
+                    kind: "asset".into(),
+                    asset_id: id.clone(),
+                    source_id: 1,
+                    path: originals.join("notes.txt").to_str().unwrap().into(),
+                    filename: "notes.txt".into(),
+                    media_kind: "text".into(),
+                    text_excerpt: Some("Only this bounded indexed excerpt".into()),
+                    indexed_text: Some("notes.txt\nOnly this bounded indexed excerpt".into()),
+                    embedding: Some(vector.clone()),
+                    ..Record::default()
+                }],
+            )
+            .unwrap();
+        let audio_id = format!("asset_{}", Uuid::new_v4());
+        store
+            .replace_file(
+                1,
+                originals.join("talk.wav").to_str().unwrap(),
+                &[Record {
+                    kind: "asset".into(),
+                    asset_id: audio_id.clone(),
+                    source_id: 1,
+                    path: originals.join("talk.wav").to_str().unwrap().into(),
+                    filename: "talk.wav".into(),
+                    media_kind: "audio".into(),
+                    start_ms: Some(0),
+                    end_ms: Some(30_000),
+                    embedding: Some(vector.clone()),
+                    ..Record::default()
+                }],
+            )
+            .unwrap();
+        fs::remove_dir_all(&originals).unwrap();
+        let agent = AgentCatalog::open(&data).unwrap();
+        let status = agent.status().unwrap();
+        assert_eq!((status.asset_count, status.file_count), (2, 2));
+        let metadata = agent.metadata(&id).unwrap();
+        assert_eq!(metadata.media_kind, "text");
+        assert!(metadata.thumbnail_handle.is_none());
+        assert_eq!(
+            metadata.text_excerpt.as_deref(),
+            Some("Only this bounded indexed excerpt")
+        );
+        let audio = agent.metadata(&audio_id).unwrap();
+        assert_eq!((audio.start_ms, audio.end_ms), (Some(0), Some(30_000)));
+        assert!(audio.thumbnail_handle.is_none());
+        let json = serde_json::to_string(&agent.browse(0, 100).unwrap()).unwrap();
+        assert!(
+            !json.contains("private-originals")
+                && !json.contains(&root.path().display().to_string())
+        );
+        assert!(!json.contains("\"path\"") && !json.contains("file://"));
+        assert_eq!(agent.search(&vector, 100).unwrap().len(), 2);
+        assert!(agent.thumbnail(&format!("thumbnail_{id}")).is_err());
+        assert!(agent.thumbnail(&format!("thumbnail_{audio_id}")).is_err());
+        assert!(!data.join("thumbnails").exists());
+        store.update_for_test(&id, "text_excerpt", &"x".repeat(MAX_TEXT_EXCERPT_BYTES + 1));
+        let error = agent.metadata(&id).unwrap_err().to_string();
+        assert!(!error.contains("private-originals"));
     }
 }

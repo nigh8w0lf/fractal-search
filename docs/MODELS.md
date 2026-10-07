@@ -1,49 +1,73 @@
-# Native FG-CLIP2 models
+# Native EmbeddingGemma 2 models
 
-Fractal Search runs FG-CLIP2 through native ONNX Runtime. The [model manifest](../crates/fractal-search-core/models/fgclip2.json) pins every asset by size and SHA-256 to `zihuv/fg-clip2-base-onnx` revision `33f3b9d426dfa8aeda700fd3b8fc5f7b6e3a9c40`.
+Fractal Search uses the exact [onnx-community/embeddinggemma-2-ONNX export](https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/tree/daa72c51243991dfcaf9f9137d2c573d8f7790c0), pinned to revision `daa72c51243991dfcaf9f9137d2c573d8f7790c0`. The [manifest](../crates/fractal-search-core/models/embeddinggemma2.json) records every asset's byte count and SHA-256. This is the multimodal EmbeddingGemma 2 model, not the older text-only EmbeddingGemma 300M.
 
-## Assets and setup
+## Setup and assets
 
-Use **Set up model** in the panel, or the optional developer downloader:
+Use **Set up model** in the panel, or the optional development downloader:
 
 ```bash
-python3 scripts/fetch-fgclip2-onnx-probe.py /absolute/model/cache
+python3 scripts/fetch-embeddinggemma2.py /absolute/model/cache
 ```
 
-Downloads total approximately 1.14 GB. Existing assets must pass verification; corrupt or incomplete files fail visibly. The default persistent cache is `$XDG_CACHE_HOME/fractal-search/models/fgclip2-33f3b9d4`, normally under `~/.cache`. Never put model weights in the source repository or use a temporary directory for the installed application.
+The eleven pinned FP32 assets total 2,960,874,003 bytes, approximately 2.96 GB (2.76 GiB). Existing files must pass size/hash verification; corrupt or incomplete files fail visibly. Nested graph paths and distinct per-file `.part` files are preserved. Only verified downloads become final assets; cancellation retains previously verified assets.
 
-| Asset | Purpose |
+The persistent application cache is `$XDG_CACHE_HOME/fractal-search/models/embeddinggemma2-daa72c51`, normally under `~/.cache`. Select the cache root containing `tokenizer.json` and `onnx/`, not the `onnx/` subdirectory. Do not store weights in the repository or use a temporary directory for an installed application.
+
+| Assets | Purpose |
 | --- | --- |
-| `visual.onnx` | Dynamic-patch image encoder. |
-| `text.onnx` | One short text query per inference call. |
-| `vision_pos_embedding.bin` | Float32 16×16×768 table for native positional interpolation. |
-| `text_token_embedding.bin` | Float16 256,000×768 table, converted to float32 for graph input. |
-| `tokenizer.json` | Pinned tokenizer configuration. |
+| `onnx/model.onnx` and `.onnx_data` | Shared text backbone and normalized sentence output |
+| `onnx/vision_encoder.onnx` and `.onnx_data` | Image/frame features |
+| `onnx/audio_encoder.onnx` and `.onnx_data` | Audio features |
+| `tokenizer.json`, `tokenizer_config.json` | Exact text vocabulary and tokenization |
+| `config.json`, `processor_config.json`, `preprocessor_config.json` | Pinned model/processor contract and reference tooling |
 
-Upstream: [FG-CLIP](https://github.com/360CVGroup/FG-CLIP), [original model](https://huggingface.co/qihoo360/fg-clip2-base), [ONNX export](https://huggingface.co/zihuv/fg-clip2-base-onnx). The export declares Apache-2.0; preserve model attribution and license when distributing assets. The development bundle downloads assets separately. See [NOTICE](../quickshell-app/packaging/NOTICE).
+The export declares Apache-2.0. Preserve applicable licenses and attribution when distributing assets. Development bundles download assets separately; see [NOTICE](../quickshell-app/packaging/NOTICE) and the [Google model card](https://huggingface.co/google/embeddinggemma-2).
 
-## Embedding contract
+## Embedding and catalog contract
 
-The catalog profile is `fgclip2-base-33f3b9d4-dynamic-torch291-short64-v1`. Images and text produce finite, nonzero 768-dimensional vectors which the runtime normalizes to unit length. The catalog stores one vector per image. Model/profile changes require coordinated reindexing; incompatible vectors must never be mixed.
+`embeddinggemma2-daa72c51-fp32-multimodal-v1` produces one finite, unit-normalized 768-dimensional vector per image, text passage, audio segment or temporal visual-video segment. Schema 4 and its separate lexical profile require a fresh catalog and explicit reindexing. Older catalogs are not deleted, converted or mixed with these vectors.
 
-Image indexing chooses each image's own dynamic patch budget and reproduces the pinned Torch 2.9.1 preprocessing, including positional interpolation for narrow images. Text uses lowercase input, a fixed length of 64 tokens and the short-query graph. Longer input is token-truncated according to that contract; the separate 196-token long mode is unsupported. Batch-size changes must preserve preprocessing and profile semantics. The desktop indexer batches only consecutive images with matching individual patch budgets, so the shared batch preprocessing budget cannot alter an image's resolution. Per-image normalization, opaque identities and atomic metadata/vector commits are unchanged.
+The shared graph takes int64 `input_ids`/`attention_mask` and float32 image/video/audio feature matrices with 512 columns. Absent modalities still receive real empty `[0, 512]` tensors. Use `sentence_embedding`, which already includes projection, masked mean pooling and normalization. `last_hidden_state` is not the current retrieval representation. Video features go to `video_features`, not `image_features`.
 
-CPU and CUDA use the same FP32 profile. CUDA disables TF32 and fails visibly when its selected device or runtime cannot initialize. See [CUDA validation](../quickshell-app/CUDA.md) for device requirements, numerical comparisons and graph profiling.
+### Queries and documents
 
-## Validation
+Queries automatically receive `task: search result | query: `. Documents receive `title: {filename} | text: {passage}`, with `none` for an empty title. Users enter ordinary text without manually supplying prefixes. Tokenization preserves case/Unicode and inserts BOS/EOS from the pinned template. Literal strings such as `<|image|>` in text are treated as text content, not missing media features.
 
-The 2026-10-01 synthetic CPU audit covered 35 fixtures and 43 embeddings. Minimum image cosine against the pinned PyTorch reference was 0.9999999915629018; minimum text cosine was 0.9999999999988171. A temporary service catalog compared 192 scores across 24 images and eight queries; top-result and top-five membership matched for all queries. This establishes numerical parity on those fixtures, not semantic accuracy or recall on a labeled photo library.
+The graph context limit is 8,192 tokens including prefixes and boundary tokens. Application queries are limited to 4,096 UTF-8 bytes. UTF-8 `.txt`, `.md` and `.markdown` files up to 2 MiB are divided into passages of at most 4,096 bytes with 256-byte overlap, at most 1,024 passages. Whitespace-only chunks are skipped. Titles are UTF-8-safe filename prefixes of at most 1,024 bytes. Excessive inputs fail explicitly; there is no silent tokenizer truncation.
 
-Fixtures cover dynamic patch budgets, mixed image shapes, JPEG/PNG/WebP/HEIC decoding, narrow/tiny images, Unicode and truncated queries. The generator uses cached upstream revision `430fbc8a912c86fd4de601381b6245a0edab22f0` and performs no model download or catalog write.
+Schema 4 keeps filename plus the full passage privately for BM25 and a separate public passage-only excerpt of at most 2,048 bytes. Text-only search fuses BM25 and semantic ranks; other scopes remain semantic. See [hybrid text search](HYBRID-TEXT-SEARCH.md). PDF/Office extraction, OCR and transcription are not implemented.
 
-Optional reference generation requires an isolated Python environment with Torch 2.9.1, Transformers 4.57.6, Tokenizers 0.22.2, Pillow 12.1.0, NumPy and pillow-heif. Prepare the upstream model/tokenizer/processor cache separately. The generator explicitly loads the pinned upstream model's custom code with `trust_remote_code=True`; inspect that pinned code before preparing a new reference environment. These tools are not needed for normal plugin operation.
+### Images
+
+Native preprocessing converts RGB, performs aspect-preserving antialiased bicubic uint8 resizing and rescales by `1/255`, without CLIP mean/std normalization. It uses 16×16 patches, pooling kernel 3, a 280-soft-token budget and 2,520 padded patch slots. Positions are `[column, row]`, padded with `[-1, -1]`. Each sample retains its independent aspect ratio and token count.
+
+Consecutive images can be batched (saved setting 1–8, default 1). Skips, unchanged files and batch tails may yield smaller batches. Failure never triggers a smaller-batch retry or provider fallback. A larger batch needs more memory; no fixed RAM/VRAM envelope is claimed.
+
+### Audio and video
+
+System FFmpeg decodes mono 16 kHz float PCM in segments up to 30 seconds. Audio extraction uses a periodic 320-sample Hann window, hop 160 and FFT 512; prepends 160 zeros; right-pads to a multiple of 128; and calculates 128 unnormalized HTK mel bands from 0–8 kHz over magnitude, not power. It computes `log(mel + 0.001)` without normalization, dither or preemphasis. Boolean masks downsample every four frames, producing at most 750 soft tokens per 30 seconds. Fewer than 161 samples are rejected.
+
+Video visual segments are at most 30 seconds, sampled at 1 fps with at most 30 frames and 140 soft tokens per frame. Their ordered frame features form one backbone sequence; the vector is not an average of independent frame embeddings. The app uses deterministic FFmpeg `fps=1:round=up:start_time=0` sampling, with no automatic rotation or scaling. Exact frame-index parity with every upstream variable-frame-rate loader is not claimed. Model-level fixtures use explicit sampled frames.
+
+A video's soundtrack is indexed separately as timestamped audio segments. The first audio and first non-cover-art video track are selected; alternate tracks/subtitles/attachments are not indexed. Stream offsets are normalized to the container origin. Tiny final intervals adjust the preceding boundary without losing or overlapping source content.
+
+Audio/video inputs are capped at 2 GiB/two hours. Video frames above 2,073,600 pixels or a 4,096-pixel side are rejected. Decoders have local-only protocol/demuxer allowlists, time/output/memory bounds and process-group cleanup. Corrupt packets and error-level stderr fail visibly, even if FFmpeg exits successfully. A failed segment prevents partial replacement of the file's previous complete segment set.
+
+## Providers and validation
+
+CPU and CUDA use the same FP32 profile. CUDA is explicit, disables TF32, and fails visibly without retrying on CPU. The shared backbone loads for text or any media inference; vision/audio encoders remain lazy. Browsing and metadata load no models. See [CUDA.md](../quickshell-app/CUDA.md) for actual provider-placement validation.
+
+Reference generation uses Hugging Face's Gemma4 image/audio preprocessing and the pinned tokenizer, followed by the pinned export in Python ONNX Runtime. It does not compare with Google's original PyTorch checkpoint. Optional development dependencies are NumPy, Pillow, Torch, Torchvision, Transformers exposing these processors, and ONNX Runtime; production inference remains Rust-only. The generator records dependency versions and performs no remote model-code execution or automatic asset download.
 
 ```bash
-python3 scripts/prepare-fgclip2-onnx-fixtures.py /absolute/model/cache /absolute/new/fixtures
-cargo run --locked -p fractal-search-core --example validate_fgclip2 -- \
+python3 scripts/prepare-embeddinggemma2-fixtures.py /absolute/model/cache /absolute/new/fixtures
+cargo run --locked -p fractal-search-core --example validate_embeddinggemma2 -- \
   /absolute/model/cache /absolute/new/fixtures/fixtures.json
-python3 quickshell-app/tests/compare_fgclip2_retrieval.py \
+python3 quickshell-app/tests/compare_embeddinggemma2_retrieval.py \
   target/debug/fractal-search /absolute/model/cache /absolute/new/fixtures/fixtures.json
 ```
 
-Use synthetic inputs and temporary catalogs. GPU comparisons and real-inference service smoke commands are documented in [CUDA.md](../quickshell-app/CUDA.md) and the [plugin guide](../quickshell-app/README.md).
+For metadata-only preprocessing validation, pass `--preprocess-only` to both generator and validator and provide the five pinned metadata/tokenizer JSON files. HF reference libraries are still required; no weights or inference are used. Use `--max-image-batch` to bound full reference inference memory.
+
+The validator checks tokens, masks, patches and feature tensors, then requires embedding cosine at least 0.9999. The retrieval comparator requires score error at most `1e-4`. These are acceptance thresholds, not claims of unrun checks. Synthetic parity does not establish labeled-library relevance, large-corpus latency, GPU memory use or batch-eight inference. Previous results do not validate reconstructed source; rerun checks against the current tree and record actual limitations.

@@ -146,10 +146,24 @@ def main():
             for name in ["decode-jpeg.jpg", "decode-webp.webp", "decode-webp-misnamed.jpg"]:
                 shutil.copyfile(args.fixtures / name, photos / name)
         count = len(list(photos.iterdir()))
+        # Keep a genuinely cold text-load check separate from image indexing:
+        # EmbeddingGemma's image path also loads the shared text backbone.
+        cold = Service(binary, models, root / "cold-data", root / "cold.log")
+        try:
+            ready = cold.until(lambda item: item.get("event") == "ready")["payload"]
+            assert ready["modelLoaded"] is False and ready["textModelLoaded"] is False
+            empty, stages = cold.search_with_progress({"type": "search", "query": "a cold-start description", "limit": 2})
+            assert stages == ["starting", "searching"], stages
+            assert empty["items"] == [] and empty["total"] == 0
+            assert cold.call({"type": "status"})["textModelLoaded"] is True
+            print("Cold text-model startup progress passed", flush=True)
+        finally:
+            cold.close()
         service = Service(binary, models, root / "data", root / "backend.log")
         try:
             ready = service.until(lambda item: item.get("event") == "ready")["payload"]
-            assert ready["catalog"]["imageCount"] == 0 and ready["modelLoaded"] is False
+            assert ready["catalog"]["assetCount"] == 0 and ready["modelLoaded"] is False
+            assert ready["textModelLoaded"] is False
             preferences = {"topMatches": 6, "resultLayout": "listPreview", "watchChanges": False, "closeAfterOpening": True, "imageBatchSize": 1}
             assert ready["settings"] == preferences
             assert "Top matches" in service.call({"type": "updateSettings", "settings": {**preferences, "topMatches": 0}}, success=False)
@@ -167,7 +181,11 @@ def main():
                 lambda item: item.get("id") is None and item.get("ok") is False
             )
             assert "unknown field" in rejection["error"]
-            result = service.call({"type": "index", "directory": photos.as_uri()})
+            # Model warmup plus several FP32 image embeddings is a long-running
+            # operation on CPU, unlike the metadata calls' 60-second deadline.
+            index_id = service.send({"type": "index", "directory": photos.as_uri()})
+            service.until(lambda item: item.get("id") == index_id and "ok" in item, timeout=300)
+            result = service.response(index_id)
             assert result["indexed"] == count and not result["cancelled"]
             assets = service.call({"type": "browse"})["items"]
             identifiers = {item["assetId"] for item in assets}
@@ -181,8 +199,10 @@ def main():
             assert preview_path.is_file()
             assert struct.unpack(">II", preview_path.read_bytes()[16:24]) == (256, 192)
             assert local_url(service.call({"type": "originalUrl", "assetId": assets[0]["assetId"]})["url"]).is_file()
+            # Image indexing has already loaded the shared backbone; search is warm.
+            assert service.call({"type": "status"})["textModelLoaded"] is True
             hits, stages = service.search_with_progress({"type": "search", "query": "a colorful image", "limit": 2})
-            assert stages == ["starting", "searching"], stages
+            assert stages == ["searching"], stages
             assert len(hits["items"]) == 2 and hits["total"] == count
             assert all(math.isfinite(item["similarity"]) for item in hits["items"])
             page, stages = service.search_with_progress({"type": "search", "query": "a colorful image", "offset": 2, "limit": 2})
@@ -190,7 +210,7 @@ def main():
             assert not ({item["assetId"] for item in hits["items"]} & {item["assetId"] for item in page["items"]})
             _, stages = service.search_with_progress({"type": "search", "query": "a blue image", "limit": 2})
             assert stages == ["searching"], stages
-            print("Cold-model startup, warm search and cached-page progress passed", flush=True)
+            print("Image-warmed shared backbone, warm search and cached-page progress passed", flush=True)
             assert service.call({"type": "index", "directory": str(photos)})["unchanged"] == count
             local_url(assets[0]["thumbnailUrl"]).unlink()
             assert "Thumbnail is unavailable" in service.call({"type": "browse"}, success=False)
@@ -255,7 +275,7 @@ def main():
             assert service.response(cancel_id)["cancelRequested"]
             result = service.response(index_id)
             assert result["cancelled"] and 1 <= result["indexed"] < 8
-            assert service.response(status_id)["catalog"]["imageCount"] == count + additional_count + result["indexed"]
+            assert service.response(status_id)["catalog"]["assetCount"] == count + additional_count + result["indexed"]
             assert not service.call({"type": "index", "directory": str(photos)})["cancelled"]
             print("Cancellation finishes active work and rejects concurrent scans", flush=True)
 
@@ -308,7 +328,7 @@ def main():
                 [str(binary), "--data-dir", str(root / "data"), "status"],
                 capture_output=True, text=True, check=True, timeout=10,
             )
-            assert json.loads(status.stdout)["catalog"]["imageCount"] > count
+            assert json.loads(status.stdout)["catalog"]["assetCount"] > count
             assert json.loads(status.stdout)["settings"] == preferences
             eof = subprocess.run(
                 [str(binary), "--data-dir", str(root / "data"), "serve"],

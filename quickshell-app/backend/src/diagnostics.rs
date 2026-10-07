@@ -1,4 +1,4 @@
-//! Model-independent accelerator checks, available even when the worker cannot start.
+//! Model-independent accelerator and media-decoder checks, available even when the worker cannot start.
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use std::{
@@ -48,6 +48,9 @@ pub struct RuntimeDiagnostics {
     nvidia_driver: Probe,
     gpus: Vec<Gpu>,
     cuda_toolkit: Probe,
+    ffmpeg: Probe,
+    ffprobe: Probe,
+    media_tools_available: bool,
     linker_cache: Probe,
     provider_dependencies: Probe,
     libraries: Vec<Library>,
@@ -340,6 +343,13 @@ fn missing_dependencies(output: &str) -> Vec<String> {
         .collect()
 }
 
+fn media_tool_probe(program: &str) -> Probe {
+    match successful_probe(program, &["-version"]) {
+        Ok(text) => Probe::new("available", bounded(text.lines().next().unwrap_or(""), 1024)),
+        Err(error) => Probe::new("unavailable", format!("{error:#}. Install the ffmpeg package and ensure {program} is on the service PATH. Audio/video indexing requires both ffmpeg and ffprobe; this check does not validate codecs or inference.")),
+    }
+}
+
 pub fn collect(provider: &str, device_id: Option<i32>) -> Result<RuntimeDiagnostics> {
     ensure!(
         matches!(provider, "cpu" | "cuda"),
@@ -353,6 +363,9 @@ pub fn collect(provider: &str, device_id: Option<i32>) -> Result<RuntimeDiagnost
         device_id.is_none_or(|value| value >= 0),
         "CUDA device ID must be non-negative"
     );
+    let ffmpeg = media_tool_probe("ffmpeg");
+    let ffprobe = media_tool_probe("ffprobe");
+    let media_tools_available = ffmpeg.state == "available" && ffprobe.state == "available";
     let mut errors = Vec::new();
     let (nvidia_driver, gpus) = match successful_probe(
         "nvidia-smi",
@@ -638,6 +651,9 @@ pub fn collect(provider: &str, device_id: Option<i32>) -> Result<RuntimeDiagnost
         nvidia_driver,
         gpus,
         cuda_toolkit,
+        ffmpeg,
+        ffprobe,
+        media_tools_available,
         linker_cache,
         provider_dependencies,
         libraries,
@@ -721,6 +737,15 @@ mod tests {
                 .is_ok_and(|output| !output.success && output.stderr == "failure")
         );
         assert!(run_probe("sh", &["-c", "exec yes x"], PROBE_TIMEOUT).is_err());
+    }
+    #[test]
+    fn missing_media_tools_are_actionable_and_do_not_claim_inference() {
+        let probe = media_tool_probe("fractal-search-test-nonexistent-decoder");
+        assert_eq!(probe.state, "unavailable");
+        assert!(probe.detail.contains("ffmpeg"));
+        assert!(probe
+            .detail
+            .contains("does not validate codecs or inference"));
     }
     #[test]
     fn diagnostics_validate_configuration_without_initializing_models() {
