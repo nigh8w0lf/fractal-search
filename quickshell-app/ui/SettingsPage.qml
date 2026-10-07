@@ -121,7 +121,7 @@ ColumnLayout {
                                     }
                                 }
                                 SearchText {
-                                    text: folder.modelData.imageCount + " photos"
+                                    text: folder.modelData.fileCount + " files · " + folder.modelData.assetCount + " searchable segments"
                                     color: page.app.secondaryText
                                     font.pixelSize: SearchTheme.font.bodySmall
                                 }
@@ -138,7 +138,7 @@ ColumnLayout {
                     }
                     SearchText {
                         visible: !page.app.status.catalog.sources.length
-                        text: "Add a folder to make its photos searchable. Your originals stay in place."
+                        text: "Add a folder containing images, UTF-8 text, audio or video. Your originals stay in place."
                         wrapMode: Text.WordWrap
                         color: page.app.secondaryText
                         Layout.fillWidth: true
@@ -170,7 +170,7 @@ ColumnLayout {
                     SearchText {
                         Layout.fillWidth: true
                         Layout.bottomMargin: Style.space(8)
-                        text: "Automatically index new and changed photos."
+                        text: "Automatically index new and changed supported files."
                         color: page.app.secondaryText
                         font.pixelSize: SearchTheme.font.bodySmall
                         wrapMode: Text.WordWrap
@@ -187,7 +187,7 @@ ColumnLayout {
                     SearchText {
                         Layout.fillWidth: true
                         Layout.minimumWidth: 0
-                        text: (page.app.indexing ? "Indexing" : page.app.ready ? "Index ready" : "Connecting") + " · " + page.app.status.catalog.imageCount.toLocaleString() + " images"
+                        text: (page.app.indexing ? "Indexing" : page.app.ready ? "Index ready" : "Connecting") + " · " + page.app.status.catalog.fileCount.toLocaleString() + " files · " + page.app.status.catalog.assetCount.toLocaleString() + " segments"
                         color: page.app.colors.foreground
                         wrapMode: Text.WordWrap
                     }
@@ -244,7 +244,7 @@ ColumnLayout {
                     }
                     SearchToggle {
                         Layout.fillWidth: true
-                        text: "Hide after opening a photo"
+                        text: "Hide after opening a file"
                         colors: page.app.colors
                         checked: page.app.settings.closeAfterOpening
                         enabled: page.app.ready && !page.app.busy
@@ -358,7 +358,7 @@ ColumnLayout {
                         font.pixelSize: SearchTheme.font.bodySmall
                     }
                     SearchText {
-                        text: "FG-CLIP2 · " + page.app.status.provider + " · " + page.app.status.threads + " threads"
+                        text: "EmbeddingGemma 2 · " + page.app.status.provider + " · " + page.app.status.threads + " threads"
                         color: page.app.secondaryText
                         font.pixelSize: SearchTheme.font.bodySmall
                     }
@@ -394,7 +394,7 @@ ColumnLayout {
                     }
                     SearchText {
                         Layout.fillWidth: true
-                        text: "Maximum images processed together during indexing. Larger batches use more memory. Restart Fractal Search to apply changes."
+                        text: "Maximum still images processed together during indexing. Text, audio and video use separate segments. Larger batches use more memory. Restart Fractal Search to apply changes."
                         color: page.app.secondaryText
                         wrapMode: Text.WordWrap
                         font.pixelSize: SearchTheme.font.bodySmall

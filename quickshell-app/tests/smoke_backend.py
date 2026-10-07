@@ -149,7 +149,7 @@ def main():
         service = Service(binary, models, root / "data", root / "backend.log")
         try:
             ready = service.until(lambda item: item.get("event") == "ready")["payload"]
-            assert ready["catalog"]["imageCount"] == 0 and ready["modelLoaded"] is False
+            assert ready["catalog"]["assetCount"] == 0 and ready["modelLoaded"] is False
             preferences = {"topMatches": 6, "resultLayout": "listPreview", "watchChanges": False, "closeAfterOpening": True, "imageBatchSize": 1}
             assert ready["settings"] == preferences
             assert "Top matches" in service.call({"type": "updateSettings", "settings": {**preferences, "topMatches": 0}}, success=False)
@@ -255,7 +255,7 @@ def main():
             assert service.response(cancel_id)["cancelRequested"]
             result = service.response(index_id)
             assert result["cancelled"] and 1 <= result["indexed"] < 8
-            assert service.response(status_id)["catalog"]["imageCount"] == count + additional_count + result["indexed"]
+            assert service.response(status_id)["catalog"]["assetCount"] == count + additional_count + result["indexed"]
             assert not service.call({"type": "index", "directory": str(photos)})["cancelled"]
             print("Cancellation finishes active work and rejects concurrent scans", flush=True)
 
@@ -308,7 +308,7 @@ def main():
                 [str(binary), "--data-dir", str(root / "data"), "status"],
                 capture_output=True, text=True, check=True, timeout=10,
             )
-            assert json.loads(status.stdout)["catalog"]["imageCount"] > count
+            assert json.loads(status.stdout)["catalog"]["assetCount"] > count
             assert json.loads(status.stdout)["settings"] == preferences
             eof = subprocess.run(
                 [str(binary), "--data-dir", str(root / "data"), "serve"],

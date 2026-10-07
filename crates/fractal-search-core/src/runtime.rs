@@ -1,4 +1,4 @@
-//! Resident FG-CLIP2 ONNX sessions with explicit CPU or CUDA selection.
+//! Resident EmbeddingGemma 2 ONNX sessions with explicit CPU or CUDA selection.
 use crate::{embeddings, preprocess, Embedder, EMBEDDING_DIM, MODEL_PROFILE};
 use anyhow::{bail, ensure, Context, Result};
 use ort::{
@@ -82,7 +82,31 @@ struct ModelFile {
     sha256: String,
 }
 
-/// Model verification is performed once per process before either session loads.
+// ort rc.10 rejects zero dimensions in from_array; allocate real empty tensors.
+fn empty_media_features() -> Result<Tensor<f32>> {
+    Ok(Tensor::new(
+        &ort::memory::Allocator::default(),
+        [0usize, preprocess::HIDDEN_DIM],
+    )?)
+}
+
+fn media_feature_tensor(ids: &[i64], token: i64, features: Vec<f32>) -> Result<Tensor<f32>> {
+    let count = ids.iter().filter(|&&id| id == token).count();
+    ensure!(
+        features.len() == count * preprocess::HIDDEN_DIM && features.iter().all(|v| v.is_finite()),
+        "Media token/feature count mismatch for token {token}"
+    );
+    if count == 0 {
+        empty_media_features()
+    } else {
+        Ok(Tensor::from_array((
+            [count, preprocess::HIDDEN_DIM],
+            features.into_boxed_slice(),
+        ))?)
+    }
+}
+
+/// Model verification is performed once per process before any session loads.
 pub struct NativeRuntime {
     model_dir: PathBuf,
     threads: usize,
@@ -90,10 +114,9 @@ pub struct NativeRuntime {
     profiling_directory: Option<PathBuf>,
     verified: bool,
     vision: Option<Session>,
+    audio: Option<Session>,
     text: Option<Session>,
-    positions: Vec<f32>,
-    tokens: Vec<u8>,
-    tokenizer: Option<preprocess::ShortTextTokenizer>,
+    tokenizer: Option<preprocess::QueryTokenizer>,
 }
 
 impl NativeRuntime {
@@ -119,9 +142,8 @@ impl NativeRuntime {
             profiling_directory: None,
             verified: false,
             vision: None,
+            audio: None,
             text: None,
-            positions: Vec::new(),
-            tokens: Vec::new(),
             tokenizer: None,
         })
     }
@@ -147,14 +169,17 @@ impl NativeRuntime {
             "Runtime profiling is not enabled"
         );
         let mut files = Vec::new();
-        for session in [&mut self.vision, &mut self.text].into_iter().flatten() {
+        for session in [&mut self.vision, &mut self.audio, &mut self.text]
+            .into_iter()
+            .flatten()
+        {
             files.push(PathBuf::from(session.end_profiling()?));
         }
         self.profiling_directory = None;
         Ok(files)
     }
     pub fn loaded(&self) -> bool {
-        self.vision.is_some() || self.text.is_some()
+        self.vision.is_some() || self.audio.is_some() || self.text.is_some()
     }
     pub fn text_loaded(&self) -> bool {
         self.text.is_some()
@@ -164,14 +189,15 @@ impl NativeRuntime {
         if self.verified {
             return Ok(());
         }
-        let manifest: Manifest = serde_json::from_str(include_str!("../models/fgclip2.json"))?;
+        let manifest: Manifest =
+            serde_json::from_str(include_str!("../models/embeddinggemma2.json"))?;
         eprintln!(
             "[Model] Verifying {}/{} profile={MODEL_PROFILE} at {:?}",
             manifest.repository, manifest.revision, self.model_dir
         );
         for file in manifest.files {
             let path = self.model_dir.join(&file.path);
-            let size = fs::metadata(&path).with_context(|| format!("Missing FG-CLIP2 asset {path:?}; use Fractal Search’s Set up model button or the development scripts/fetch-fgclip2-onnx-probe.py downloader"))?.len();
+            let size = fs::metadata(&path).with_context(|| format!("Missing EmbeddingGemma 2 asset {path:?}; use Fractal Search’s Set up model button or the development scripts/fetch-embeddinggemma2.py downloader"))?.len();
             ensure!(
                 size == file.bytes,
                 "Invalid model asset size for {path:?}: expected {}, found {size}",
@@ -228,18 +254,21 @@ impl NativeRuntime {
             }
         }
     }
-    fn session(&self, file: &str, inputs: &[&str], output: &str) -> Result<Session> {
+    fn session(&self, file: &str, inputs: &[&str], outputs: &[&str]) -> Result<Session> {
         let start = Instant::now();
         let mut builder = self.session_builder()?;
         if let Some(directory) = &self.profiling_directory {
-            builder = builder
-                .with_profiling(directory.join(format!("{}-{file}", self.provider.name())))?;
+            builder = builder.with_profiling(directory.join(format!(
+                "{}-{}",
+                self.provider.name(),
+                file.replace('/', "-")
+            )))?;
         }
         let session = builder
             .commit_from_file(self.model_dir.join(file))
             .with_context(|| {
                 format!(
-                    "Loading native FG-CLIP2 {file} with {} device {:?}; no provider retry",
+                    "Loading native EmbeddingGemma 2 {file} with {} device {:?}; no provider retry",
                     self.provider.name(),
                     self.provider.device_id()
                 )
@@ -251,11 +280,16 @@ impl NativeRuntime {
                 .map(|i| i.name.as_str())
                 .collect::<Vec<_>>()
                 == inputs,
-            "Unexpected FG-CLIP2 input contract for {file}"
+            "Unexpected EmbeddingGemma 2 input contract for {file}"
         );
         ensure!(
-            session.outputs.len() == 1 && session.outputs[0].name == output,
-            "Unexpected FG-CLIP2 output contract for {file}"
+            session
+                .outputs
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>()
+                == outputs,
+            "Unexpected EmbeddingGemma 2 output contract for {file}"
         );
         eprintln!(
             "[Model] Loaded {file} provider={} device={:?} threads={} load_ms={:.1}",
@@ -276,84 +310,234 @@ impl NativeRuntime {
             return Ok(());
         }
         self.verify()?;
-        let bytes = fs::read(self.model_dir.join("vision_pos_embedding.bin"))?;
-        self.positions = bytes
-            .chunks_exact(4)
-            .map(|v| f32::from_le_bytes(v.try_into().expect("four bytes")))
-            .collect();
-        ensure!(
-            self.positions.len() == 16 * 16 * EMBEDDING_DIM
-                && self.positions.iter().all(|x| x.is_finite()),
-            "Invalid vision position table"
-        );
         self.vision = Some(self.session(
-            "visual.onnx",
-            &["pixel_values", "pixel_attention_mask", "pos_embed"],
-            "image_features",
+            "onnx/vision_encoder.onnx",
+            &["pixel_values", "pixel_position_ids"],
+            &["image_features"],
         )?);
         Ok(())
     }
-    /// Allow callers to report startup separately from query inference.
+    fn load_audio(&mut self) -> Result<()> {
+        if self.audio.is_some() {
+            return Ok(());
+        }
+        self.verify()?;
+        self.audio = Some(self.session(
+            "onnx/audio_encoder.onnx",
+            &["input_features", "input_features_mask"],
+            &["audio_features"],
+        )?);
+        Ok(())
+    }
+    /// Warm only the shared text backbone; the vision encoder remains lazy.
     pub fn prepare_text(&mut self) -> Result<()> {
         if self.text.is_some() {
             return Ok(());
         }
         self.verify()?;
-        self.tokenizer = Some(preprocess::ShortTextTokenizer::from_file(
+        self.tokenizer = Some(preprocess::QueryTokenizer::from_file(
             &self.model_dir.join("tokenizer.json"),
         )?);
-        self.tokens = fs::read(self.model_dir.join("text_token_embedding.bin"))?;
-        self.text = Some(self.session("text.onnx", &["token_embeds"], "text_features")?);
+        self.text = Some(self.session(
+            "onnx/model.onnx",
+            &[
+                "input_ids",
+                "attention_mask",
+                "image_features",
+                "video_features",
+                "audio_features",
+            ],
+            &["last_hidden_state", "sentence_embedding"],
+        )?);
         Ok(())
     }
+
+    /// The exported backbone already performs masked mean pooling, projection
+    /// and L2 normalization. Use sentence_embedding, never last_hidden_state.
+    fn embed_tokens(
+        &mut self,
+        inputs: preprocess::TextInputs,
+        image_features: Vec<f32>,
+        video_features: Vec<f32>,
+        audio_features: Vec<f32>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let sequence = inputs.sequence_length;
+        ensure!(
+            sequence > 0 && inputs.input_ids.len() % sequence == 0,
+            "Invalid token batch shape"
+        );
+        let batch = inputs.input_ids.len() / sequence;
+        ensure!(
+            batch > 0 && inputs.attention_mask.len() == inputs.input_ids.len(),
+            "Invalid attention mask shape"
+        );
+        let images = media_feature_tensor(
+            &inputs.input_ids,
+            preprocess::IMAGE_TOKEN_ID,
+            image_features,
+        )?;
+        let video = media_feature_tensor(
+            &inputs.input_ids,
+            preprocess::VIDEO_TOKEN_ID,
+            video_features,
+        )?;
+        let audio = media_feature_tensor(
+            &inputs.input_ids,
+            preprocess::AUDIO_TOKEN_ID,
+            audio_features,
+        )?;
+        let ids = Tensor::from_array(([batch, sequence], inputs.input_ids.into_boxed_slice()))?;
+        let mask =
+            Tensor::from_array(([batch, sequence], inputs.attention_mask.into_boxed_slice()))?;
+        let outputs = self
+            .text
+            .as_mut()
+            .context("Text session not initialized")?
+            .run(ort::inputs![
+                "input_ids" => ids, "attention_mask" => mask, "image_features" => images,
+                "video_features" => video, "audio_features" => audio
+            ])?;
+        let (shape, values) = outputs["sentence_embedding"].try_extract_tensor::<f32>()?;
+        ensure!(
+            shape.as_ref() == [batch as i64, EMBEDDING_DIM as i64],
+            "Unexpected EmbeddingGemma 2 sentence_embedding shape {shape:?}"
+        );
+        values
+            .chunks_exact(EMBEDDING_DIM)
+            .map(embeddings::normalize)
+            .collect()
+    }
+
     pub fn embed_images(&mut self, images: &[image::RgbImage]) -> Result<Vec<Vec<f32>>> {
         let start = Instant::now();
         let inputs = preprocess::prepare_images(images)?;
+        let tokens = preprocess::image_tokens(&inputs.num_soft_tokens)?;
+        let feature_count: usize = inputs.num_soft_tokens.iter().sum();
+        self.prepare_text()?;
         self.load_vision()?;
         let batch = images.len();
         let patches = inputs.max_patches;
-        let positions =
-            embeddings::position_embeddings(&self.positions, &inputs.spatial_shapes, patches)?;
-        let pixels = Tensor::from_array((
-            [batch, patches, EMBEDDING_DIM],
-            inputs.pixel_values.into_boxed_slice(),
-        ))?;
-        let mask = Tensor::from_array((
-            [batch, patches],
-            inputs.pixel_attention_mask.into_boxed_slice(),
-        ))?;
-        let positions = Tensor::from_array((
-            [batch, patches, EMBEDDING_DIM],
-            positions.into_boxed_slice(),
-        ))?;
         let prepared_ms = start.elapsed().as_secs_f64() * 1000.0;
         let inference = Instant::now();
-        let outputs = self.vision.as_mut().context("Vision session not initialized")?.run(ort::inputs!["pixel_values" => pixels, "pixel_attention_mask" => mask, "pos_embed" => positions])?;
-        let (shape, values) = outputs["image_features"].try_extract_tensor::<f32>()?;
-        ensure!(
-            shape.as_ref() == [batch as i64, EMBEDDING_DIM as i64],
-            "Unexpected FG-CLIP2 vision output shape {shape:?}"
-        );
-        let result = values
-            .chunks_exact(EMBEDDING_DIM)
-            .map(embeddings::normalize)
-            .collect::<Result<_>>()?;
+        let features = self.encode_visual(inputs, batch, feature_count)?;
+        let result = self.embed_tokens(tokens, features, Vec::new(), Vec::new())?;
         eprintln!("[Inference] provider={} images={batch} patches={patches} prepare_and_load_ms={prepared_ms:.1} inference_ms={:.1}", self.provider.name(), inference.elapsed().as_secs_f64()*1000.0);
         Ok(result)
     }
+    fn encode_visual(
+        &mut self,
+        inputs: preprocess::ImageInputs,
+        batch: usize,
+        feature_count: usize,
+    ) -> Result<Vec<f32>> {
+        self.load_vision()?;
+        let patches = inputs.max_patches;
+        let pixels = Tensor::from_array((
+            [batch, patches, preprocess::PATCH_DIM],
+            inputs.pixel_values.into_boxed_slice(),
+        ))?;
+        let positions = Tensor::from_array((
+            [batch, patches, 2],
+            inputs.pixel_position_ids.into_boxed_slice(),
+        ))?;
+        let outputs = self
+            .vision
+            .as_mut()
+            .context("Vision session not initialized")?
+            .run(ort::inputs![
+                "pixel_values" => pixels, "pixel_position_ids" => positions
+            ])?;
+        let (shape, values) = outputs["image_features"].try_extract_tensor::<f32>()?;
+        ensure!(
+            shape.as_ref() == [feature_count as i64, preprocess::HIDDEN_DIM as i64],
+            "Unexpected EmbeddingGemma 2 vision output shape {shape:?}"
+        );
+        Ok(values.to_vec())
+    }
+
+    pub fn embed_document(&mut self, title: &str, text: &str) -> Result<Vec<f32>> {
+        self.prepare_text()?;
+        let inputs = self
+            .tokenizer
+            .as_ref()
+            .context("Text tokenizer not initialized")?
+            .encode_document(title, text)?;
+        self.embed_tokens(inputs, Vec::new(), Vec::new(), Vec::new())?
+            .into_iter()
+            .next()
+            .context("Model returned no document embedding")
+    }
+
+    pub fn embed_audio(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
+        let inputs = preprocess::prepare_audio(samples)?;
+        let tokens = preprocess::audio_tokens(&[inputs.num_soft_tokens])?;
+        self.prepare_text()?;
+        self.load_audio()?;
+        let features = {
+            let data = Tensor::from_array((
+                [1, inputs.num_frames, preprocess::AUDIO_FEATURE_DIM],
+                inputs.input_features.into_boxed_slice(),
+            ))?;
+            let mask = Tensor::from_array((
+                [1, inputs.num_frames],
+                inputs.input_features_mask.into_boxed_slice(),
+            ))?;
+            let output = self
+                .audio
+                .as_mut()
+                .context("Audio session not initialized")?
+                .run(ort::inputs![
+                    "input_features" => data, "input_features_mask" => mask
+                ])?;
+            let (shape, values) = output["audio_features"].try_extract_tensor::<f32>()?;
+            ensure!(
+                shape.as_ref() == [inputs.num_soft_tokens as i64, preprocess::HIDDEN_DIM as i64],
+                "Unexpected audio encoder feature shape {shape:?}"
+            );
+            values.to_vec()
+        };
+        self.embed_tokens(tokens, Vec::new(), Vec::new(), features)?
+            .into_iter()
+            .next()
+            .context("Model returned no audio embedding")
+    }
+
+    pub fn embed_video(&mut self, frames: &[image::RgbImage]) -> Result<Vec<f32>> {
+        ensure!(
+            (1..=preprocess::MAX_VIDEO_FRAMES).contains(&frames.len()),
+            "Video requires 1..=32 sampled frames"
+        );
+        self.prepare_text()?;
+        let mut features = Vec::new();
+        let mut soft_tokens = Vec::with_capacity(frames.len());
+        // Encode one frame at a time to keep encoder memory independent of clip
+        // length. The shared backbone still embeds the whole temporal sequence.
+        for frame in frames {
+            let inputs = preprocess::prepare_video_frames(std::slice::from_ref(frame))?;
+            let count = inputs.num_soft_tokens[0];
+            soft_tokens.push(count);
+            features.extend(self.encode_visual(inputs, 1, count)?);
+        }
+        let tokens = preprocess::video_tokens(&soft_tokens)?;
+        self.embed_tokens(tokens, Vec::new(), features, Vec::new())?
+            .into_iter()
+            .next()
+            .context("Model returned no video embedding")
+    }
+
     pub fn model_dir(&self) -> &Path {
         &self.model_dir
     }
     pub fn assets_present(&self) -> bool {
-        [
-            "visual.onnx",
-            "text.onnx",
-            "vision_pos_embedding.bin",
-            "text_token_embedding.bin",
-            "tokenizer.json",
-        ]
-        .iter()
-        .all(|file| self.model_dir.join(file).is_file())
+        let manifest: Manifest =
+            match serde_json::from_str(include_str!("../models/embeddinggemma2.json")) {
+                Ok(manifest) => manifest,
+                Err(_) => return false,
+            };
+        manifest
+            .files
+            .iter()
+            .all(|file| self.model_dir.join(&file.path).is_file())
     }
 }
 
@@ -367,34 +551,34 @@ impl Embedder for NativeRuntime {
             .next()
             .context("Vision returned no embedding")
     }
+    fn embed_document(&mut self, title: &str, text: &str) -> Result<Vec<f32>> {
+        NativeRuntime::embed_document(self, title, text)
+    }
+    fn embed_audio(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
+        NativeRuntime::embed_audio(self, samples)
+    }
+    fn embed_video(&mut self, frames: &[image::RgbImage]) -> Result<Vec<f32>> {
+        NativeRuntime::embed_video(self, frames)
+    }
     fn embed_text(&mut self, query: &str) -> Result<Vec<f32>> {
+        ensure!(!query.trim().is_empty(), "Search query must not be empty");
         ensure!(
-            query.len() <= 4096,
-            "Model text input exceeds 4096 UTF-8 bytes"
+            query.len() <= preprocess::MAX_TEXT_BYTES,
+            "Model text input exceeds {} UTF-8 bytes",
+            preprocess::MAX_TEXT_BYTES
         );
         self.prepare_text()?;
-        let ids = self
+        let inputs = self
             .tokenizer
             .as_ref()
             .context("Text tokenizer not initialized")?
-            .encode(query, "short")?;
-        let values = embeddings::token_embeddings(&self.tokens, &ids)?;
-        let tensor = Tensor::from_array((
-            [1, preprocess::SHORT_TEXT_LENGTH, EMBEDDING_DIM],
-            values.into_boxed_slice(),
-        ))?;
+            .encode(query)?;
         let start = Instant::now();
-        let outputs = self
-            .text
-            .as_mut()
-            .context("Text session not initialized")?
-            .run(ort::inputs!["token_embeds" => tensor])?;
-        let (shape, values) = outputs["text_features"].try_extract_tensor::<f32>()?;
-        ensure!(
-            shape.as_ref() == [1, EMBEDDING_DIM as i64],
-            "Unexpected FG-CLIP2 text output shape {shape:?}"
-        );
-        let result = embeddings::normalize(values)?;
+        let result = self
+            .embed_tokens(inputs, Vec::new(), Vec::new(), Vec::new())?
+            .into_iter()
+            .next()
+            .context("Model returned no query embedding")?;
         eprintln!(
             "[Inference] provider={} query inference_ms={:.1}",
             self.provider.name(),
@@ -408,18 +592,50 @@ impl Embedder for NativeRuntime {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "requires FRACTAL_SEARCH_BATCH_TEST_MODELS and host CUDA access"]
+    fn absent_modalities_have_real_zero_row_tensors_without_model_weights() {
+        let tensor = empty_media_features().unwrap();
+        match tensor.dtype() {
+            ort::value::ValueType::Tensor { ty, shape, .. } => {
+                assert_eq!(*ty, ort::tensor::TensorElementType::Float32);
+                assert_eq!(shape.as_ref(), &[0, preprocess::HIDDEN_DIM as i64]);
+            }
+            _ => panic!("Expected tensor"),
+        }
+    }
+
+    #[test]
+    fn media_feature_counts_and_nonfinite_outputs_are_rejected() {
+        assert!(media_feature_tensor(
+            &[preprocess::AUDIO_TOKEN_ID],
+            preprocess::AUDIO_TOKEN_ID,
+            Vec::new()
+        )
+        .is_err());
+        assert!(media_feature_tensor(&[], preprocess::VIDEO_TOKEN_ID, vec![1.0; 512]).is_err());
+        assert!(media_feature_tensor(
+            &[preprocess::IMAGE_TOKEN_ID],
+            preprocess::IMAGE_TOKEN_ID,
+            vec![f32::NAN; 512]
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[ignore = "requires FRACTAL_SEARCH_BATCH_TEST_MODELS; CUDA builds additionally need host CUDA access"]
     fn image_batches_preserve_single_image_embeddings_on_cpu_and_cuda() {
         let models = PathBuf::from(
             std::env::var_os("FRACTAL_SEARCH_BATCH_TEST_MODELS")
                 .expect("Provide an existing verified model cache"),
         );
-        for provider in [
-            ExecutionProvider::Cpu,
-            ExecutionProvider::Cuda { device_id: 0 },
-        ] {
+        let providers = vec![ExecutionProvider::Cpu];
+        #[cfg(feature = "cuda")]
+        let providers = {
+            let mut providers = providers;
+            providers.push(ExecutionProvider::Cuda { device_id: 0 });
+            providers
+        };
+        for provider in providers {
             let mut runtime = NativeRuntime::with_provider(models.clone(), 6, provider).unwrap();
             for large in [false, true] {
                 let images = (0..crate::MAX_IMAGE_BATCH_SIZE)

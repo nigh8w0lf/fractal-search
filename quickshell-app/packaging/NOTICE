@@ -12,10 +12,15 @@ libraries. NVIDIA driver, CUDA 12 and cuDNN 9 libraries are external runtime
 requirements and are not redistributed in this bundle. The stdio MCP server
 uses rmcp (MIT) and Tokio (MIT).
 
-First-run models are downloaded from zihuv/fg-clip2-base-onnx at the exact
-revision recorded in model-manifest.json. Original FG-CLIP2:
-https://github.com/360CVGroup/FG-CLIP
-https://huggingface.co/zihuv/fg-clip2-base-onnx
+Audio/video decoding invokes separately installed ffmpeg and ffprobe tools.
+Their licensing depends on the system FFmpeg build; no FFmpeg binary is bundled.
+
+First-run EmbeddingGemma 2 FP32 text, vision and audio assets are downloaded from
+onnx-community/embeddinggemma-2-ONNX at the exact revision in model-manifest.json.
+The export declares Apache-2.0. Upstream model and export:
+https://huggingface.co/google/embeddinggemma-2
+https://huggingface.co/onnx-community/embeddinggemma-2-ONNX
+Preserve the applicable model license and attribution when distributing assets.
 
 This local development bundle is not a published or signed release. Complete
 project and third-party license/redistribution review before public distribution.

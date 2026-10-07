@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Compare real service scores with PyTorch fixtures using a temporary catalog.
+"""Compare real service scores with pinned EmbeddingGemma 2 ONNX fixtures.
 
 This measures implementation agreement on synthetic fixtures, not semantic recall.
-Generate fixtures with scripts/prepare-fgclip2-onnx-fixtures.py first.
+Generate fixtures with scripts/prepare-embeddinggemma2-fixtures.py first.
 """
 
 import argparse
@@ -14,6 +14,10 @@ import sys
 import tempfile
 
 from smoke_backend import Service
+
+MODEL_REPOSITORY = "onnx-community/embeddinggemma-2-ONNX"
+MODEL_REVISION = "daa72c51243991dfcaf9f9137d2c573d8f7790c0"
+MODEL_PROFILE = "embeddinggemma2-daa72c51-fp32-multimodal-v1"
 
 
 def cosine(a, b):
@@ -28,11 +32,16 @@ def cosine(a, b):
 
 
 def compare(binary, models, fixtures_path):
+    environment = json.loads((fixtures_path.parent / "environment.json").read_text())
+    if (environment.get("model_repository"), environment.get("model_revision")) != (MODEL_REPOSITORY, MODEL_REVISION):
+        raise ValueError("Regenerate fixtures for the pinned EmbeddingGemma 2 export")
     fixtures = json.loads(fixtures_path.read_text())
     images = [f for f in fixtures if f["kind"] == "image" and len(f["image_files"]) == 1]
     queries = [f for f in fixtures if f["kind"] == "text" and f["text"].strip()]
     if not 5 <= len(images) <= 100 or not queries:
         raise ValueError("Need 5–100 single-image fixtures and nonempty text fixtures")
+    if any(len(query["text"].encode("utf-8")) > 4096 for query in queries):
+        raise ValueError("Fixture query exceeds the application byte limit")
     score_tolerance = 1e-4
     with tempfile.TemporaryDirectory(prefix="fractal-search-parity-", dir="/tmp") as temporary:
         root = pathlib.Path(temporary)
@@ -42,7 +51,11 @@ def compare(binary, models, fixtures_path):
         for fixture in images:
             if len(fixture["reference"]) != 1:
                 raise ValueError(f"Expected one reference for {fixture['name']}")
-            source = fixtures_path.parent / fixture["image_files"][0]
+            source = (fixtures_path.parent / fixture["image_files"][0]).resolve(strict=True)
+            if not source.is_relative_to(fixtures_path.parent.resolve()):
+                raise ValueError("Image fixture escapes its directory")
+            if pathlib.Path(fixture["name"]).name != fixture["name"]:
+                raise ValueError("Fixture names must be filename components")
             name = fixture["name"] + source.suffix
             if name in references:
                 raise ValueError(f"Duplicate fixture name {name}")
@@ -53,8 +66,10 @@ def compare(binary, models, fixtures_path):
         service = Service(binary, models, root / "data", log)
         try:
             ready = service.until(lambda item: item.get("event") == "ready")["payload"]
-            if ready["catalog"]["imageCount"] != 0:
+            if ready["catalog"]["assetCount"] != 0:
                 raise RuntimeError("Expected an empty temporary catalog")
+            if ready["catalog"]["modelProfile"] != MODEL_PROFILE:
+                raise RuntimeError("Unexpected catalog embedding profile")
             indexing_id = service.send({"type": "index", "directory": str(photos)})
             service.until(lambda item: item.get("id") == indexing_id and "ok" in item, timeout=300)
             indexed = service.response(indexing_id)
@@ -99,7 +114,8 @@ def compare(binary, models, fixtures_path):
                 })
                 print(f"[Retrieval parity] {query['name']} max score error={max(errors):.9g}", file=sys.stderr)
             return {
-                "scope": "Synthetic fixtures; numerical retrieval agreement, not labeled retrieval quality",
+                "scope": "Synthetic HF preprocessing and pinned ONNX fixtures; numerical retrieval agreement, not original-checkpoint or labeled retrieval quality",
+                "modelRepository": MODEL_REPOSITORY, "modelRevision": MODEL_REVISION,
                 "images": len(images), "queries": len(queries),
                 "scoreComparisons": len(images) * len(queries),
                 "scoreTolerance": score_tolerance,

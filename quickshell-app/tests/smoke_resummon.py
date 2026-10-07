@@ -180,7 +180,7 @@ with (root / 'viewer.log').open('a') as log:
         png(photos / 'blue.png', color=(20, 40, 200))
         call('test', 'index', str(photos))
         wait(lambda s: s['indexing'], timeout=10)
-        wait(lambda s: not s['indexing'] and s['imageCount'] == 2, timeout=60)
+        wait(lambda s: not s['indexing'] and s['assetCount'] == 2, timeout=60)
         call('search', 'query', 'red image')
         wait(lambda s: s['loading'])
         wait(lambda s: not s['loading'] and s['count'] == 2 and bool(s['previewUrl']), timeout=60)
@@ -263,7 +263,7 @@ with (root / 'viewer.log').open('a') as log:
         children.append(backend); logs.append(log); client.close()
         (root / 'restart.complete').touch()
         restarted = wait(lambda s: s['ready'] and not s['loading'] and s['activeImageBatchSize'] == 4 and not s['batchRestartRequired'])
-        assert restarted['imageCount'] == 2 and restarted['visible']
+        assert restarted['assetCount'] == 2 and restarted['visible']
         call('test', 'manageTestService', 'false')
         call('test', 'resize', '0', '0')
         print('Batch size choice, Later focus, narrow prompt, restart failure and safe restart passed', flush=True)

@@ -40,9 +40,14 @@ Item {
     property string previousPage: "summon"
     property int selectedIndex: -1
     property var sourceId: null
+    property var mediaKind: null
+    property bool resultRequestPending: false
+    property int resultRequestSerial: 0
+    property int previewGeneration: 0
+    property bool previewRequestPending: false
+    property int previewRequestSerial: 0
     property int queryGeneration: 0
     property bool deferredSearch: false
-    property string pendingSearchText: ""
     property var reindexQueue: []
     readonly property var settings: status.settings
     readonly property bool batchRestartRequired: ready && status.activeImageBatchSize !== settings.imageBatchSize
@@ -60,7 +65,8 @@ Item {
     property int total: 0
     property var status: ({
             catalog: {
-                imageCount: 0,
+                assetCount: 0,
+                fileCount: 0,
                 sources: []
             },
             modelsPresent: false,
@@ -89,6 +95,7 @@ Item {
     property string previewError: ""
     property var pending: ({})
     property double nextId: 1
+    property double discardedBeforeId: 0
     readonly property var colors: ({
             background: Color.popups.background,
             foreground: Color.popups.text,
@@ -103,7 +110,7 @@ Item {
     readonly property bool busy: loading || indexing || installingModels || closing || restarting
     readonly property bool serviceRunning: worker.connected
     readonly property bool serviceStarting: !closing && ((starting && !ready) || searchWarming)
-    readonly property string loadingMessage: serviceStarting || searchStarting ? "Starting search service…" : activeQuery.length ? "Searching your images…" : "Loading images…"
+    readonly property string loadingMessage: serviceStarting || searchStarting ? "Starting search service…" : activeQuery.length ? "Searching your library…" : "Loading results…"
     property alias results: results
     signal dismissRequested
     signal stopped
@@ -155,6 +162,9 @@ Item {
         const next = Object.assign({}, pending);
         next[id] = {
             type: command.type,
+            generation: ["search", "browse", "preview"].indexOf(command.type) >= 0 ? queryGeneration : null,
+            previewGeneration: command.type === "preview" ? previewGeneration : null,
+            scope: ["search", "browse"].indexOf(command.type) >= 0 ? resultScope() : null,
             callback: callback
         };
         pending = next;
@@ -167,6 +177,9 @@ Item {
     function receive(line) {
         try {
             const message = JSON.parse(line);
+            // IDs are monotonic across connections; ignore buffered replies from a discarded socket.
+            if (typeof message.id === "number" && message.id < discardedBeforeId)
+                return;
             if (message.event === "ready") {
                 if (message.payload.protocolVersion !== 1)
                     throw new Error("Incompatible backend protocol. Reinstall Fractal Search.");
@@ -197,8 +210,10 @@ Item {
                     }, function () {});
                     return;
                 }
-                if (!indexing && !installingModels)
+                if (!indexing && !installingModels) {
+                    deferredSearch = false;
                     browse(false, false);
+                }
                 return;
             }
             if (message.event === "status") {
@@ -262,9 +277,9 @@ Item {
                 indexReportAcknowledged = false;
                 indexFailureCount = message.payload.failed;
                 indexFailures = message.payload.failures;
-                notice = "Index updated · " + message.payload.indexed + " image(s) updated";
+                notice = "Index updated · " + message.payload.indexed + " file(s) updated";
                 if (indexFailureCount)
-                    fail(indexFailureCount + " image(s) skipped. Open Skipped files for details.");
+                    fail(indexFailureCount + " file(s) skipped. Open Skipped files for details.");
                 browse(false, false);
                 return;
             }
@@ -284,7 +299,7 @@ Item {
                     // later model/storage error prevents a final result.
                     if (indexFailures.length < 100)
                         indexFailures = indexFailures.concat([progress.failure]);
-                    fail(indexFailureCount + " image(s) skipped. Latest: " + progress.failure.path + "\n" + progress.failure.error);
+                    fail(indexFailureCount + " file(s) skipped. Latest: " + progress.failure.path + "\n" + progress.failure.error);
                 }
                 return;
             }
@@ -292,6 +307,8 @@ Item {
                 const entry = pending[message.id];
                 if (!entry || entry.type !== "search")
                     throw new Error("Unexpected search progress " + message.id);
+                if (!isCurrentReply(entry))
+                    return;
                 if (message.payload.stage === "starting")
                     searchStarting = true;
                 else if (message.payload.stage === "searching")
@@ -310,7 +327,7 @@ Item {
             const next = Object.assign({}, pending);
             delete next[message.id];
             pending = next;
-            if (!message.ok)
+            if (!message.ok && isCurrentReply(entry))
                 fail(message.error);
             if (entry.callback)
                 entry.callback(message.ok ? message.result : null, message.ok ? "" : message.error);
@@ -335,7 +352,7 @@ Item {
         if (report.error)
             fail(report.error);
         else if (report.failed)
-            fail(report.failed + " image(s) skipped. Open Skipped files for details.");
+            fail(report.failed + " file(s) skipped. Open Skipped files for details.");
     }
     function installModels() {
         if (!ready || busy)
@@ -370,67 +387,139 @@ Item {
         connectAttempts = 0;
         errorMessage = "";
         notice = "";
-        pending = {};
+        resetConnectionRequests();
         if (manageService)
             starter.running = true;
         else
             connectTimer.start();
     }
+    function resultScope() {
+        return JSON.stringify([activeQuery, sourceId, mediaKind]);
+    }
+    function isCurrentReply(entry) {
+        return (entry.generation === null || entry.generation === queryGeneration)
+            && (entry.scope === null || entry.scope === resultScope())
+            && (entry.previewGeneration === null || entry.previewGeneration === previewGeneration);
+    }
+    function clearResults() {
+        ++previewGeneration;
+        previewTimer.stop();
+        previewLoading = false;
+        selectedIndex = -1;
+        selectedAsset = null;
+        previewUrl = "";
+        previewError = "";
+        total = 0;
+        results.clear();
+    }
+    function resetConnectionRequests() {
+        // Old socket callbacks cannot clear or overwrite a newer connection's work.
+        ++queryGeneration;
+        ++resultRequestSerial;
+        ++previewGeneration;
+        ++previewRequestSerial;
+        previewRequestPending = false;
+        resultRequestPending = false;
+        previewLoading = false;
+        discardedBeforeId = nextId;
+        pending = {};
+    }
+    function editQuery(text) {
+        query = text;
+        activeQuery = text.trim();
+        deferredSearch = false;
+        ++queryGeneration;
+        loading = false;
+        searchStarting = false;
+        clearResults();
+    }
+    function setMediaKind(kind) {
+        mediaKind = kind;
+        browse(false);
+    }
+    function setSourceId(id) {
+        sourceId = id;
+        browse(false);
+    }
     function browse(append, clearError) {
-        if (indexing || installingModels || closing || !ready)
+        if (closing)
             return;
+        // Generation and the complete query/folder/type scope are both checked.
+        // Invalidate immediately, even when a request must wait for warmup or IO.
+        const generation = append ? queryGeneration : ++queryGeneration;
+        if (!append)
+            clearResults();
         loading = true;
         searchStarting = false;
         if (clearError !== false)
             errorMessage = "";
-        const offset = append ? results.count : 0;
-        const generation = ++queryGeneration;
-        if (!append) {
-            selectedIndex = -1;
-            selectedAsset = null;
-            previewUrl = "";
-            results.clear();
+        if (indexing || installingModels || !ready || resultRequestPending) {
+            deferredSearch = true;
+            return;
         }
+        deferredSearch = false;
+        const scope = resultScope();
+        const serial = ++resultRequestSerial;
+        const offset = append ? results.count : 0;
         const command = activeQuery.length ? {
             type: "search",
             query: activeQuery,
             sourceId: sourceId,
+            mediaKind: mediaKind,
             maxResults: settings.topMatches,
             offset: offset,
             limit: settings.topMatches
         } : {
             type: "browse",
             sourceId: sourceId,
+            mediaKind: mediaKind,
             offset: offset,
             limit: settings.topMatches
         };
+        resultRequestPending = true;
         request(command, function (result) {
-            if (generation !== app.queryGeneration)
+            if (serial !== app.resultRequestSerial)
+                return;
+            app.resultRequestPending = false;
+            if (app.deferredSearch) {
+                app.deferredSearch = false;
+                app.browse(false, false);
+                return;
+            }
+            if (generation !== app.queryGeneration || scope !== app.resultScope())
                 return;
             app.loading = false;
             app.searchStarting = false;
-            if (app.deferredSearch) {
-                app.deferredSearch = false;
-                app.search(app.pendingSearchText);
-                return;
-            }
             if (!result)
                 return;
             app.total = result.total;
-            for (const image of result.items) {
-                if (!image.assetId || !image.thumbnailUrl) {
-                    app.fail("Service returned an image without its thumbnail.");
+            for (const asset of result.items) {
+                if (!asset.assetId || ["image", "text", "audio", "video"].indexOf(asset.mediaKind) < 0 || (app.isVisualAsset(asset) && !asset.thumbnailUrl)) {
+                    app.fail("Service returned incomplete media metadata. Reinstall matching UI and backend versions.");
+                    return;
+                }
+                const hasScore = asset.similarity !== null && asset.similarity !== undefined;
+                const hasHybridScore = asset.hybridScore !== null && asset.hybridScore !== undefined;
+                if ((hasScore && !Number.isFinite(asset.similarity)) || (hasHybridScore && (!Number.isFinite(asset.hybridScore) || app.mediaKind !== "text" || !app.activeQuery.length))) {
+                    app.fail("Service returned an invalid search score. Reinstall matching UI and backend versions.");
                     return;
                 }
                 results.append({
-                    assetId: image.assetId,
-                    filename: image.filename,
-                    path: image.path,
-                    thumbnailUrl: image.thumbnailUrl,
-                    width: image.width,
-                    height: image.height,
-                    similarity: image.similarity === null ? 0 : image.similarity,
-                    hasScore: image.similarity !== null
+                    assetId: asset.assetId,
+                    filename: asset.filename,
+                    path: asset.path,
+                    mediaKind: asset.mediaKind,
+                    segmentIndex: asset.segmentIndex,
+                    startMs: asset.startMs === null ? -1 : asset.startMs,
+                    endMs: asset.endMs === null ? -1 : asset.endMs,
+                    textExcerpt: asset.textExcerpt || "",
+                    thumbnailUrl: asset.thumbnailUrl || "",
+                    width: asset.width,
+                    height: asset.height,
+                    similarity: hasScore ? asset.similarity : 0,
+                    hasScore: hasScore,
+                    hybridScore: hasHybridScore ? asset.hybridScore : 0,
+                    hasHybridScore: hasHybridScore
                 });
             }
             if (!append && results.count)
@@ -439,23 +528,19 @@ Item {
         });
     }
     function search(text) {
-        if (!ready && serviceStarting) {
-            query = text;
-            pendingSearchText = text;
-            deferredSearch = true;
-            return;
-        }
-        if (indexing || installingModels || closing || !ready)
+        if (closing)
             return;
         page = "results";
         query = text;
-        if (loading) {
-            pendingSearchText = text;
-            deferredSearch = true;
-            return;
-        }
         activeQuery = text.trim();
         browse(false);
+    }
+    function scoreLabel(asset) {
+        if (!asset)
+            return "";
+        if (asset.hasHybridScore)
+            return "Hybrid score " + asset.hybridScore.toFixed(5);
+        return asset.hasScore ? "Cosine " + asset.similarity.toFixed(3) : "";
     }
     function indexFolder(directory) {
         if (busy || !ready)
@@ -485,7 +570,7 @@ Item {
                 app.indexFailures = result.failures;
                 app.notice = (result.cancelled ? "Indexing stopped. " : result.failed ? "Indexing finished with errors. " : "Folder indexed. ") + result.indexed + " updated · " + result.unchanged + " unchanged" + (result.failed ? " · " + result.failed + " skipped" : "") + (result.removed ? " · " + result.removed + " removed from index" : "");
                 if (result.failed)
-                    app.errorMessage = result.failed + " image(s) could not be indexed. Open Skipped files for the filenames and errors, then rescan after repairing them.";
+                    app.errorMessage = result.failed + " file(s) could not be indexed. Open Skipped files for the filenames and errors, then rescan after repairing them.";
                 app.activeQuery = "";
                 app.query = "";
                 if (app.reindexQueue.length && !result.cancelled && !result.failed)
@@ -498,7 +583,7 @@ Item {
                 }
             } else {
                 app.reindexQueue = [];
-                // Completed images remain usable after a scan fails. Refresh
+                // Completed files remain usable after a scan fails. Refresh
                 // the gallery while preserving the visible indexing error.
                 app.activeQuery = "";
                 app.query = "";
@@ -512,7 +597,7 @@ Item {
             type: "cancel"
         }, function (result) {
             if (result)
-                app.notice = "Stopping after the active image is saved…";
+                app.notice = "Finishing active work and saving completed files…";
         });
     }
     function setModelDirectory(directory) {
@@ -541,6 +626,33 @@ Item {
         const home = Quickshell.env("HOME");
         return home && (path === home || path.startsWith(home + "/")) ? "~" + path.substring(home.length) : path;
     }
+    function isVisualAsset(asset) {
+        return !!asset && (asset.mediaKind === "image" || asset.mediaKind === "video");
+    }
+    function timeLabel(milliseconds) {
+        const seconds = Math.max(0, Math.floor(milliseconds / 1000));
+        const minutes = Math.floor(seconds / 60);
+        return minutes + ":" + (seconds % 60 < 10 ? "0" : "") + (seconds % 60);
+    }
+    function mediaLabel(asset) {
+        if (!asset)
+            return "";
+        const kind = asset.mediaKind.charAt(0).toUpperCase() + asset.mediaKind.slice(1);
+        if (asset.mediaKind === "text")
+            return kind + " · passage " + (asset.segmentIndex + 1);
+        if (asset.mediaKind === "audio" || asset.mediaKind === "video")
+            return kind + " · " + timeLabel(asset.startMs) + "–" + timeLabel(asset.endMs);
+        return kind;
+    }
+    function previewText() {
+        if (!selectedAsset)
+            return "Select a result";
+        if (selectedAsset.mediaKind === "text")
+            return selectedAsset.textExcerpt;
+        if (selectedAsset.mediaKind === "audio")
+            return mediaLabel(selectedAsset) + "\n\nOpen file to listen in your default app. Playback starts according to that app; segment seeking is not requested.";
+        return "";
+    }
     function select(index) {
         if (index < 0 || index >= results.count)
             return;
@@ -550,12 +662,26 @@ Item {
             assetId: asset.assetId,
             filename: asset.filename,
             path: asset.path,
+            mediaKind: asset.mediaKind,
+            segmentIndex: asset.segmentIndex,
+            startMs: asset.startMs,
+            endMs: asset.endMs,
+            textExcerpt: asset.textExcerpt,
+            thumbnailUrl: asset.thumbnailUrl,
             width: asset.width,
-            height: asset.height
+            height: asset.height,
+            similarity: asset.similarity,
+            hasScore: asset.hasScore,
+            hybridScore: asset.hybridScore,
+            hasHybridScore: asset.hasHybridScore
         };
-        previewUrl = "";
+        ++previewGeneration;
+        previewLoading = asset.mediaKind === "image" && previewRequestPending;
+        previewTimer.stop();
+        previewUrl = asset.mediaKind === "video" ? asset.thumbnailUrl : "";
         previewError = "";
-        previewTimer.restart();
+        if (asset.mediaKind === "image")
+            previewTimer.restart();
     }
     function preview(asset) {
         for (let i = 0; i < results.count; ++i) {
@@ -564,22 +690,30 @@ Item {
                 return;
             }
         }
-        fail("Cannot preview an image outside the current results.");
+        fail("Cannot preview a file outside the current results.");
     }
     function loadPreview() {
-        if (!selectedAsset || previewLoading || closing)
+        if (!selectedAsset || selectedAsset.mediaKind !== "image" || previewRequestPending || closing)
             return;
         const assetId = selectedAsset.assetId;
+        const generation = queryGeneration;
+        const selection = previewGeneration;
+        const serial = ++previewRequestSerial;
+        previewRequestPending = true;
         previewLoading = true;
         request({
             type: "preview",
             assetId: assetId
         }, function (result, error) {
-            app.previewLoading = false;
-            if (!app.selectedAsset || app.selectedAsset.assetId !== assetId) {
+            if (serial !== app.previewRequestSerial)
+                return;
+            app.previewRequestPending = false;
+            if (generation !== app.queryGeneration || selection !== app.previewGeneration || !app.selectedAsset || app.selectedAsset.assetId !== assetId) {
+                // One preview at a time; dispatch only the latest selected image next.
                 previewTimer.restart();
                 return;
             }
+            app.previewLoading = false;
             if (result)
                 app.previewUrl = result.url;
             else
@@ -596,7 +730,7 @@ Item {
             if (!result)
                 return;
             if (!Qt.openUrlExternally(result.url))
-                app.fail("The desktop could not open this image.");
+                app.fail("The desktop could not open this file.");
             else {
                 // Hiding releases focus itself. Lower only a panel that stays
                 // visible, so hide/resummon cannot race a native layer change.
@@ -620,13 +754,11 @@ Item {
     }
     function dismiss() {
         page = "summon";
-        query = "";
-        deferredSearch = false;
+        editQuery("");
         dismissRequested();
     }
 
     function showSettings() {
-        deferredSearch = false;
         autostart.refresh();
         previousPage = page;
         page = "settings";
@@ -636,8 +768,7 @@ Item {
             page = previousPage;
         else if (page === "results") {
             page = "summon";
-            query = "";
-            deferredSearch = false;
+            editQuery("");
         } else
             dismiss();
     }
@@ -767,7 +898,7 @@ Item {
             app.loading = false;
             app.indexing = false;
             app.installingModels = false;
-            app.pending = {};
+            app.resetConnectionRequests();
             app.notice = "";
             app.starting = true;
             app.stoppedCleanly = false;
@@ -823,6 +954,7 @@ Item {
         }
         onConnectedChanged: {
             if (!connected && app.ready) {
+                app.resetConnectionRequests();
                 app.ready = false;
                 app.loading = false;
                 app.searchStarting = false;

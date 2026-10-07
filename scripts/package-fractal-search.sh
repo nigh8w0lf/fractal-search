@@ -50,7 +50,7 @@ for SEARCH_QML in quickshell-app/ui/*.qml quickshell-app/ui/qmldir; do
   [[ ${SEARCH_QML##*/} == shell.qml ]] && continue
   cp -- "$SEARCH_QML" "$SEARCH_OUTPUT/ui/"
 done
-cp -- crates/fractal-search-core/models/fgclip2.json "$SEARCH_OUTPUT/model-manifest.json"
+cp -- crates/fractal-search-core/models/embeddinggemma2.json "$SEARCH_OUTPUT/model-manifest.json"
 cp -- quickshell-app/MCP.md "$SEARCH_OUTPUT/MCP.md"
 cp -- quickshell-app/CUDA.md "$SEARCH_OUTPUT/CUDA.md"
 jq -n --arg architecture "$(uname -m)" --arg profile "$SEARCH_PROFILE" --argjson cuda "$SEARCH_CUDA" '{architecture:$architecture,profile:$profile,protocolVersion:1,cuda:($cuda == 1)}' > "$SEARCH_OUTPUT/bundle.json"

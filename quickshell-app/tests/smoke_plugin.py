@@ -95,7 +95,7 @@ def check_catalog_reset(binary, root):
         try:
             client.send(1, {'type': 'status'})
             status = client.response(1)['result']
-            assert status['catalog']['imageCount'] == 0 and status['catalog']['sources'] == [], status
+            assert status['catalog']['assetCount'] == 0 and status['catalog']['sources'] == [], status
             assert not status['modelLoaded'] and not status['modelsPresent'], status
             if state == 'empty':
                 client.send(2, {'type': 'updateSettings', 'settings': preferences})
@@ -164,7 +164,7 @@ def main():
             client.send(2, {'type': 'status'})
             finished = client.until(lambda m: m.get('event') == 'indexFinished')['payload']
             assert finished['indexed'] == 5 and finished['failed'] == 1, finished
-            assert client.response(2)['result']['catalog']['imageCount'] == 5
+            assert client.response(2)['result']['catalog']['assetCount'] == 5
             print('UI disconnect/reconnect preserved indexing, IDs and skipped-file report', flush=True)
             client.close(); time.sleep(.1)
             client = Client(path)
@@ -194,7 +194,7 @@ def main():
             client.close()
             process, client, path, log = launch(binary, models, root)
             client.send(1, {'type': 'status'})
-            assert client.response(1)['result']['catalog']['imageCount'] >= 5
+            assert client.response(1)['result']['catalog']['assetCount'] >= 5
             client.send(2, {'type': 'shutdown'}); client.response(2)
             assert process.wait(timeout=15) == 0
             client.close()
@@ -219,7 +219,7 @@ def main():
             client.response(2)
             assert process.wait(timeout=15) == 0
             client.close()
-            assert not (empty / 'visual.onnx').exists()
+            assert not (empty / 'onnx/vision_encoder.onnx').exists()
             print('Offline model-download progress/cancel leaves no unverified asset', flush=True)
         finally:
             stop(process); log.close()

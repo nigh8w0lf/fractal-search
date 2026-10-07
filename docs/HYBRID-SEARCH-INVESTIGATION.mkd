@@ -1,7 +1,9 @@
+Current implementation: see [Text-only hybrid retrieval](HYBRID-TEXT-SEARCH.md) and [ColBERT assessment](COLBERT-ASSESSMENT.md). The broader investigation below is historical and does not imply all proposed features are implemented.
+
 # Hybrid image and document search investigation
 
 Date: 2026-10-03
-Status: Research summary and proposed direction; not an implementation specification or approval to implement.
+Status: Historical research summary. The implemented text-only BM25 + semantic baseline is specified in [HYBRID-TEXT-SEARCH.md](HYBRID-TEXT-SEARCH.md); the broader document extraction, grouping, reranking and ColBERT ideas below remain investigation only.
 
 ## Scope and requirements
 
@@ -38,7 +40,7 @@ PDF / Word / Markdown / text
   group by document + best matching passage
 ```
 
-Use a dedicated document embedding model. Preserve FG-CLIP2 for image search; its existing short text mode and image-oriented embedding contract are not a substitute for evaluating document retrieval.
+The original investigation recommended a dedicated document embedding model while keeping the then-current image encoder. The current greenfield implementation instead uses EmbeddingGemma 2 for image, UTF-8 text-passage, audio and video retrieval in one space. The current Text filter implements BM25 and passage-level RRF as documented in the [text-only hybrid contract](HYBRID-TEXT-SEARCH.md). PDF/Office extraction, document grouping, OCR and reranking from this broader proposal remain unimplemented. Evaluate those separately before revisiting the proposal. The recommendations below remain historical alternatives, not current runtime guarantees.
 
 Hybrid search does not require a multi-vector model. A conventional embedding model produces one vector per passage. A document can have many passage vectors without token-level late interaction such as ColBERT. BM25 operates independently over indexed text; fusion combines the ranked results. sqlite-vec stores and searches vectors; it does not generate them.
 

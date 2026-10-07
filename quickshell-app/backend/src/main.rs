@@ -8,6 +8,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use fractal_search_core::{
     catalog::{Asset, Catalog, Page},
+    media::MediaKind,
     runtime::{ExecutionProvider, NativeRuntime},
     Embedder,
 };
@@ -32,7 +33,7 @@ type Output = Arc<Mutex<std::io::Stdout>>;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Native FG-CLIP2 image search for Quickshell; no face models or Python"
+    about = "Native EmbeddingGemma 2 multimodal search for Quickshell; no face models or Python"
 )]
 struct Options {
     #[arg(long, env = "FRACTAL_SEARCH_DATA_DIR")]
@@ -77,6 +78,7 @@ enum Command {
         #[serde(default = "page_limit")]
         limit: usize,
         source_id: Option<i64>,
+        media_kind: Option<MediaKind>,
     },
     Search {
         query: String,
@@ -85,6 +87,7 @@ enum Command {
         #[serde(default = "page_limit")]
         limit: usize,
         source_id: Option<i64>,
+        media_kind: Option<MediaKind>,
         #[serde(default = "search_limit")]
         max_results: usize,
     },
@@ -326,11 +329,11 @@ fn reveal(url: &str) -> Result<()> {
         ])
         .output()
         .context(
-            "Reveal image requires gdbus and a file manager implementing FileManager1.ShowItems",
+            "Reveal file requires gdbus and a file manager implementing FileManager1.ShowItems",
         )?;
     ensure!(
         result.status.success(),
-        "File manager could not reveal the image: {}",
+        "File manager could not reveal the file: {}",
         String::from_utf8_lossy(&result.stderr).trim()
     );
     Ok(())
@@ -425,7 +428,7 @@ fn serve(options: Options) -> Result<()> {
         Some(path) => path,
         None => dirs::cache_dir()
             .context("Cannot determine model cache directory")?
-            .join("fractal-search/models/fgclip2-33f3b9d4"),
+            .join("fractal-search/models/embeddinggemma2-daa72c51"),
     };
     let model_dir = if model_dir.is_absolute() {
         model_dir
@@ -576,7 +579,8 @@ fn serve(options: Options) -> Result<()> {
             &json!({"event":"warmupFinished","payload":{"ok":error.is_none(),"error":error}}),
         )?;
     }
-    let mut search_cache: Option<((String, Option<i64>, usize), Vec<Asset>)> = None;
+    let mut search_cache: Option<((String, Option<i64>, Option<MediaKind>, usize), Vec<Asset>)> =
+        None;
     while !STOP.load(Ordering::Relaxed) {
         let request = match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(request) => request,
@@ -659,18 +663,20 @@ fn serve(options: Options) -> Result<()> {
                 offset,
                 limit,
                 source_id,
+                media_kind,
             } => Ok(serde_json::to_value(
-                catalog.browse_source(offset, limit, source_id)?,
+                catalog.browse_filtered(offset, limit, source_id, media_kind)?,
             )?),
             Command::Search {
                 query,
                 offset,
                 limit,
                 source_id,
+                media_kind,
                 max_results,
             } => {
                 ensure!(
-                    !query.trim().is_empty() && query.len() <= 4096,
+                    !query.trim().is_empty() && query.len() <= 4096 && !query.contains('\0'),
                     "Enter a search description between 1 and 4096 UTF-8 bytes"
                 );
                 ensure!(
@@ -684,7 +690,7 @@ fn serve(options: Options) -> Result<()> {
                 if let Some(id) = source_id {
                     catalog.source_directory(id)?;
                 }
-                let key = (query.clone(), source_id, max_results);
+                let key = (query.clone(), source_id, media_kind, max_results);
                 if !search_cache.as_ref().is_some_and(|r| r.0 == key) {
                     if !runtime.text_loaded() {
                         emit(
@@ -700,19 +706,31 @@ fn serve(options: Options) -> Result<()> {
                     let embedding = runtime.embed_text(&query)?;
                     search_cache = Some((
                         key,
-                        catalog.search_source(&embedding, max_results, source_id)?,
+                        catalog.search_filtered(
+                            &query,
+                            &embedding,
+                            max_results,
+                            source_id,
+                            media_kind,
+                        )?,
                     ));
                 }
                 let hits = &search_cache
                     .as_ref()
                     .context("Search cache not initialized")?
                     .1;
-                Ok(serde_json::to_value(Page {
+                let mut page = serde_json::to_value(Page {
                     items: hits.iter().skip(offset).take(limit).cloned().collect(),
                     total: hits.len(),
                     offset,
                     limit,
-                })?)
+                })?;
+                page["searchMode"] = json!(if media_kind == Some(MediaKind::Text) {
+                    "hybrid"
+                } else {
+                    "semantic"
+                });
+                Ok(page)
             }
             Command::Index { directory } => {
                 search_cache = None;
@@ -944,6 +962,40 @@ mod tests {
                 .unwrap(),
             b"{}"
         );
+    }
+    #[test]
+    fn media_filters_are_optional_strict_and_part_of_search_cache_scope() {
+        for kind in ["browse", "search"] {
+            for media in [
+                Value::Null,
+                json!("image"),
+                json!("text"),
+                json!("audio"),
+                json!("video"),
+            ] {
+                let mut command = json!({"type":kind,"mediaKind":media,"sourceId":7});
+                if kind == "search" {
+                    command["query"] = json!("literal AND café");
+                }
+                assert!(serde_json::from_value::<Command>(command.clone()).is_ok());
+                command["unexpected"] = json!(true);
+                assert!(serde_json::from_value::<Command>(command).is_err());
+            }
+            for media in [json!("all"), json!("Text"), json!("documents"), json!(1)] {
+                let mut command = json!({"type":kind,"mediaKind":media});
+                if kind == "search" {
+                    command["query"] = json!("needle");
+                }
+                assert!(serde_json::from_value::<Command>(command).is_err());
+            }
+        }
+        assert!(serde_json::from_value::<Command>(json!({"type":"browse"})).is_ok());
+        assert!(
+            serde_json::from_value::<Command>(json!({"type":"search","query":"needle"})).is_ok()
+        );
+        let all = ("needle".to_string(), Some(7), None, 6);
+        let text = ("needle".to_string(), Some(7), Some(MediaKind::Text), 6);
+        assert_ne!(all, text);
     }
     #[test]
     fn local_directory_urls_preserve_special_characters_and_reject_remote_urls() {

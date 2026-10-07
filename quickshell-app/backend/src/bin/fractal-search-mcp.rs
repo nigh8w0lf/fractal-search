@@ -6,6 +6,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Parser;
 use fractal_search_core::{
     agent::{validate_asset_id, validate_page, validate_query, AgentCatalog},
+    media::MediaKind,
     runtime::{ExecutionProvider, NativeRuntime},
     Embedder,
 };
@@ -42,19 +43,21 @@ struct Options {
 #[serde(deny_unknown_fields)]
 struct Empty {}
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Browse {
     #[serde(default)]
     offset: usize,
     #[serde(default = "default_limit")]
     limit: usize,
+    media_kind: Option<MediaKind>,
 }
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Search {
     query: String,
     #[serde(default = "default_limit")]
     limit: usize,
+    media_kind: Option<MediaKind>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -153,7 +156,7 @@ impl State {
         saved.map(Ok).unwrap_or_else(|| {
             dirs::cache_dir()
                 .context("Cannot locate model cache")
-                .map(|path| path.join("fractal-search/models/fgclip2-33f3b9d4"))
+                .map(|path| path.join("fractal-search/models/embeddinggemma2-daa72c51"))
         })
     }
     fn execute(&mut self, action: Action) -> Result<CallToolResult> {
@@ -169,7 +172,7 @@ impl State {
                 Ok(CallToolResult::structured(status))
             }
             Action::Browse(args) => Ok(CallToolResult::structured(serde_json::to_value(
-                catalog.browse(args.offset, args.limit)?,
+                catalog.browse_filtered(args.offset, args.limit, args.media_kind)?,
             )?)),
             Action::Metadata(args) => Ok(CallToolResult::structured(serde_json::to_value(
                 catalog.metadata(&args.asset_id)?,
@@ -191,7 +194,7 @@ impl State {
                     anyhow::anyhow!("Text inference failed; check the model setup and selected provider in server diagnostics")
                 })?;
                 Ok(CallToolResult::structured(
-                    json!({"items":catalog.search(&embedding,args.limit)?,"limit":args.limit}),
+                    json!({"items":catalog.search_filtered(&args.query,&embedding,args.limit,args.media_kind)?,"limit":args.limit,"searchMode":if args.media_kind == Some(MediaKind::Text) { "hybrid" } else { "semantic" }}),
                 ))
             }
         }
@@ -203,13 +206,14 @@ struct Server {
 }
 fn tools() -> Vec<Tool> {
     let limit = json!({"type":"integer","minimum":1,"maximum":100,"default":20});
+    let media_kind = json!({"type":["string","null"],"enum":["image","text","audio","video",null],"description":"Optional segment type; omit or null for all media. Text search uses BM25 plus semantic RRF; other scopes use cosine."});
     let mut entries = Vec::new();
     for (name,description,properties,required) in [
-        ("status","Read indexed image and folder counts, profile and inference state; no model loading.",json!({}),json!([])),
-        ("browse_assets","Browse indexed image metadata in stable filename order. Returns opaque asset and thumbnail handles, never original paths.",json!({"offset":{"type":"integer","minimum":0,"maximum":250000,"default":0},"limit":limit}),json!([])),
-        ("search_assets","Search indexed images using FG-CLIP2 short text. Query is limited to 4096 UTF-8 bytes; only this tool loads text inference. Returns at most 100 ranked images.",json!({"query":{"type":"string","minLength":1,"maxLength":4096},"limit":limit}),json!(["query"])),
-        ("get_asset_metadata","Read metadata for an opaque asset ID returned by browse/search.",json!({"assetId":{"type":"string","pattern":"^asset_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}),json!(["assetId"])),
-        ("get_thumbnail","Read an existing managed WebP thumbnail, at most 384 pixels per side and 1 MiB. Returns MCP image content; does not read originals or repair caches.",json!({"thumbnailHandle":{"type":"string","pattern":"^thumbnail_asset_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}),json!(["thumbnailHandle"])),
+        ("status","Read indexed segment, distinct-file and folder counts, profile and inference state; no model loading.",json!({}),json!([])),
+        ("browse_assets","Browse image, text, audio and video segment metadata in stable filename order. Includes media kind, time ranges and bounded cached text excerpts; thumbnail handles are null for nonvisual media. Never returns original path metadata.",json!({"offset":{"type":"integer","minimum":0,"maximum":250000,"default":0},"limit":limit,"mediaKind":media_kind}),json!([])),
+        ("search_assets","Search indexed segments using EmbeddingGemma 2. mediaKind=text combines BM25 and semantic ranks; all other scopes retain cosine order. hybridScore is a rank-fusion score, never a percent; similarity remains actual cosine. Query is limited to 4096 UTF-8 bytes; only this tool loads text inference. Returns at most 100 ranked segments with media kind, time ranges and bounded cached text excerpts.",json!({"query":{"type":"string","minLength":1,"maxLength":4096},"limit":limit,"mediaKind":media_kind}),json!(["query"])),
+        ("get_asset_metadata","Read cached segment metadata for an opaque asset ID returned by browse/search; may disclose a text excerpt up to 2048 UTF-8 bytes. No original file reads.",json!({"assetId":{"type":"string","pattern":"^asset_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}),json!(["assetId"])),
+        ("get_thumbnail","Read an existing managed WebP image/video thumbnail from a non-null handle, at most 384 pixels per side and 1 MiB. Returns MCP image content; does not read originals or repair caches.",json!({"thumbnailHandle":{"type":"string","pattern":"^thumbnail_asset_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}),json!(["thumbnailHandle"])),
     ] {
         let schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
         entries.push(Tool::new_with_raw(name,Some(description.into()),schema.as_object().expect("schema object").clone()).with_annotations(ToolAnnotations::new().read_only(true).destructive(false).idempotent(true).open_world(false)));
@@ -220,7 +224,7 @@ impl ServerHandler for Server {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fractal-search-mcp",env!("CARGO_PKG_VERSION")))
-            .with_instructions("Read-only access to the Quickshell Fractal Search catalog. Index folders and set up models in the desktop plugin first. Original paths and files are never returned. Thumbnails disclose image content to the calling client only when requested.")
+            .with_instructions("Read-only access to the Quickshell Fractal Search catalog. Index folders and set up models in the desktop plugin first. Original path metadata and file bytes are never returned. Metadata includes filenames and bounded cached text excerpts, which disclose library content. Requested thumbnails disclose image/video content. Audio/video results identify time ranges; this server does not play files or request seeking.")
     }
     async fn list_tools(
         &self,
@@ -306,4 +310,58 @@ async fn main() -> Result<()> {
         "MCP transport failed; see diagnostics"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_filter_schemas_and_arguments_are_strict() {
+        for name in ["browse_assets", "search_assets"] {
+            let tool = tools().into_iter().find(|tool| tool.name == name).unwrap();
+            let schema = serde_json::to_value(tool).unwrap();
+            assert_eq!(schema["inputSchema"]["additionalProperties"], false);
+            assert_eq!(
+                schema["inputSchema"]["properties"]["mediaKind"]["enum"],
+                json!(["image", "text", "audio", "video", null])
+            );
+            for media in [
+                Value::Null,
+                json!("image"),
+                json!("text"),
+                json!("audio"),
+                json!("video"),
+            ] {
+                let value = if name == "search_assets" {
+                    json!({"query":"literal AND café","mediaKind":media})
+                } else {
+                    json!({"mediaKind":media})
+                };
+                let request: CallToolRequestParams =
+                    serde_json::from_value(json!({"name":name,"arguments":value})).unwrap();
+                assert!(action(request).is_ok());
+            }
+            for media in [json!("all"), json!("Text"), json!("documents"), json!(1)] {
+                let value = if name == "search_assets" {
+                    json!({"query":"needle","mediaKind":media})
+                } else {
+                    json!({"mediaKind":media})
+                };
+                let request =
+                    serde_json::from_value(json!({"name":name,"arguments":value})).unwrap();
+                assert!(action(request).is_err());
+            }
+        }
+        assert!(serde_json::from_value::<Browse>(json!({})).is_ok());
+        assert!(serde_json::from_value::<Search>(json!({"query":"needle"})).is_ok());
+        assert!(serde_json::from_value::<Browse>(
+            json!({"mediaKind":"text","indexedText":"secret"})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<Search>(
+            json!({"query":"needle","mediaKind":"text","sourceId":1})
+        )
+        .is_err());
+    }
 }

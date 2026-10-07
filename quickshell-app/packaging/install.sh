@@ -38,6 +38,9 @@ done
 for SEARCH_TOOL in jq sha256sum systemctl curl; do
   command -v "$SEARCH_TOOL" >/dev/null || { echo "Missing $SEARCH_TOOL. Install with: omarchy pkg add $SEARCH_TOOL" >&2; exit 1; }
 done
+for SEARCH_TOOL in ffmpeg ffprobe; do
+  command -v "$SEARCH_TOOL" >/dev/null || { echo "Missing $SEARCH_TOOL for audio/video indexing. Install with: omarchy pkg add ffmpeg" >&2; exit 1; }
+done
 [[ $(jq -r .architecture "$SEARCH_BUNDLE/bundle.json") == "$(uname -m)" ]] || { echo 'The bundle architecture does not match this computer' >&2; exit 1; }
 [[ $(jq -r .protocolVersion "$SEARCH_BUNDLE/bundle.json") == 1 ]] || { echo 'Unsupported bundle protocol' >&2; exit 1; }
 (cd -- "$SEARCH_BUNDLE"; sha256sum --check --quiet SHA256SUMS)

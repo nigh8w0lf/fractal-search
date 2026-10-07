@@ -359,7 +359,7 @@ Item {
                                     Layout.minimumWidth: 0
                                     padding: 0
                                     text: app.query
-                                    placeholderText: app.serviceStarting && !app.errorMessage.length ? app.loadingMessage : "Describe a photo…"
+                                    placeholderText: app.serviceStarting && !app.errorMessage.length ? app.loadingMessage : "Describe what you’re looking for…"
                                     placeholderTextColor: app.secondaryText
                                     color: app.colors.foreground
                                     font.family: app.monoFont
@@ -368,7 +368,7 @@ Item {
                                     enabled: !app.closing
                                     background: null
                                     onTextEdited: {
-                                        app.query = text;
+                                        app.editQuery(text);
                                         if (text.trim().length)
                                             queryTimer.restart();
                                         else {
@@ -445,7 +445,7 @@ Item {
                                 SearchText {
                                     Layout.fillWidth: true
                                     Layout.minimumWidth: 0
-                                    text: !app.ready ? app.serviceStarting ? app.loadingMessage : "Search service unavailable" : "Set up the search model (~1.14 GB). Existing files are reused."
+                                    text: !app.ready ? app.serviceStarting ? app.loadingMessage : "Search service unavailable" : "Set up the search model (~2.96 GB). Existing files are reused."
                                     color: app.secondaryText
                                     wrapMode: Text.WordWrap
                                 }
@@ -603,13 +603,48 @@ Item {
                                 implicitHeight: Style.space(36)
                                 SearchText {
                                     Layout.fillWidth: true
-                                    text: app.loading ? app.loadingMessage : (app.activeQuery.length ? "Top " + app.results.count + " results" : app.results.count + " / " + app.total + " images")
+                                    text: app.loading ? app.loadingMessage : (app.activeQuery.length ? "Top " + app.results.count + " results" : app.results.count + " / " + app.total + " segments")
                                     color: app.secondaryText
                                 }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.leftMargin: Style.space(16)
+                                Layout.rightMargin: Style.space(12)
+                                Layout.bottomMargin: Style.space(8)
+                                spacing: Style.space(8)
                                 SearchChoice {
+                                    objectName: "mediaKindFilter"
+                                    Accessible.name: "Media type"
                                     colors: app.colors
+                                    Layout.fillWidth: true
+                                    Layout.preferredWidth: 140
+                                    Layout.minimumWidth: 100
                                     implicitHeight: Style.space(28)
-                                    implicitWidth: Math.min(window.targetWidth * 0.45, 280)
+                                    model: [
+                                        { id: null, label: "All media" },
+                                        { id: "image", label: "Images" },
+                                        { id: "text", label: "Text" },
+                                        { id: "audio", label: "Audio" },
+                                        { id: "video", label: "Video" }
+                                    ]
+                                    textRole: "label"
+                                    valueRole: "id"
+                                    currentIndex: app.mediaKind === null ? 0 : indexOfValue(app.mediaKind)
+                                    enabled: !app.indexing && !app.installingModels && !app.closing
+                                    onActivated: {
+                                        queryTimer.stop();
+                                        app.setMediaKind(currentValue);
+                                    }
+                                }
+                                SearchChoice {
+                                    objectName: "sourceFilter"
+                                    Accessible.name: "Folder"
+                                    colors: app.colors
+                                    Layout.fillWidth: true
+                                    Layout.preferredWidth: 230
+                                    Layout.minimumWidth: 100
+                                    implicitHeight: Style.space(28)
                                     model: [
                                         {
                                             id: null,
@@ -622,10 +657,10 @@ Item {
                                     textRole: "label"
                                     valueRole: "id"
                                     currentIndex: app.sourceId === null ? 0 : indexOfValue(app.sourceId)
-                                    enabled: app.ready && !app.busy
+                                    enabled: !app.indexing && !app.installingModels && !app.closing
                                     onActivated: {
-                                        app.sourceId = currentValue;
-                                        app.browse(false);
+                                        queryTimer.stop();
+                                        app.setSourceId(currentValue);
                                     }
                                 }
                             }
@@ -662,7 +697,7 @@ Item {
                                             required property var model
                                             required property int index
                                             width: resultsList.width
-                                            height: canvas.shortWindow ? 70 : 83
+                                            height: Math.max(canvas.shortWindow ? 70 : 83, resultSummary.implicitHeight + Style.space(18))
                                             color: index === app.selectedIndex ? Qt.alpha(app.colors.accent, 0.13) : rowMouse.containsMouse ? Qt.alpha(app.colors.foreground, 0.035) : "transparent"
                                             Rectangle {
                                                 x: 8
@@ -678,20 +713,34 @@ Item {
                                                 anchors.leftMargin: Style.space(18)
                                                 anchors.rightMargin: Style.space(16)
                                                 spacing: Style.space(14)
-                                                Image {
+                                                Rectangle {
                                                     Layout.preferredWidth: canvas.shortWindow ? 76 : 94
                                                     Layout.fillHeight: true
-                                                    source: resultRow.model.thumbnailUrl
-                                                    sourceSize: Qt.size(192, 160)
-                                                    fillMode: Image.PreserveAspectCrop
-                                                    asynchronous: true
-                                                    onStatusChanged: if (status === Image.Error)
-                                                        app.fail("Could not display thumbnail for " + resultRow.model.filename)
+                                                    color: Qt.alpha(app.colors.foreground, 0.05)
+                                                    radius: 4
+                                                    Image {
+                                                        anchors.fill: parent
+                                                        visible: app.isVisualAsset(resultRow.model)
+                                                        source: visible ? resultRow.model.thumbnailUrl : ""
+                                                        sourceSize: Qt.size(192, 160)
+                                                        fillMode: Image.PreserveAspectCrop
+                                                        asynchronous: true
+                                                        onStatusChanged: if (status === Image.Error)
+                                                            app.fail("Could not display thumbnail for " + resultRow.model.filename)
+                                                    }
+                                                    SearchText {
+                                                        anchors.centerIn: parent
+                                                        visible: !app.isVisualAsset(resultRow.model)
+                                                        text: resultRow.model.mediaKind === "audio" ? "Audio" : "Text"
+                                                        color: app.secondaryText
+                                                        font.pixelSize: SearchTheme.font.bodySmall
+                                                    }
                                                 }
                                                 ColumnLayout {
+                                                    id: resultSummary
                                                     Layout.fillWidth: true
                                                     Layout.minimumWidth: 0
-                                                    spacing: Style.space(7)
+                                                    spacing: Style.space(3)
                                                     SearchText {
                                                         Layout.fillWidth: true
                                                         Layout.minimumWidth: 0
@@ -703,9 +752,27 @@ Item {
                                                     SearchText {
                                                         Layout.fillWidth: true
                                                         Layout.minimumWidth: 0
-                                                        text: app.folderPath(resultRow.model.path).split("/").filter(Boolean).pop() || "/"
+                                                        text: app.mediaLabel(resultRow.model) + " · " + (app.folderPath(resultRow.model.path).split("/").filter(Boolean).pop() || "/")
                                                         color: app.secondaryText
                                                         elide: Text.ElideMiddle
+                                                        font.pixelSize: SearchTheme.font.bodySmall
+                                                    }
+                                                    SearchText {
+                                                        Layout.fillWidth: true
+                                                        Layout.minimumWidth: 0
+                                                        visible: resultRow.model.hasHybridScore || resultRow.model.hasScore
+                                                        text: app.scoreLabel(resultRow.model)
+                                                        color: app.secondaryText
+                                                        elide: Text.ElideRight
+                                                        font.pixelSize: SearchTheme.font.bodySmall
+                                                    }
+                                                    SearchText {
+                                                        Layout.fillWidth: true
+                                                        Layout.minimumWidth: 0
+                                                        visible: resultRow.model.textExcerpt.length > 0
+                                                        text: resultRow.model.textExcerpt.replace(/\s+/g, " ")
+                                                        color: app.secondaryText
+                                                        elide: Text.ElideRight
                                                         font.pixelSize: SearchTheme.font.bodySmall
                                                     }
                                                 }
@@ -742,21 +809,24 @@ Item {
                                             Layout.fillHeight: true
                                             Image {
                                                 anchors.fill: parent
-                                                source: app.previewUrl
+                                                visible: app.isVisualAsset(app.selectedAsset)
+                                                source: visible ? app.previewUrl : ""
                                                 asynchronous: true
                                                 fillMode: Image.PreserveAspectFit
                                                 onStatusChanged: if (status === Image.Error) {
-                                                    app.previewError = "The image preview could not be displayed.";
+                                                    app.previewError = "The visual preview could not be displayed.";
                                                     app.fail(app.previewError);
                                                 }
                                             }
                                             SearchText {
                                                 anchors.centerIn: parent
                                                 width: parent.width - 20
-                                                horizontalAlignment: Text.AlignHCenter
-                                                text: app.previewError.length ? app.previewError : app.previewLoading ? "Loading preview…" : app.selectedAsset ? "" : "Select an image"
+                                                horizontalAlignment: app.selectedAsset && app.selectedAsset.mediaKind === "text" ? Text.AlignLeft : Text.AlignHCenter
+                                                text: app.previewError.length ? app.previewError : app.previewLoading && app.selectedAsset && app.selectedAsset.mediaKind === "image" ? "Loading preview…" : app.previewText()
                                                 color: app.previewError.length ? app.colors.error : app.secondaryText
                                                 wrapMode: Text.WordWrap
+                                                maximumLineCount: Math.max(1, Math.floor((parent.height - 20) / font.pixelSize / 1.4))
+                                                elide: Text.ElideRight
                                             }
                                         }
                                         RowLayout {
@@ -770,10 +840,17 @@ Item {
                                                 font.pixelSize: SearchTheme.font.subtitle
                                             }
                                             SearchText {
-                                                text: app.selectedAsset ? app.selectedAsset.width + " × " + app.selectedAsset.height : ""
+                                                text: app.selectedAsset ? app.mediaLabel(app.selectedAsset) : ""
                                                 color: app.secondaryText
                                                 font.pixelSize: SearchTheme.font.bodySmall
                                             }
+                                        }
+                                        SearchText {
+                                            Layout.fillWidth: true
+                                            visible: text.length > 0
+                                            text: app.scoreLabel(app.selectedAsset)
+                                            color: app.secondaryText
+                                            font.pixelSize: SearchTheme.font.bodySmall
                                         }
                                         SearchText {
                                             Layout.fillWidth: true
@@ -796,7 +873,7 @@ Item {
                                     spacing: Style.space(12)
                                     SearchText {
                                         Layout.fillWidth: true
-                                        text: app.serviceStarting || app.loading ? app.loadingMessage : app.indexing ? "Building your image index…" : app.errorMessage.length ? "Could not load images" : app.activeQuery.length ? "No matching images" : "Your images, searchable"
+                                        text: app.serviceStarting || app.loading ? app.loadingMessage : app.indexing ? "Building your search index…" : app.errorMessage.length ? "Could not load results" : app.activeQuery.length ? "No matching results" : "Your library, searchable"
                                         color: app.colors.foreground
                                         font.pixelSize: 17
                                         horizontalAlignment: Text.AlignHCenter
@@ -805,7 +882,7 @@ Item {
                                     SearchText {
                                         Layout.fillWidth: true
                                         visible: !app.loading && !app.indexing
-                                        text: app.errorMessage.length ? "Resolve the error above, then try again." : app.activeQuery.length ? "Try another description or choose a different folder." : "Add a folder in settings to build a local image index."
+                                        text: app.errorMessage.length ? "Resolve the error above, then try again." : app.activeQuery.length ? "Try another description or choose a different folder." : "Add a folder in settings to search images, text, audio and video locally."
                                         color: app.secondaryText
                                         horizontalAlignment: Text.AlignHCenter
                                         wrapMode: Text.WordWrap
@@ -912,7 +989,7 @@ Item {
             PortalFolderDialog {
                 id: imageFolder
                 executable: panel.pickerExecutable
-                title: "Choose an image folder to index"
+                title: "Choose a folder to index"
                 onVisibleChanged: if (!visible && window.visible)
                     panel.focusSearch()
                 onAccepted: app.indexFolder(selectedFolder.toString())
@@ -921,7 +998,7 @@ Item {
             PortalFolderDialog {
                 id: modelFolder
                 executable: panel.pickerExecutable
-                title: "Choose the downloaded FG-CLIP2 model folder"
+                title: "Choose the downloaded EmbeddingGemma 2 model folder"
                 onVisibleChanged: if (!visible && window.visible)
                     panel.focusSearch()
                 onAccepted: app.setModelDirectory(selectedFolder.toString())
@@ -933,7 +1010,7 @@ Item {
                 colors: app.colors
                 borderColor: app.borderColor
                 title: "Restart Fractal Search?"
-                message: "Image batch size is saved as " + app.settings.imageBatchSize + ". Restart the search service to apply it.\n\nThe current image will finish and be saved before restart."
+                message: "Image batch size is saved as " + app.settings.imageBatchSize + ". Restart the search service to apply it.\n\nActive inference will finish and completed files will be saved before restart."
                 confirmText: "Restart now"
                 cancelText: "Later"
                 onClosed: panel.focusSearch()
@@ -945,7 +1022,7 @@ Item {
                 colors: app.colors
                 borderColor: app.borderColor
                 title: "Stop search service?"
-                message: "Indexing and folder watching will stop. Active work finishes safely and indexed images are saved.\n\nOpen Fractal Search again to restart the service."
+                message: "Indexing and folder watching will stop. Active work finishes safely and indexed files are saved.\n\nOpen Fractal Search again to restart the service."
                 confirmText: "Stop service"
                 onClosed: panel.focusSearch()
                 onAccepted: app.shutdown()
@@ -959,7 +1036,7 @@ Item {
                 colors: app.colors
                 borderColor: app.borderColor
                 title: "Remove indexed folder?"
-                message: app.displayPath(directory) + "\n\nRemove its images from the search index. Original files stay in place."
+                message: app.displayPath(directory) + "\n\nRemove its searchable segments from the index. Original files stay in place."
                 confirmText: "Remove folder"
                 onClosed: panel.focusSearch()
                 onAccepted: app.removeSource(sourceId)
@@ -1161,7 +1238,8 @@ Item {
                 skippedFilesVisible: skippedFiles.visible,
                 count: app.results.count,
                 total: app.total,
-                imageCount: app.status.catalog.imageCount,
+                assetCount: app.status.catalog.assetCount,
+                fileCount: app.status.catalog.fileCount,
                 progress: app.progress,
                 previewError: app.previewError,
                 background: app.colors.background,

@@ -13,6 +13,9 @@ use std::{collections::BTreeMap, fs, path::PathBuf, time::Instant};
 struct Measurements {
     images: Vec<Vec<f32>>,
     text: Vec<Vec<f32>>,
+    documents: Vec<Vec<f32>>,
+    audio: Vec<Vec<f32>>,
+    video: Vec<Vec<f32>>,
     image_ms: f64,
     text_ms: f64,
     profiles: Vec<PathBuf>,
@@ -43,6 +46,13 @@ fn measure(
         .iter()
         .map(|query| runtime.embed_text(query))
         .collect::<Result<Vec<_>>>()?;
+    let documents =
+        vec![runtime.embed_document("notes.md", "A colorful landscape beside the water")?];
+    let samples: Vec<f32> = (0..16000)
+        .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin() * 0.25)
+        .collect();
+    let audio = vec![runtime.embed_audio(&samples)?];
+    let video = vec![runtime.embed_video(images)?];
     let mut image_times = Vec::new();
     let mut text_times = Vec::new();
     for _ in 0..5 {
@@ -57,6 +67,9 @@ fn measure(
     Ok(Measurements {
         images: image_vectors,
         text,
+        documents,
+        audio,
+        video,
         image_ms: median(image_times),
         text_ms: median(text_times),
         profiles,
@@ -98,8 +111,8 @@ fn compare(cpu: &[Vec<f32>], cuda: &[Vec<f32>]) -> Result<Value> {
 
 fn check_cuda_nodes(profiles: &[PathBuf]) -> Result<Value> {
     ensure!(
-        profiles.len() == 2,
-        "Expected vision and text CUDA profiles"
+        profiles.len() == 3,
+        "Expected vision, audio and shared text CUDA profiles"
     );
     let mut summaries = Vec::new();
     for path in profiles {
@@ -197,6 +210,9 @@ fn main() -> Result<()> {
         "deviceId":device_id,
         "images":compare(&cpu.images, &cuda.images)?,
         "text":compare(&cpu.text, &cuda.text)?,
+        "documents":compare(&cpu.documents, &cuda.documents)?,
+        "audio":compare(&cpu.audio, &cuda.audio)?,
+        "video":compare(&cpu.video, &cuda.video)?,
         "cpuMedianImageMs":cpu.image_ms,"cudaMedianImageMs":cuda.image_ms,
         "cpuMedianTextMs":cpu.text_ms,"cudaMedianTextMs":cuda.text_ms,
         "imageSpeedup":cpu.image_ms/cuda.image_ms,"textSpeedup":cpu.text_ms/cuda.text_ms,

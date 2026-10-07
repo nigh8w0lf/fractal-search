@@ -122,10 +122,23 @@ def main():
             tools = mcp.call("tools/list")["result"]["tools"]
             assert {tool["name"] for tool in tools} == {"status", "browse_assets", "search_assets", "get_asset_metadata", "get_thumbnail"}
             assert all(tool["inputSchema"]["additionalProperties"] is False and tool["annotations"]["readOnlyHint"] for tool in tools)
-            assert data(mcp.tool("status"))["textModelLoaded"] is False
+            for tool in tools:
+                if tool['name'] in ('browse_assets', 'search_assets'):
+                    assert tool['inputSchema']['properties']['mediaKind']['enum'] == ['image', 'text', 'audio', 'video', None]
+            assert data(mcp.tool('browse_assets', {'mediaKind': 'text'}))['total'] == 0
+            assert data(mcp.tool('browse_assets', {'mediaKind': 'image'}))['total'] == 2
+            for name in ('browse_assets', 'search_assets'):
+                arguments = {'query': 'needle'} if name == 'search_assets' else {}
+                for invalid in ('all', 'Text', 'documents', 1):
+                    assert 'error' in mcp.tool(name, {**arguments, 'mediaKind': invalid}, success=False)
+                assert 'error' in mcp.tool(name, {**arguments, 'mediaKind': 'text', 'unknown': True}, success=False)
+            status = data(mcp.tool("status"))
+            assert status["textModelLoaded"] is False and status["assetCount"] == status["fileCount"] == 2
             page = data(mcp.tool("browse_assets", {"limit": 1}))
             assert page["total"] == 2 and len(page["items"]) == 1
             asset = page["items"][0]
+            assert asset["mediaKind"] == "image" and asset["segmentIndex"] == 0
+            assert asset["startMs"] is None and asset["endMs"] is None and asset["textExcerpt"] is None
             second = data(mcp.tool("browse_assets", {"offset": 1, "limit": 1}))["items"][0]
             assert asset["assetId"] != second["assetId"]
             assert data(mcp.tool("get_asset_metadata", {"assetId": asset["assetId"]})) == asset
@@ -145,7 +158,7 @@ def main():
             assert data(mcp.tool("status"))["textModelLoaded"] is False
             assert not any(str(root) in json.dumps(message) or "file://" in json.dumps(message) for message in mcp.history)
             mcp.stop()
-            assert "Loaded text.onnx" not in (root / "metadata.log").read_text()
+            assert "Loaded onnx/model.onnx" not in (root / "metadata.log").read_text()
             assert catalog_hashes(catalog) == original_hashes
             # Server and desktop remain concurrent. Model loads only for search.
             mcp = Mcp(binary, catalog, models, root / "search.log")
@@ -160,8 +173,8 @@ def main():
                 assert len(data(mcp.receive(ident))["items"]) == 1
             assert mcp.process.wait(timeout=120) == 0
             mcp.log.close()
-            assert "Loaded text.onnx" in (root / "search.log").read_text()
-            assert "Loaded visual.onnx" not in (root / "search.log").read_text()
+            assert "Loaded onnx/model.onnx" in (root / "search.log").read_text()
+            assert "Loaded onnx/vision_encoder.onnx" not in (root / "search.log").read_text()
             assert not any(str(root) in json.dumps(message) or "file://" in json.dumps(message) for message in mcp.history)
             # Invalid frames terminate explicitly after a bounded error response.
             mcp = Mcp(binary, catalog, models, root / "overlong.log")
@@ -169,7 +182,7 @@ def main():
             mcp.process.stdin.flush()
             assert mcp.receive(None)["error"]["code"] == -32600
             mcp.stop(expected=1)
-            assert desktop.call({"type": "status"})["catalog"]["imageCount"] == 2
+            assert desktop.call({"type": "status"})["catalog"]["assetCount"] == 2
             desktop.call({"type": "shutdown"})
             assert desktop.process.wait(timeout=60) == 0
         finally:

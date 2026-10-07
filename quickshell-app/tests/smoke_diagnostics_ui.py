@@ -15,6 +15,9 @@ def main():
         'cudaEnabledBuild': True, 'platform': 'linux', 'summary': 'Fixture runtime check.',
         'checksPassed': False, 'nvidiaDriver': {'state': 'available', 'detail': 'Fixture driver'},
         'gpus': [{'index': 0, 'name': 'Fixture GPU', 'driverVersion': '580'}],
+        'ffmpeg': {'state': 'available', 'detail': 'Fixture ffmpeg version'},
+        'ffprobe': {'state': 'unavailable', 'detail': 'Install ffmpeg for media decoding'},
+        'mediaToolsAvailable': False,
         'cudaToolkit': {'state': 'optional', 'detail': 'nvcc is not required'},
         'linkerCache': {'state': 'available', 'detail': 'Fixture cache'},
         'providerDependencies': {'state': 'missing', 'detail': 'libcudart.so.12 not found'},
@@ -40,7 +43,7 @@ if mode == 'malformed':
 elif mode == 'oversized':
     print('x' * 65537)
 elif mode == 'timeout':
-    time.sleep(25)
+    time.sleep(35)
 else:
     print(os.environ['DIAGNOSTIC_REPORT'])
 ''')
@@ -77,7 +80,7 @@ ShellRoot {
             env = dict(base, DIAGNOSTIC_CASE=case,
                        DIAGNOSTIC_EXECUTABLE=str(root / 'missing') if case == 'missing' else str(fixture))
             result = subprocess.run(['quickshell', '--path', str(root), '--no-duplicate', '--no-color'],
-                                    env=env, capture_output=True, text=True, timeout=24)
+                                    env=env, capture_output=True, text=True, timeout=34)
             output = result.stdout + result.stderr
             assert result.returncode == 0, output
             lines = [line.split('DIAGNOSTIC_RESULT ', 1)[1] for line in output.splitlines() if 'DIAGNOSTIC_RESULT ' in line]
@@ -87,13 +90,15 @@ ShellRoot {
                 assert not state['error'], state
                 assert 'INSTALLED, outside loader path' in state['details'], state
                 assert 'nvcc is not required' in state['details'], state
+                assert 'Media decoder tools: unavailable' in state['details'], state
+                assert 'Install ffmpeg for media decoding' in state['details'], state
                 assert '/tmp/diagnostic-runtime' in state['details'], state
             else:
                 assert state['error'], state
                 if case == 'nonzero':
                     assert 'Fixture missing runtime error' in state['error'], state
                 elif case == 'timeout':
-                    assert 'exceeded 20 seconds' in state['error'], state
+                    assert 'exceeded 30 seconds' in state['error'], state
             print(f'PASS diagnostic UI {case}', flush=True)
 
 
