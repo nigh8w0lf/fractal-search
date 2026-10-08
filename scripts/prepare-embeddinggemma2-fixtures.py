@@ -6,6 +6,8 @@ Gemma4ImageProcessor support. Full parity also needs ONNX Runtime and an
 existing verified FP32 model cache. --preprocess-only uses only the verified
 config/tokenizer files and never opens a model graph or weights.
 No network access, remote model code, catalog access, or weight downloads occur.
+The default reference projects native output to leading-512/L2-normalized indexed
+vectors. --native-output preserves full 768-dimensional graph-parity references.
 The independent reference is Hugging Face's image processor/tokenizer plus the
 pinned ONNX export, not a claim of parity against Google's original checkpoint.
 """
@@ -17,6 +19,11 @@ import os
 import statistics
 import time
 from pathlib import Path
+
+from embeddinggemma2_contract import (
+    EMBEDDING_DIM, MODEL_PROFILE, NATIVE_EMBEDDING_DIM, NATIVE_MODEL_PROFILE,
+    project_indexed_vector,
+)
 
 
 QUERY_PREFIX = "task: search result | query: "
@@ -46,6 +53,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_dir", type=Path)
     parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--native-output", action="store_true",
+                        help="Keep full 768-dimensional native graph outputs for explicit parity validation")
     parser.add_argument("--preprocess-only", action="store_true",
                         help="Generate processor/tokenizer tensors without model weights or inference")
     parser.add_argument("--max-image-batch", type=int, choices=range(1, 9), default=8,
@@ -125,12 +134,15 @@ def main():
             start = time.perf_counter()
             result = model.run(["sentence_embedding"], feed)[0]
             durations.append((time.perf_counter() - start) * 1000)
-        if result.ndim != 2 or result.shape[1] != 768 or not np.isfinite(result).all():
+        if result.ndim != 2 or result.shape[1] != NATIVE_EMBEDDING_DIM or not np.isfinite(result).all():
             raise RuntimeError("Reference returned invalid embeddings")
         norms = np.linalg.norm(result, axis=-1)
         if not np.allclose(norms, 1.0, atol=1e-5, rtol=0):
             raise RuntimeError("Reference returned non-unit embeddings")
-        return result.tolist(), statistics.median(durations)
+        reference = result.tolist()
+        if not args.native_output:
+            reference = [project_indexed_vector(vector) for vector in reference]
+        return reference, statistics.median(durations)
 
     texts = ["a red dress outdoors", "海边的日落", "Mixed CASE café portrait",
              "a photo of " + "a colorful tree beside a lake " * 30,
@@ -338,6 +350,10 @@ def main():
     (output / "fixtures.json").write_text(json.dumps(fixtures, indent=2, allow_nan=False) + "\n")
     (output / "environment.json").write_text(json.dumps(dict(
         model_repository=manifest["repository"], model_revision=REVISION,
+        output_mode="native" if args.native_output else "indexed",
+        embedding_dimension=NATIVE_EMBEDDING_DIM if args.native_output else EMBEDDING_DIM,
+        native_embedding_dimension=NATIVE_EMBEDDING_DIM,
+        model_profile=NATIVE_MODEL_PROFILE if args.native_output else MODEL_PROFILE,
         torch=torch.__version__, torchvision=torchvision.__version__,
         transformers=transformers.__version__, pillow=PIL.__version__,
         numpy=np.__version__, onnxruntime=ort.__version__ if ort else None,

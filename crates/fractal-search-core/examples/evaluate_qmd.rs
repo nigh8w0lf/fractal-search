@@ -339,6 +339,10 @@ mod evaluation {
             .clone();
         output.insert("model_profile".into(), Value::from(MODEL_PROFILE));
         output.insert(
+            "embedding_dimension".into(),
+            Value::from(fractal_search_core::EMBEDDING_DIM),
+        );
+        output.insert(
             "text_search_profile".into(),
             Value::from(TEXT_SEARCH_PROFILE),
         );

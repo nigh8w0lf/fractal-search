@@ -20,13 +20,14 @@ Raw FP32 content-vector storage, excluding boundary tokens and index overhead:
 
 | Representation | Per segment |
 | --- | ---: |
-| Current pooled vector | 3 KiB |
+| Current indexed pooled vector (512D MRL) | 2 KiB |
+| Native pooled reference (768D) | 3 KiB |
 | 256 text tokens | 768 KiB |
 | 280 image tokens | 840 KiB |
 | 30-second audio, approximately 750 tokens | 2.2 MiB |
 | 30 video frames × 140 tokens | 12.3 MiB |
 
-For 10,000 full-budget images, raw vectors rise from about 31 MB to 8.6 GB. The backbone pass is shared, but normalization, copying, storage, I/O and scoring add work. Exact scoring grows with query tokens × document tokens × dimensions × candidates; whole-catalog brute force would be inappropriate. Published Matryoshka results concern pooled vectors and do not establish the quality of 128-dimensional token vectors. MaxSim also needs separate score metadata; a summed token score is not a single cosine or probability.
+For 10,000 full-budget images, raw vectors rise from about 20.5 MB for current 512D pooled vectors (30.7 MB for native 768D) to 8.6 GB for full 768D token vectors. The backbone pass is shared, but normalization, copying, storage, I/O and scoring add work. Exact scoring grows with query tokens × document tokens × dimensions × candidates; whole-catalog brute force would be inappropriate. Published Matryoshka results concern pooled vectors and do not establish the quality of 128-dimensional token vectors. MaxSim also needs separate score metadata; a summed token score is not a single cosine or probability.
 
 ## Recommended next experiment, if requested
 

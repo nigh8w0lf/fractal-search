@@ -1,5 +1,5 @@
 //! Resident EmbeddingGemma 2 ONNX sessions with explicit CPU or CUDA selection.
-use crate::{embeddings, preprocess, Embedder, EMBEDDING_DIM, MODEL_PROFILE};
+use crate::{embeddings, preprocess, Embedder, MODEL_PROFILE, NATIVE_EMBEDDING_DIM};
 use anyhow::{bail, ensure, Context, Result};
 use ort::{
     execution_providers::CPUExecutionProvider,
@@ -308,27 +308,57 @@ impl NativeRuntime {
         })
     }
 
+    /// Indexed query output: leading 512 native dimensions, then L2 normalize.
     pub fn embed_text(&self, query: &str) -> Result<Vec<f32>> {
+        embeddings::project(&self.embed_text_native(query)?)
+    }
+
+    pub fn embed_document(&self, title: &str, text: &str) -> Result<Vec<f32>> {
+        embeddings::project(&self.embed_document_native(title, text)?)
+    }
+
+    pub fn embed_images(&self, images: &[image::RgbImage]) -> Result<Vec<Vec<f32>>> {
+        self.embed_images_native(images)?
+            .iter()
+            .map(|vector| embeddings::project(vector))
+            .collect()
+    }
+
+    pub fn embed_audio(&self, samples: &[f32]) -> Result<Vec<f32>> {
+        embeddings::project(&self.embed_audio_native(samples)?)
+    }
+
+    pub fn embed_video(&self, frames: &[image::RgbImage]) -> Result<Vec<f32>> {
+        embeddings::project(&self.embed_video_native(frames)?)
+    }
+
+    /// Native 768-dimensional output for upstream reference validation only.
+    /// Never pass this full-width vector to a catalog or indexed-vector cache.
+    pub fn embed_text_native(&self, query: &str) -> Result<Vec<f32>> {
         self.owner
             .execute(owner::TEXT, |sessions| sessions.embed_text(query))
     }
 
-    pub fn embed_document(&self, title: &str, text: &str) -> Result<Vec<f32>> {
+    /// Native 768-dimensional document output for upstream reference validation.
+    pub fn embed_document_native(&self, title: &str, text: &str) -> Result<Vec<f32>> {
         self.owner
             .execute(owner::TEXT, |sessions| sessions.embed_document(title, text))
     }
 
-    pub fn embed_images(&self, images: &[image::RgbImage]) -> Result<Vec<Vec<f32>>> {
+    /// Native 768-dimensional image outputs for upstream reference validation.
+    pub fn embed_images_native(&self, images: &[image::RgbImage]) -> Result<Vec<Vec<f32>>> {
         self.owner
             .execute(owner::VISION, |sessions| sessions.embed_images(images))
     }
 
-    pub fn embed_audio(&self, samples: &[f32]) -> Result<Vec<f32>> {
+    /// Native 768-dimensional audio output for upstream reference validation.
+    pub fn embed_audio_native(&self, samples: &[f32]) -> Result<Vec<f32>> {
         self.owner
             .execute(owner::AUDIO, |sessions| sessions.embed_audio(samples))
     }
 
-    pub fn embed_video(&self, frames: &[image::RgbImage]) -> Result<Vec<f32>> {
+    /// Native 768-dimensional video output for upstream reference validation.
+    pub fn embed_video_native(&self, frames: &[image::RgbImage]) -> Result<Vec<f32>> {
         self.owner
             .execute(owner::VISION, |sessions| sessions.embed_video(frames))
     }
@@ -657,11 +687,11 @@ impl RuntimeSessions {
             ])?;
         let (shape, values) = outputs["sentence_embedding"].try_extract_tensor::<f32>()?;
         ensure!(
-            shape.as_ref() == [batch as i64, EMBEDDING_DIM as i64],
+            shape.as_ref() == [batch as i64, NATIVE_EMBEDDING_DIM as i64],
             "Unexpected EmbeddingGemma 2 sentence_embedding shape {shape:?}"
         );
         values
-            .chunks_exact(EMBEDDING_DIM)
+            .chunks_exact(NATIVE_EMBEDDING_DIM)
             .map(embeddings::normalize)
             .collect()
     }
@@ -837,25 +867,7 @@ impl Resources for RuntimeSessions {
     }
 }
 
-impl Embedder for RuntimeSessions {
-    fn embed_images(&mut self, images: &[image::RgbImage]) -> Result<Vec<Vec<f32>>> {
-        RuntimeSessions::embed_images(self, images)
-    }
-    fn embed_image(&mut self, image: &image::RgbImage) -> Result<Vec<f32>> {
-        self.embed_images(std::slice::from_ref(image))?
-            .into_iter()
-            .next()
-            .context("Vision returned no embedding")
-    }
-    fn embed_document(&mut self, title: &str, text: &str) -> Result<Vec<f32>> {
-        RuntimeSessions::embed_document(self, title, text)
-    }
-    fn embed_audio(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
-        RuntimeSessions::embed_audio(self, samples)
-    }
-    fn embed_video(&mut self, frames: &[image::RgbImage]) -> Result<Vec<f32>> {
-        RuntimeSessions::embed_video(self, frames)
-    }
+impl RuntimeSessions {
     fn embed_text(&mut self, query: &str) -> Result<Vec<f32>> {
         ensure!(!query.trim().is_empty(), "Search query must not be empty");
         ensure!(
@@ -887,6 +899,7 @@ impl Embedder for RuntimeSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EMBEDDING_DIM;
 
     #[test]
     fn idle_configuration_and_diagnostics_do_not_load_models() {
@@ -1022,6 +1035,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn indexed_profile_is_distinct_from_native_without_loading_models() {
+        let runtime = NativeRuntime::new(PathBuf::from("/missing-model-assets"), 1).unwrap();
+        assert_eq!(runtime.embedding_profile().as_deref(), Some(MODEL_PROFILE));
+        assert_ne!(MODEL_PROFILE, crate::NATIVE_MODEL_PROFILE);
+        assert_eq!(EMBEDDING_DIM, 512);
+        assert_eq!(NATIVE_EMBEDDING_DIM, 768);
+        assert!(!runtime.loaded());
+    }
+
+    #[test]
+    #[ignore = "requires FRACTAL_SEARCH_BATCH_TEST_MODELS with the verified full native model cache"]
+    fn every_modality_and_query_projects_the_same_native_space() {
+        let models = PathBuf::from(
+            std::env::var_os("FRACTAL_SEARCH_BATCH_TEST_MODELS")
+                .expect("Provide an existing verified model cache"),
+        );
+        let runtime = NativeRuntime::new(models, 2).unwrap();
+        let image = image::RgbImage::from_fn(48, 32, |x, y| image::Rgb([x as u8, y as u8, 100]));
+        let images = [image.clone(), image];
+        let samples = (0..16000)
+            .map(|i| (i as f32 * 0.17).sin() * 0.25)
+            .collect::<Vec<_>>();
+        let check = |actual: Vec<f32>, native: Vec<f32>| {
+            assert_eq!(actual.len(), EMBEDDING_DIM);
+            assert_eq!(native.len(), NATIVE_EMBEDDING_DIM);
+            let expected = embeddings::project(&native).unwrap();
+            assert!(actual
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| (*a - b).abs() < 1e-5));
+            assert!((actual.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() - 1.).abs() < 1e-5);
+        };
+        check(
+            runtime.embed_text("a colorful landscape").unwrap(),
+            runtime.embed_text_native("a colorful landscape").unwrap(),
+        );
+        check(
+            runtime
+                .embed_document("notes", "a colorful landscape")
+                .unwrap(),
+            runtime
+                .embed_document_native("notes", "a colorful landscape")
+                .unwrap(),
+        );
+        for (indexed, native) in runtime
+            .embed_images(&images)
+            .unwrap()
+            .into_iter()
+            .zip(runtime.embed_images_native(&images).unwrap())
+        {
+            check(indexed, native);
+        }
+        check(
+            runtime.embed_audio(&samples).unwrap(),
+            runtime.embed_audio_native(&samples).unwrap(),
+        );
+        check(
+            runtime.embed_video(&images).unwrap(),
+            runtime.embed_video_native(&images).unwrap(),
+        );
     }
 
     #[test]

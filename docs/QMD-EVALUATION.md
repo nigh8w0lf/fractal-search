@@ -28,12 +28,18 @@ never installs dependencies, downloads weights, starts a desktop service,
 opens a user catalog or writes to an original user document. It creates its own
 synthetic files and catalog in an automatically cleaned temporary directory.
 
-The three retrieval arms share a catalog, actual EmbeddingGemma 2 passage vectors,
+The three retrieval arms share a fresh temporary catalog, actual normalized 512-dimensional EmbeddingGemma 2 passage vectors,
 literal ICU BM25 tokenizer and identical Text/source prefilters:
 
 1. **BM25-only:** native lexical ranking; no query-model load or query embedding
 2. **Dense-only:** exact cosine ranking of the actual model query embedding
 3. **Hybrid:** current equal-weight, one-based RRF with k=60
+
+The native graph remains 768-dimensional FP32; indexing and queries both keep
+the leading 512 values and L2-normalize them. The harness requires indexed profile
+`embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2` and `embedding_dimension: 512`
+from every adapter phase, rejecting old adapters instead of mixing contracts.
+Native 768-dimensional numerical parity is a separate explicit tool mode.
 
 No LLM expansion, reranking, alternate tokenization or synthetic-vector scoring is
 used. The BM25 arm still uses the same real indexed corpus; omitting query
@@ -154,7 +160,7 @@ All timed results are checked against the six-result budget and folder scope;
 dense/hybrid must return `min(6, in-scope passages)`. Cold query IDs and repetition
 numbers must match their actual requests. Provider, device, thread count,
 executable hash, source commit/dirty state, model revision, model profile,
-text-search profile, extraction profile and fixture hash are recorded.
+indexed embedding dimension, text-search profile, extraction profile and fixture hash are recorded.
 
 ## Run without models
 

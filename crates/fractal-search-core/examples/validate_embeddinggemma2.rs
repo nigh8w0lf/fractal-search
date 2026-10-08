@@ -1,7 +1,10 @@
 //! Offline parity against scripts/prepare-embeddinggemma2-fixtures.py.
-//! cargo run -p fractal-search-core --example validate_embeddinggemma2 -- [--preprocess-only] MODEL_DIR FIXTURES_JSON...
+//! cargo run -p fractal-search-core --example validate_embeddinggemma2 -- [--preprocess-only] [--native-output] MODEL_DIR FIXTURES_JSON...
 use anyhow::{bail, ensure, Context, Result};
-use fractal_search_core::{preprocess, runtime::NativeRuntime, EMBEDDING_DIM};
+use fractal_search_core::{
+    preprocess, runtime::NativeRuntime, EMBEDDING_DIM, MODEL_PROFILE, NATIVE_EMBEDDING_DIM,
+    NATIVE_MODEL_PROFILE,
+};
 use serde::Deserialize;
 use std::{
     fs,
@@ -107,10 +110,23 @@ fn compare_floats(directory: &Path, name: &str, actual: &[f32], tolerance: f32) 
 
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
-    let preprocess_only = args.peek().is_some_and(|s| s == "--preprocess-only");
-    if preprocess_only {
+    let mut preprocess_only = false;
+    let mut native_output = false;
+    while let Some(arg) = args.peek() {
+        if arg == "--preprocess-only" {
+            preprocess_only = true;
+        } else if arg == "--native-output" {
+            native_output = true;
+        } else {
+            break;
+        }
         args.next();
     }
+    let embedding_dimension = if native_output {
+        NATIVE_EMBEDDING_DIM
+    } else {
+        EMBEDDING_DIM
+    };
     let model = PathBuf::from(args.next().context("Provide the pinned model directory")?);
     let files: Vec<PathBuf> = args.map(PathBuf::from).collect();
     ensure!(!files.is_empty(), "Provide native-input fixture JSON files");
@@ -152,9 +168,17 @@ fn main() -> Result<()> {
                     if preprocess_only {
                         Vec::new()
                     } else if fixture.kind == "document" {
-                        vec![runtime.embed_document(title, query)?]
+                        vec![if native_output {
+                            runtime.embed_document_native(title, query)?
+                        } else {
+                            runtime.embed_document(title, query)?
+                        }]
                     } else {
-                        vec![runtime.embed_text(query)?]
+                        vec![if native_output {
+                            runtime.embed_text_native(query)?
+                        } else {
+                            runtime.embed_text(query)?
+                        }]
                     }
                 }
                 "image" | "video" => {
@@ -222,9 +246,17 @@ fn main() -> Result<()> {
                     if preprocess_only {
                         Vec::new()
                     } else if fixture.kind == "video" {
-                        vec![runtime.embed_video(&images)?]
+                        vec![if native_output {
+                            runtime.embed_video_native(&images)?
+                        } else {
+                            runtime.embed_video(&images)?
+                        }]
                     } else {
-                        runtime.embed_images(&images)?
+                        if native_output {
+                            runtime.embed_images_native(&images)?
+                        } else {
+                            runtime.embed_images(&images)?
+                        }
                     }
                 }
                 "audio" => {
@@ -297,7 +329,11 @@ fn main() -> Result<()> {
                     if preprocess_only {
                         Vec::new()
                     } else {
-                        vec![runtime.embed_audio(&samples)?]
+                        vec![if native_output {
+                            runtime.embed_audio_native(&samples)?
+                        } else {
+                            runtime.embed_audio(&samples)?
+                        }]
                     }
                 }
                 other => bail!("Unknown fixture kind {other:?}"),
@@ -320,8 +356,8 @@ fn main() -> Result<()> {
             let mut maximum_norm_error = 0.0_f64;
             for (actual, expected) in actual.iter().zip(&fixture.reference) {
                 ensure!(
-                    actual.len() == EMBEDDING_DIM
-                        && expected.len() == EMBEDDING_DIM
+                    actual.len() == embedding_dimension
+                        && expected.len() == embedding_dimension
                         && actual.iter().chain(expected).all(|v| v.is_finite()),
                     "Invalid actual or reference embedding in {}",
                     fixture.name
@@ -379,6 +415,9 @@ fn main() -> Result<()> {
         "{}",
         serde_json::json!({
             "fixtures":case_count, "embeddings":embedding_count,
+            "output_mode":if native_output { "native" } else { "indexed" },
+            "embedding_dimension":embedding_dimension,
+            "model_profile":if native_output { NATIVE_MODEL_PROFILE } else { MODEL_PROFILE },
             "minimumCosine":if embedding_count > 0 { Some(minimum_cosine) } else { None },
             "inferenceValidated":!preprocess_only, "results":results,
             "scope":"Synthetic image/document/audio/sampled-video HF preprocessing and pinned ONNX parity, not decoder, original-checkpoint or semantic-quality validation"

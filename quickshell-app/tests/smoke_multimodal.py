@@ -77,6 +77,7 @@ def main():
         try:
             ready = desktop.until(lambda event: event.get('event') == 'ready')['payload']
             assert ready['catalog']['fileCount'] == ready['catalog']['assetCount'] == 0
+            assert ready['catalog']['modelProfile'] == 'embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2'
             request = desktop.send({'type': 'index', 'directory': str(originals)})
             # Multimodal FP32 inference can take minutes on CPU.
             desktop.until(lambda event: event.get('id') == request and 'ok' in event, timeout=1800)
@@ -130,6 +131,7 @@ def main():
             mcp = Mcp(args.mcp.resolve(), catalog, args.models.resolve(), root / 'mcp.log')
             status = data(mcp.tool('status'))
             assert status['assetCount'] == count and status['fileCount'] == 5 and not status['textModelLoaded']
+            assert status['modelProfile'] == 'embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2'
             page = data(mcp.tool('browse_assets', {'limit': 100}))
             assert page['total'] == count
             for item in page['items']:

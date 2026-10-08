@@ -1,8 +1,8 @@
 //! One Lance table owns source rows, segment metadata and multimodal vectors.
 //! Each mutation is one atomic Lance commit; readers use a pinned snapshot.
 use crate::{
-    catalog::validate_embedding, media::MediaKind, TextSearchMode, EMBEDDING_DIM, MODEL_PROFILE,
-    TEXT_SEARCH_PROFILE,
+    catalog::validate_embedding, media::MediaKind, TextSearchMode, EMBEDDING_DIM,
+    EMBEDDING_PROJECTION, MODEL_PROFILE, TEXT_SEARCH_PROFILE,
 };
 use anyhow::{ensure, Context, Result};
 use arrow_array::{
@@ -187,6 +187,10 @@ fn schema() -> Arc<Schema> {
             ),
             ("fractal.model_profile".into(), MODEL_PROFILE.into()),
             ("fractal.embedding_dim".into(), EMBEDDING_DIM.to_string()),
+            (
+                "fractal.embedding_projection".into(),
+                EMBEDDING_PROJECTION.into(),
+            ),
             ("fractal.distance_metric".into(), "cosine".into()),
             ("fractal.normalization".into(), "l2".into()),
             ("fractal.vectors_per_segment".into(), "1".into()),
@@ -547,7 +551,7 @@ impl Store {
             .context("Open LanceDB catalog")?;
         ensure!(
             table.schema().await?.as_ref() == schema().as_ref(),
-            "Incompatible catalog schema, model profile or embedding contract; use a fresh data directory and reindex"
+            crate::CatalogContractMismatch
         );
         Self::validate_text_index(&table).await?;
         Ok(table)
@@ -1619,6 +1623,14 @@ mod tests {
             schema.metadata().get("fractal.embedding_dim").unwrap(),
             &EMBEDDING_DIM.to_string()
         );
+        assert_eq!(EMBEDDING_DIM, 512);
+        assert_eq!(
+            schema
+                .metadata()
+                .get("fractal.embedding_projection")
+                .unwrap(),
+            EMBEDDING_PROJECTION
+        );
         assert_eq!(
             schema.metadata().get("fractal.distance_metric").unwrap(),
             "cosine"
@@ -1641,6 +1653,22 @@ mod tests {
                 EMBEDDING_DIM as i32
             )
         );
+    }
+
+    #[test]
+    fn source_placeholder_uses_current_width_but_has_no_vector() {
+        let row = Record {
+            kind: "source".into(),
+            asset_id: "source:1".into(),
+            source_id: 1,
+            path: "/test".into(),
+            filename: "test".into(),
+            ..Record::default()
+        };
+        let record = batch(&row).unwrap();
+        let values = array::<FixedSizeListArray>(&record, "embedding").unwrap();
+        assert_eq!(values.value_length(), 512);
+        assert!(values.is_null(0));
     }
 
     fn text_record(id: &str, filename: &str, passage: &str, axis: usize) -> Record {
@@ -2880,7 +2908,11 @@ mod tests {
                 "fractal.model_profile",
                 Some("fgclip2-base-33f3b9d4-dynamic-torch291-short64-v1"),
             ),
+            ("fractal.model_profile", Some(crate::NATIVE_MODEL_PROFILE)),
+            ("fractal.embedding_dim", Some("768")),
             ("fractal.embedding_dim", Some("1024")),
+            ("fractal.embedding_projection", Some("native768-l2")),
+            ("fractal.embedding_projection", None),
             ("fractal.distance_metric", Some("l2")),
             ("fractal.normalization", Some("none")),
             ("fractal.vectors_per_segment", Some("2")),
@@ -2919,6 +2951,78 @@ mod tests {
         }
     }
     #[test]
+    fn old_768_catalog_with_vectors_is_preserved_on_writer_and_reader_rejection() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let current = schema();
+        let mut metadata = current.metadata().clone();
+        metadata.insert(
+            "fractal.model_profile".into(),
+            crate::NATIVE_MODEL_PROFILE.into(),
+        );
+        metadata.insert("fractal.embedding_dim".into(), "768".into());
+        metadata.remove("fractal.embedding_projection");
+        let mut fields = current.fields().iter().cloned().collect::<Vec<_>>();
+        let index = current.index_of("embedding").unwrap();
+        fields[index] = Arc::new(Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 768),
+            true,
+        ));
+        let old_schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+        let mut columns = batch(&image("legacy-image", 0)).unwrap().columns().to_vec();
+        let mut vector = vec![0.; 768];
+        vector[0] = 1.;
+        columns[index] = Arc::new(FixedSizeListArray::from_iter_primitive::<
+            arrow_array::types::Float32Type,
+            _,
+            _,
+        >([Some(vector.into_iter().map(Some))], 768));
+        let legacy = RecordBatch::try_new(old_schema.clone(), columns).unwrap();
+        runtime.block_on(async {
+            let db = lancedb::connect(root.path().join("catalog.lancedb").to_str().unwrap())
+                .execute()
+                .await
+                .unwrap();
+            let table = db
+                .create_empty_table("assets", old_schema)
+                .execute()
+                .await
+                .unwrap();
+            table
+                .add(Box::new(arrow_array::RecordBatchIterator::new(
+                    [Ok(legacy)],
+                    table.schema().await.unwrap(),
+                ))
+                    as Box<dyn arrow_array::RecordBatchReader + Send>)
+                .execute()
+                .await
+                .unwrap();
+        });
+        let before = contents(root.path());
+        for read_only in [false, true] {
+            let error = Store::open(root.path(), read_only).unwrap_err().to_string();
+            assert!(
+                error.contains("512-dimensional")
+                    && error.contains("preserve")
+                    && error.contains("reindex"),
+                "{error}"
+            );
+            assert_eq!(contents(root.path()), before);
+        }
+        let error = crate::agent::AgentCatalog::open(root.path())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("512-dimensional") && error.contains("reindex"),
+            "{error}"
+        );
+        assert!(!error.contains(&root.path().display().to_string()));
+        assert_eq!(contents(root.path()), before);
+    }
+
+    #[test]
     fn invalid_stored_and_query_embeddings_fail_without_mutation() {
         let root = tempfile::tempdir().unwrap();
         let store = Store::open(root.path(), false).unwrap();
@@ -2927,6 +3031,11 @@ mod tests {
         let before = contents(root.path());
         for vector in [
             vec![],
+            {
+                let mut old = vec![0.; crate::NATIVE_EMBEDDING_DIM];
+                old[0] = 1.;
+                old
+            },
             vec![1.; EMBEDDING_DIM - 1],
             vec![1.; EMBEDDING_DIM + 1],
             vec![0.; EMBEDDING_DIM],

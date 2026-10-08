@@ -1,6 +1,6 @@
 //! Optional derived state. The Lance file generation remains authoritative.
 //! A crash before this sidecar publishes loses reuse, never searchable rows.
-use crate::{catalog::validate_embedding, store::Record, MODEL_PROFILE};
+use crate::{catalog::validate_embedding, store::Record, EMBEDDING_PROJECTION, MODEL_PROFILE};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,7 +13,7 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) const EMBEDDING_CACHE_VERSION: &str =
-    "formatted-input-assets-tokenizer-preprocess-fp32-v1";
+    "formatted-input-assets-tokenizer-preprocess-fp32-mrl512-v2";
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_VECTOR_BYTES: u64 = 32 * 1024;
 
@@ -68,6 +68,10 @@ impl FileState {
             embedding_profile: embedding,
             locations,
         }
+    }
+    pub fn matches_profile(&self, embedding: Option<&str>, extraction: Option<&str>) -> bool {
+        self.embedding_profile.as_deref() == embedding
+            && extraction.is_none_or(|profile| self.extraction_profile == profile)
     }
     pub fn matches(&self, rows: &[Record]) -> bool {
         self.generation == generation(rows)
@@ -254,7 +258,7 @@ impl IndexState {
             include_str!("../models/embeddinggemma2.json"),
             "text",
             "fp32",
-            "768-l2-masked-pool",
+            EMBEDDING_PROJECTION,
             "tokenizers-0.22.2-bos-eos-literal-specials",
             extraction,
             &formatted,
@@ -318,6 +322,69 @@ mod tests {
         fs::write(s.root.join("vectors/key.json"), b"invalid").unwrap();
         assert!(s.vector("key").is_err());
     }
+    #[test]
+    fn projected_cache_is_separate_and_rejects_full_width_vectors_without_overwrite() {
+        let d = tempfile::tempdir().unwrap();
+        let state = IndexState::new(d.path());
+        let old_contract = [
+            "formatted-input-assets-tokenizer-preprocess-fp32-v1",
+            crate::NATIVE_MODEL_PROFILE,
+            crate::NATIVE_MODEL_PROFILE,
+            include_str!("../models/embeddinggemma2.json"),
+            "text",
+            "fp32",
+            "768-l2-masked-pool",
+            "tokenizers-0.22.2-bos-eos-literal-specials",
+            "chunks",
+            "title: title | text: body",
+        ];
+        let old_key = digest(&serde_json::to_vec(&old_contract).unwrap());
+        let key = state.document_key(MODEL_PROFILE, "chunks", "title", "body");
+        assert_ne!(old_key, key);
+        let mut old = vec![0.; crate::NATIVE_EMBEDDING_DIM];
+        old[0] = 1.;
+        assert!(state.save_vector(&key, &old).is_err());
+        let path = state.root.join("vectors").join(format!("{old_key}.json"));
+        write_json(&path, &serde_json::json!({"key":old_key,"vector":old})).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(state.vector(&key).unwrap().is_none());
+        assert!(state.vector(&old_key).is_err());
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn all_modality_file_states_bind_reuse_to_the_indexed_profile() {
+        let d = tempfile::tempdir().unwrap();
+        let index = IndexState::new(d.path());
+        for kind in ["text", "image", "audio", "video"] {
+            let row = Record {
+                asset_id: kind.into(),
+                source_id: 1,
+                path: format!("/{kind}"),
+                media_kind: kind.into(),
+                ..Record::default()
+            };
+            let rows = [row];
+            let state = FileState::new(
+                &rows,
+                FileStamp {
+                    bytes: 1,
+                    modified: "1.0".into(),
+                },
+                "hash".into(),
+                "extraction",
+                Some(MODEL_PROFILE.into()),
+                vec![],
+            );
+            index.save(1, &rows[0].path, &state).unwrap();
+            let actual = index.load(1, &rows[0].path, &rows).unwrap().unwrap();
+            assert!(actual.matches_profile(Some(MODEL_PROFILE), Some("extraction")));
+            assert!(!actual.matches_profile(Some(crate::NATIVE_MODEL_PROFILE), Some("extraction")));
+            assert!(!actual.matches_profile(None, None));
+            assert!(!actual.matches_profile(Some(MODEL_PROFILE), Some("other-extraction")));
+        }
+    }
+
     #[test]
     fn recent_and_future_stamps_are_racy_old_ones_are_not() {
         let now = SystemTime::now()

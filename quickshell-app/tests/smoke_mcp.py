@@ -134,6 +134,7 @@ def main():
                 assert 'error' in mcp.tool(name, {**arguments, 'mediaKind': 'text', 'unknown': True}, success=False)
             status = data(mcp.tool("status"))
             assert status["textModelLoaded"] is False and status["assetCount"] == status["fileCount"] == 2
+            assert status["modelProfile"] == "embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2"
             page = data(mcp.tool("browse_assets", {"limit": 1}))
             assert page["total"] == 2 and len(page["items"]) == 1
             asset = page["items"][0]

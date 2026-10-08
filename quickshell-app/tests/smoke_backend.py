@@ -163,6 +163,7 @@ def main():
         try:
             ready = service.until(lambda item: item.get("event") == "ready")["payload"]
             assert ready["catalog"]["assetCount"] == 0 and ready["modelLoaded"] is False
+            assert ready["catalog"]["modelProfile"] == "embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2"
             assert ready["textModelLoaded"] is False
             preferences = {"topMatches": 6, "resultLayout": "listPreview", "watchChanges": False, "closeAfterOpening": True, "imageBatchSize": 1}
             assert ready["settings"] == preferences
