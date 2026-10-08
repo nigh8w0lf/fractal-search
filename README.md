@@ -137,6 +137,7 @@ A source edit is not an installed update: rebuild/package/install to change the 
 - [CUDA runtime requirements and real-inference validation](quickshell-app/CUDA.md)
 - [MCP protocol, client configuration and privacy limits](quickshell-app/MCP.md)
 - [Model contract and reference fixtures](docs/MODELS.md)
+- [512D default validation and remaining native checks](docs/EMBEDDING-512-VALIDATION.md)
 - [Text-only hybrid retrieval and validation](docs/HYBRID-TEXT-SEARCH.md)
 - [QMD-inspired improvements, indexing/reuse, idle policies and limitations](docs/QMD-SEARCH-IMPROVEMENTS.md)
 - [Labeled retrieval evaluation](docs/QMD-EVALUATION.md)
