@@ -31,6 +31,9 @@ ShellRoot {
         id: app
         property var runtimeDiagnostics: diagnostic
         property bool ready: true
+        property bool busy: false
+        property int statusRefreshCount: 0
+        function refreshStatus() { statusRefreshCount++; }
         property string configuredProvider: "cpu"
         property var status: ({provider: "CPU", textModelLoaded: true})
         property var colors: ({foreground: "#eeeeee", background: "#111111", accent: "#88ffaa", error: "#ff8888"})
@@ -50,6 +53,7 @@ ShellRoot {
             function check(condition, message) { if (!condition) throw new Error(message); }
             try {
                 check(diagnostic.refreshCount === 1, "Expected one automatic check");
+                check(app.statusRefreshCount === 1, "Expected one visible runtime status refresh");
                 check(!card.expanded, "Details should start collapsed");
                 diagnostic.report = {checksPassed: false};
                 check(card.cpuActive && !card.gpuAvailable && card.gpuState === "Unavailable", "Missing CUDA must leave actual CPU active");

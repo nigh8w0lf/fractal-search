@@ -1,7 +1,7 @@
 //! Offline parity against scripts/prepare-embeddinggemma2-fixtures.py.
 //! cargo run -p fractal-search-core --example validate_embeddinggemma2 -- [--preprocess-only] MODEL_DIR FIXTURES_JSON...
 use anyhow::{bail, ensure, Context, Result};
-use fractal_search_core::{preprocess, runtime::NativeRuntime, Embedder, EMBEDDING_DIM};
+use fractal_search_core::{preprocess, runtime::NativeRuntime, EMBEDDING_DIM};
 use serde::Deserialize;
 use std::{
     fs,
@@ -115,7 +115,7 @@ fn main() -> Result<()> {
     let files: Vec<PathBuf> = args.map(PathBuf::from).collect();
     ensure!(!files.is_empty(), "Provide native-input fixture JSON files");
     let tokenizer = preprocess::QueryTokenizer::from_file(&model.join("tokenizer.json"))?;
-    let mut runtime = NativeRuntime::new(model, 6)?;
+    let runtime = NativeRuntime::new(model, 6)?;
     fractal_search_core::initialize_image_decoders();
     let mut minimum_cosine = 1.0_f64;
     let mut case_count = 0;

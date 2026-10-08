@@ -14,16 +14,16 @@ This repository is the complete standalone project: both Cargo workspace members
 
 Up/Down selects results, Enter opens the selection, Ctrl+Enter shows it in the file manager, and Ctrl+, opens Settings. Escape goes back or hides the panel. Ctrl+Q asks to stop the service; Cancel is focused by default, using the same confirmation component as folder removal. Left/Right switches a focused settings tab. All panels follow Omarchy's theme and font tokens.
 
-Hiding or reloading the UI keeps the backend and indexing alive. Stopping the service drains active work and saves the catalog; summoning starts it again. **Prepare search at login** controls the actual systemd user-unit enabled state and preloads only text inference. Vision and audio encoders load lazily for the media being indexed.
+Hiding or reloading the UI keeps the backend and indexing alive. Stopping the service drains active work and saves the catalog; summoning starts it again. **Prepare search at login** controls the actual systemd user-unit enabled state and preloads only text inference. Vision and audio encoders load lazily for the media being indexed. Idle ONNX sessions are released safely after configurable timeouts (default 15 minutes for text, 5 minutes for media); Keep warm is available.
 
 **Image batch size** accepts 1–8 (default 1) for CPU and GPU indexing. Larger batches use more memory. Saving a change prompts **Restart now** or **Later**; the running service keeps its current size until restarted. Restart now safely drains indexing and reconnects the panel. Consecutive images share a batch; skipped/unchanged files and the final partial batch can produce smaller batches. Inference errors never trigger retries at a smaller size or on another provider.
 
 ## Supported media and result segments
 
-All media share the pinned normalized 768-dimensional EmbeddingGemma 2 retrieval space. Results represent searchable segments; one file can produce several results. Counts distinguish `fileCount` (distinct source files) from `assetCount` (searchable segments).
+All media share the pinned normalized 768-dimensional EmbeddingGemma 2 retrieval space. Results represent searchable segments; one file can produce several results. Optional Text file grouping keeps the strongest document result and expandable additional passages. Counts distinguish `fileCount` (distinct source files) from `assetCount` (searchable segments).
 
 - Images: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC and HEIF retain one embedding per still image and the 280-soft-token image budget
-- Text: UTF-8 `.txt`, `.md` and `.markdown` files, at most 2 MiB, split into overlapping passages of at most 4,096 UTF-8 bytes with 256-byte overlap at Unicode boundaries, up to 1,024 passages/file. This is plain-text passage indexing; Text mode adds BM25 + semantic hybrid retrieval; PDF, Office and OCR are not implemented
+- Text: UTF-8 `.txt`, `.md` and `.markdown` files, at most 2 MiB, split into overlapping passages of at most 4,096 UTF-8 bytes with at most 256-byte overlap at Unicode boundaries, structural Markdown/paragraph boundaries and real formatted-input token checks, up to 1,024 passages/file. Explicit text reindexing upgrades unchanged legacy passages. This is plain-text passage indexing; Text mode adds BM25 + semantic hybrid retrieval; PDF, Office and OCR are not implemented
 - Audio: decoded with FFmpeg to mono 16 kHz samples and embedded in segments up to 30 seconds. These are native audio embeddings; no transcription is generated
 - Video: sampled at 1 frame per second into visual segments up to 30 seconds / 30 frames, using 140 soft tokens per frame. An available soundtrack is additionally indexed as separate audio segments with its own vectors and timestamps. Visual and audio matches can therefore refer to the same video file
 
@@ -136,6 +136,9 @@ A source edit is not an installed update: rebuild/package/install to change the 
 - [MCP protocol, client configuration and privacy limits](quickshell-app/MCP.md)
 - [Model contract and reference fixtures](docs/MODELS.md)
 - [Text-only hybrid retrieval and validation](docs/HYBRID-TEXT-SEARCH.md)
+- [QMD-inspired improvements, indexing/reuse, idle policies and limitations](docs/QMD-SEARCH-IMPROVEMENTS.md)
+- [Labeled retrieval evaluation](docs/QMD-EVALUATION.md)
+- [QMD validation results and blocked checks](docs/QMD-VALIDATION.md)
 
 This is a local development project. Model weights and generated bundles are not checked in. Public release/signing and redistribution review remain separate work; preserve [bundle notices](quickshell-app/packaging/NOTICE).
 

@@ -8,11 +8,14 @@ ColumnLayout {
     id: page
     required property Controller app
     property int currentTab: 0
+    property bool panelVisible: false
+    readonly property bool performanceVisible: panelVisible && visible && currentTab === 2
     signal addFolder
     signal chooseModel
     signal showSkippedFiles
     signal stopService
     signal restartService
+    signal rebuildText
     signal removeFolder(int sourceId, string directory)
     spacing: Style.space(20)
 
@@ -199,6 +202,25 @@ ColumnLayout {
                         onClicked: page.app.reindexAll()
                     }
                 }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(6)
+                    SearchButton {
+                        objectName: "rebuildTextPassagesButton"
+                        Layout.fillWidth: true
+                        text: "Rebuild text passages"
+                        colors: page.app.colors
+                        enabled: page.app.ready && page.app.status.modelsPresent && !page.app.busy && page.app.status.catalog.sources.length > 0
+                        onClicked: page.rebuildText()
+                    }
+                    SearchText {
+                        Layout.fillWidth: true
+                        text: "Explicitly regenerate text passages and embeddings in all indexed folders. Original files stay in place."
+                        color: page.app.secondaryText
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: SearchTheme.font.bodySmall
+                    }
+                }
                 RowLayout {
                     visible: page.app.indexFailureCount > 0
                     Layout.fillWidth: true
@@ -262,6 +284,26 @@ ColumnLayout {
                     text: "Search results"
                     color: page.app.colors.foreground
                     font.bold: true
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(4)
+                    SearchToggle {
+                        objectName: "groupTextByFileToggle"
+                        Layout.fillWidth: true
+                        text: "Group Text matches by file"
+                        colors: page.app.colors
+                        checked: page.app.settings.groupTextByFile
+                        enabled: page.app.ready && !page.app.busy
+                        onClicked: page.app.updateSettings({groupTextByFile: checked})
+                    }
+                    SearchText {
+                        Layout.fillWidth: true
+                        text: "Text searches show each file's strongest passage, with up to five extra matching excerpts. Turn off for individual passages. All media searches and browsing keep segment results."
+                        color: page.app.secondaryText
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: SearchTheme.font.bodySmall
+                    }
                 }
                 RowLayout {
                     Layout.fillWidth: true
@@ -371,6 +413,11 @@ ColumnLayout {
                 AcceleratorSection {
                     Layout.fillWidth: true
                     app: page.app
+                    statusUpdatesEnabled: page.performanceVisible
+                }
+                ModelRuntimeSection {
+                    Layout.fillWidth: true
+                    app: page.app
                 }
                 ColumnLayout {
                     Layout.fillWidth: true
@@ -461,7 +508,7 @@ ColumnLayout {
                     SearchText {
                         Layout.fillWidth: true
                         Layout.minimumWidth: 0
-                        text: "Closing the panel keeps search ready. Stop the service to free model memory; opening Fractal starts it again."
+                        text: "Closing the panel keeps the service running under your idle policy. Stop the service to release loaded models; opening Fractal starts it again."
                         color: page.app.secondaryText
                         wrapMode: Text.WordWrap
                         font.pixelSize: SearchTheme.font.bodySmall

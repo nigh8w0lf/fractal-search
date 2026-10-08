@@ -9,10 +9,14 @@ ColumnLayout {
     property bool expanded: false
     property bool copied: false
     property bool checkRequested: false
+    property bool statusUpdatesEnabled: visible
     readonly property var diagnostics: app.runtimeDiagnostics
     readonly property bool hasReport: !diagnostics.checking && !diagnostics.errorMessage.length && diagnostics.report !== null
     readonly property bool gpuAvailable: hasReport && diagnostics.report.checksPassed === true
-    readonly property bool modelReady: app.ready && app.status.textModelLoaded === true
+    readonly property var modelSessions: app.status.runtimeDiagnostics
+    readonly property bool modelReady: app.ready && (modelSessions
+        ? [modelSessions.text, modelSessions.vision, modelSessions.audio].some(model => model && model.loaded === true)
+        : app.status.textModelLoaded === true)
     readonly property bool gpuActive: modelReady && app.status.provider.toLowerCase() === "cuda"
     readonly property bool cpuActive: modelReady && app.status.provider.toLowerCase() === "cpu"
     readonly property string gpuState: gpuActive ? "Active" : diagnostics.checking ? "Checking…" : diagnostics.errorMessage.length ? "Check failed" : gpuAvailable ? "Available" : hasReport ? "Unavailable" : "Not checked"
@@ -27,6 +31,16 @@ ColumnLayout {
     }
     onVisibleChanged: if (visible) ensureChecked()
     Component.onCompleted: if (visible) ensureChecked()
+
+    // Sessions can release without a search or other foreground request.
+    // Read-only status does not refresh their idle timers or load any model.
+    Timer {
+        interval: 5000
+        repeat: true
+        triggeredOnStart: true
+        running: section.statusUpdatesEnabled && section.visible && section.app.ready && !section.app.busy
+        onTriggered: section.app.refreshStatus()
+    }
 
     SearchText {
         text: "Accelerator"
@@ -108,6 +122,8 @@ ColumnLayout {
                 onClicked: {
                     section.copied = false;
                     section.diagnostics.refresh();
+                    if (section.app.ready && !section.app.busy)
+                        section.app.refreshStatus();
                 }
             }
         }

@@ -17,10 +17,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod text_chunks;
+pub use text_chunks::text_segments_with_token_counter;
+
 pub const MAX_TEXT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const TEXT_SEGMENT_BYTES: usize = 4096;
 pub const TEXT_OVERLAP_BYTES: usize = 256;
 pub const MAX_TEXT_SEGMENTS: usize = 1024;
+/// Independent of the vector/schema contract: changing extraction requires an
+/// explicit reindex, never a destructive catalog migration during open/search.
+pub const TEXT_EXTRACTION_PROFILE: &str =
+    "structural-v2-4096b-overlap256-lookback1024-formatted8192-offsets-v1";
 pub const MAX_MEDIA_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_DURATION_MS: u64 = 2 * 60 * 60 * 1000;
 pub const SEGMENT_DURATION_MS: u64 = 30 * 1000;
@@ -82,6 +89,12 @@ pub struct SegmentSpec {
     pub start_ms: Option<u64>,
     pub end_ms: Option<u64>,
     pub text: Option<String>,
+    /// Original UTF-8 byte interval, zero-based with an exclusive end.
+    pub start_byte: Option<u64>,
+    pub end_byte: Option<u64>,
+    /// Original source lines, one-based and inclusive (LF and CRLF supported).
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -149,16 +162,49 @@ pub fn inspect(path: &Path) -> Result<MediaInfo> {
 pub fn segments(path: &Path, info: &MediaInfo) -> Result<Vec<SegmentSpec>> {
     validate_path_kind(path, info)?;
     match info.kind {
-        MediaKind::Text => text_segments(&read_text(path)?),
+        MediaKind::Text => bail!(
+            "Text extraction requires the real model tokenizer; use segments_with_token_counter"
+        ),
         MediaKind::Image => Ok(vec![SegmentSpec {
             index: 0,
             kind: MediaKind::Image,
             start_ms: None,
             end_ms: None,
             text: None,
+            start_byte: None,
+            end_byte: None,
+            start_line: None,
+            end_line: None,
         }]),
         MediaKind::Audio | MediaKind::Video => timed_segments(info),
     }
+}
+
+/// Plan text passages using actual formatted model-input token counts. Other
+/// modalities keep their existing model-free segment planning.
+pub fn segments_with_token_counter<F>(
+    path: &Path,
+    info: &MediaInfo,
+    count_tokens: F,
+) -> Result<Vec<SegmentSpec>>
+where
+    F: FnMut(&str, &str) -> Result<usize>,
+{
+    validate_path_kind(path, info)?;
+    if info.kind != MediaKind::Text {
+        return segments(path, info);
+    }
+    let title = path
+        .file_name()
+        .context("Document filename is missing")?
+        .to_string_lossy();
+    let markdown = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        });
+    text_segments_with_token_counter(&title, &read_text(path)?, markdown, count_tokens)
 }
 
 pub fn decode_segment(path: &Path, info: &MediaInfo, spec: &SegmentSpec) -> Result<PreparedMedia> {
@@ -300,51 +346,6 @@ fn read_text(path: &Path) -> Result<String> {
     Ok(text)
 }
 
-fn text_segments(text: &str) -> Result<Vec<SegmentSpec>> {
-    ensure!(!text.trim().is_empty(), "Document contains no text");
-    ensure!(!text.contains('\0'), "Document contains NUL bytes");
-    ensure!(
-        text.len() as u64 <= MAX_TEXT_FILE_BYTES,
-        "Document exceeds the 2 MiB text limit"
-    );
-    let mut segments = Vec::new();
-    let mut start = 0;
-    while start < text.len() {
-        ensure!(
-            segments.len() < MAX_TEXT_SEGMENTS,
-            "Document exceeds the {MAX_TEXT_SEGMENTS}-segment limit"
-        );
-        let mut end = (start + TEXT_SEGMENT_BYTES).min(text.len());
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        ensure!(
-            end > start,
-            "Cannot make progress while splitting a UTF-8 document"
-        );
-        // Blank passages have no embeddable content. Still advance using the
-        // original byte interval so long whitespace runs cannot stall indexing.
-        if !text[start..end].trim().is_empty() {
-            segments.push(SegmentSpec {
-                index: u32::try_from(segments.len())?,
-                kind: MediaKind::Text,
-                start_ms: None,
-                end_ms: None,
-                text: Some(text[start..end].to_owned()),
-            });
-        }
-        if end == text.len() {
-            break;
-        }
-        let mut next = end.saturating_sub(TEXT_OVERLAP_BYTES).max(start + 1);
-        while !text.is_char_boundary(next) {
-            next += 1;
-        }
-        start = next;
-    }
-    Ok(segments)
-}
-
 fn validate_duration(duration_ms: u64) -> Result<()> {
     ensure!(
         (1..=MAX_DURATION_MS).contains(&duration_ms),
@@ -467,6 +468,10 @@ fn planned_timed_segment(
         start_ms: Some(offset_ms + start_ms),
         end_ms: Some(offset_ms + end_ms),
         text: None,
+        start_byte: None,
+        end_byte: None,
+        start_line: None,
+        end_line: None,
     }))
 }
 
@@ -503,8 +508,34 @@ fn validate_segment(info: &MediaInfo, spec: &SegmentSpec) -> Result<()> {
                 .as_deref()
                 .context("Missing document segment text")?;
             ensure!(
-                !text.is_empty() && !text.contains('\0') && text.len() <= TEXT_SEGMENT_BYTES,
+                !text.trim().is_empty() && !text.contains('\0') && text.len() <= TEXT_SEGMENT_BYTES,
                 "Text segment must contain 1..=4096 UTF-8 bytes"
+            );
+            let start = spec
+                .start_byte
+                .context("Text segment is missing its source byte offset")?;
+            let end = spec
+                .end_byte
+                .context("Text segment is missing its source end byte offset")?;
+            let start_line = spec
+                .start_line
+                .context("Text segment is missing its source line offset")?;
+            let end_line = spec
+                .end_line
+                .context("Text segment is missing its source end line offset")?;
+            ensure!(
+                end > start
+                    && end <= MAX_TEXT_FILE_BYTES
+                    && end - start == text.len() as u64
+                    && start_line > 0
+                    && u64::from(start_line) <= start + 1
+                    && end_line >= start_line
+                    && (end_line - start_line) as usize
+                        == text.as_bytes()[..text.len() - 1]
+                            .iter()
+                            .filter(|&&byte| byte == b'\n')
+                            .count(),
+                "Invalid text source offsets"
             );
         }
         MediaKind::Audio | MediaKind::Video => {
@@ -522,7 +553,11 @@ fn validate_segment(info: &MediaInfo, spec: &SegmentSpec) -> Result<()> {
                 spec.index == 0
                     && spec.start_ms.is_none()
                     && spec.end_ms.is_none()
-                    && spec.text.is_none(),
+                    && spec.text.is_none()
+                    && spec.start_byte.is_none()
+                    && spec.end_byte.is_none()
+                    && spec.start_line.is_none()
+                    && spec.end_line.is_none(),
                 "Invalid image segment metadata"
             );
         }
@@ -1190,6 +1225,14 @@ mod tests {
         }
     }
 
+    // Explicit deterministic fake tokenizer for media-only unit tests. Actual
+    // indexing always calls the runtime tokenizer through the counted API.
+    fn text_segments(text: &str) -> Result<Vec<SegmentSpec>> {
+        text_segments_with_token_counter("test.txt", text, false, |title, text| {
+            Ok(title.len() + text.len() + 16)
+        })
+    }
+
     #[test]
     fn text_limits_and_empty_documents_are_rejected() {
         assert!(text_segments("").is_err());
@@ -1225,7 +1268,15 @@ mod tests {
         let path = directory.path().join("note.md");
         fs::write(&path, "Local document 🦊").unwrap();
         let inspected = inspect(&path).unwrap();
-        let segment = segments(&path, &inspected).unwrap().remove(0);
+        assert!(segments(&path, &inspected)
+            .unwrap_err()
+            .to_string()
+            .contains("real model tokenizer"));
+        let segment = segments_with_token_counter(&path, &inspected, |title, text| {
+            Ok(title.len() + text.len() + 16)
+        })
+        .unwrap()
+        .remove(0);
         let PreparedMedia::Text { title, text } =
             decode_segment(&path, &inspected, &segment).unwrap()
         else {

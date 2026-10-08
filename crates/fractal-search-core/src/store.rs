@@ -1,7 +1,7 @@
 //! One Lance table owns source rows, segment metadata and multimodal vectors.
 //! Each mutation is one atomic Lance commit; readers use a pinned snapshot.
 use crate::{
-    catalog::validate_embedding, media::MediaKind, EMBEDDING_DIM, MODEL_PROFILE,
+    catalog::validate_embedding, media::MediaKind, TextSearchMode, EMBEDDING_DIM, MODEL_PROFILE,
     TEXT_SEARCH_PROFILE,
 };
 use anyhow::{ensure, Context, Result};
@@ -17,21 +17,26 @@ use lancedb::{
         Index, IndexType,
     },
     query::{ColumnOrdering, ExecutableQuery, QueryBase, Select},
-    DistanceType, Table,
+    Connection, DistanceType, Table,
 };
 use std::{
     collections::{HashMap, HashSet},
+    io::Write,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{Arc, Mutex, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 const MAX_ROWS: usize = 250_000;
 const TEXT_INDEX_NAME: &str = "text_passage_bm25_v1";
 const MAX_INDEXED_TEXT_BYTES: usize = 1024 + 1 + 4096;
 const RRF_K: f64 = 60.0;
+const MAX_ADDITIONAL_MATCHES: usize = 5;
+const MANIFEST_PAGE_SIZE: usize = 1024;
+const TEXT_MAINTENANCE_STATE: &str = "fractal-text-index-state.json";
+const SMALL_TEXT_CORPUS: usize = 4096;
+const MIN_CHANGED_TEXT_ROWS: u64 = 256;
+const MAX_INDEX_AGE_SECONDS: u64 = 24 * 60 * 60;
 
 fn text_index_config() -> FtsIndexBuilder {
     FtsIndexBuilder::default()
@@ -47,11 +52,12 @@ fn text_index_config() -> FtsIndexBuilder {
         .num_workers(2)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SearchHit {
     pub row: Record,
     pub distance: f32,
     pub hybrid_score: Option<f64>,
+    pub additional_matches: Vec<SearchHit>,
 }
 
 const COLUMNS: &[&str] = &[
@@ -92,12 +98,56 @@ pub(crate) struct Record {
     pub indexed_text: Option<String>,
     pub embedding: Option<Vec<f32>>,
 }
-#[derive(Debug)]
 pub(crate) struct Store {
     path: PathBuf,
     read_only: bool,
     runtime: tokio::runtime::Runtime,
-    text_index_dirty: AtomicBool,
+    // A connection owns reusable Lance caches; each request opens and pins an
+    // independent table handle so checkout cannot move another reader's view.
+    connection: OnceLock<Connection>,
+    text_maintenance: Mutex<TextMaintenance>,
+}
+impl std::fmt::Debug for Store {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Store")
+            .field("path", &self.path)
+            .field("read_only", &self.read_only)
+            .finish_non_exhaustive()
+    }
+}
+/// Write-ahead generation intent. Persisted before a text mutation, and marked
+/// indexed only after the atomic index-manifest commit. A failed row commit can
+/// cause redundant maintenance, never falsely mark committed text as indexed.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextMaintenance {
+    format: u32,
+    index_uuid: String,
+    data_generation: u64,
+    indexed_generation: u64,
+    changed_rows: u64,
+    last_indexed_at: u64,
+    #[serde(skip)]
+    recovery_due: bool,
+}
+impl TextMaintenance {
+    fn dirty(&self) -> bool {
+        self.data_generation != self.indexed_generation
+    }
+    fn due(&self, text_rows: usize, now: u64) -> bool {
+        self.dirty()
+            && (self.recovery_due
+                || text_rows <= SMALL_TEXT_CORPUS
+                || self.changed_rows >= MIN_CHANGED_TEXT_ROWS.max((text_rows as u64).div_ceil(10))
+                || now.saturating_sub(self.last_indexed_at) >= MAX_INDEX_AGE_SECONDS)
+    }
+}
+fn unix_seconds() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before the Unix epoch")?
+        .as_secs())
 }
 pub(crate) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -403,7 +453,8 @@ impl Store {
         let store = Self {
             path: data.join("catalog.lancedb"),
             read_only,
-            text_index_dirty: AtomicBool::new(false),
+            connection: OnceLock::new(),
+            text_maintenance: Mutex::new(TextMaintenance::default()),
             runtime: tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -450,6 +501,7 @@ impl Store {
                     .execute()
                     .await
                     .context("Connect to empty LanceDB catalog")?;
+                store.connection.set(db.clone()).map_err(|_| anyhow::anyhow!("Catalog connection was initialized twice"))?;
                 let table = db.create_empty_table("assets", schema())
                     .execute()
                     .await
@@ -458,7 +510,10 @@ impl Store {
                     .name(TEXT_INDEX_NAME.to_owned())
                     .execute().await.context("Create text BM25 index; use a fresh data directory and reindex if creation was interrupted")?;
             }
-            store.table().await?;
+            let table = store.table().await?;
+            if !read_only {
+                store.initialize_text_maintenance(&table, empty).await?;
+            }
             Ok::<_, anyhow::Error>(())
         })?;
         Ok(store)
@@ -475,7 +530,16 @@ impl Store {
                 "LanceDB catalog must contain real directories, not symlinks"
             );
         }
-        let db = lancedb::connect(self.uri()?).execute().await?;
+        let db = if let Some(db) = self.connection.get() {
+            db.clone()
+        } else {
+            let db = lancedb::connect(self.uri()?).execute().await?;
+            // Store::open initializes this before sharing the Store.
+            self.connection
+                .set(db.clone())
+                .map_err(|_| anyhow::anyhow!("Catalog connection was initialized twice"))?;
+            db
+        };
         let table = db
             .open_table("assets")
             .execute()
@@ -487,6 +551,111 @@ impl Store {
         );
         Self::validate_text_index(&table).await?;
         Ok(table)
+    }
+    async fn text_index_uuid(table: &Table) -> Result<String> {
+        table
+            .list_indices()
+            .await?
+            .into_iter()
+            .find(|index| index.name == TEXT_INDEX_NAME)
+            .and_then(|index| index.index_uuid)
+            .context("Text BM25 index is missing its persisted identity")
+    }
+    async fn initialize_text_maintenance(&self, table: &Table, fresh: bool) -> Result<()> {
+        let index_uuid = Self::text_index_uuid(table).await?;
+        let path = self.path.join(TEXT_MAINTENANCE_STATE);
+        let existing = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.len() <= 4096,
+                    "Invalid text-index maintenance state file"
+                );
+                Some(
+                    serde_json::from_slice::<TextMaintenance>(&std::fs::read(&path)?).context(
+                        "Invalid text-index maintenance state; committed files remain searchable",
+                    )?,
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("Read text-index maintenance state"),
+        };
+        let state = if let Some(mut state) = existing {
+            ensure!(
+                state.format == 1 && state.indexed_generation <= state.data_generation,
+                "Incompatible text-index maintenance state"
+            );
+            if state.index_uuid != index_uuid {
+                // A previous replacement may have committed before its state
+                // checkpoint. Conservatively rebuild rather than guess coverage.
+                state.data_generation = state
+                    .data_generation
+                    .checked_add(1)
+                    .context("Text-index generation overflow")?;
+                state.index_uuid = index_uuid;
+            }
+            state.recovery_due = state.dirty();
+            state
+        } else {
+            // Schema 4 predates this optional sidecar. Its tokenizer/schema stay
+            // untouched; one conservative checkpoint establishes exact tracking.
+            let has_text = !fresh
+                && table
+                    .count_rows(Some("kind = 'asset' AND media_kind = 'text'".into()))
+                    .await?
+                    > 0;
+            TextMaintenance {
+                format: 1,
+                index_uuid,
+                data_generation: u64::from(has_text),
+                indexed_generation: 0,
+                changed_rows: 0,
+                last_indexed_at: unix_seconds()?,
+                recovery_due: has_text,
+            }
+        };
+        self.persist_text_maintenance(&state)?;
+        *self
+            .text_maintenance
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Text-index maintenance lock poisoned"))? = state;
+        Ok(())
+    }
+    fn persist_text_maintenance(&self, state: &TextMaintenance) -> Result<()> {
+        ensure!(!self.read_only, "Catalog is read-only");
+        let path = self.path.join(TEXT_MAINTENANCE_STATE);
+        let temporary = self
+            .path
+            .join(format!(".text-index-{}.part", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&serde_json::to_vec(state)?)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            // Persist the rename before permitting a row commit. File sync alone
+            // does not provide the write-ahead ordering after a machine crash.
+            std::fs::File::open(&self.path)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result.context("Persist text-index maintenance generation")
+    }
+    fn mark_text_dirty(&self, state: &mut TextMaintenance, changed_rows: usize) -> Result<()> {
+        let mut next = state.clone();
+        next.data_generation = next
+            .data_generation
+            .checked_add(1)
+            .context("Text-index generation overflow")?;
+        next.changed_rows = next.changed_rows.saturating_add(changed_rows.max(1) as u64);
+        self.persist_text_maintenance(&next)?;
+        *state = next;
+        Ok(())
     }
     async fn validate_text_index(table: &Table) -> Result<()> {
         let indices = table
@@ -576,6 +745,54 @@ impl Store {
     pub fn list(&self, filter: &str, limit: usize, vectors: bool) -> Result<Vec<Record>> {
         self.runtime.block_on(async {
             Self::rows(&self.snapshot().await?, filter, 0, limit, false, vectors).await
+        })
+    }
+    /// Read one source once per scan, using bounded keyset pages on a single
+    /// pinned snapshot. No vectors or private complete passages are materialized.
+    pub fn source_manifest(&self, source_id: i64) -> Result<Vec<Record>> {
+        ensure!(source_id > 0, "Invalid manifest source ID");
+        self.runtime.block_on(async {
+            let table = self.snapshot().await?;
+            let mut rows = Vec::new();
+            let mut last_id: Option<String> = None;
+            loop {
+                let mut filter = asset_filter(Some(source_id));
+                if let Some(id) = &last_id {
+                    filter.push_str(&format!(" AND asset_id > {}", quote(id)));
+                }
+                let mut stream = table
+                    .query()
+                    .only_if(filter)
+                    .select(Select::columns(COLUMNS))
+                    .order_by(Some(vec![ColumnOrdering::asc_nulls_last(
+                        "asset_id".into(),
+                    )]))
+                    .limit(MANIFEST_PAGE_SIZE)
+                    .execute()
+                    .await?;
+                let mut page_count = 0;
+                while let Some(batch) = stream.try_next().await? {
+                    for index in 0..batch.num_rows() {
+                        let row = record(&batch, index)?;
+                        ensure!(
+                            last_id.as_ref().is_none_or(|id| row.asset_id > *id),
+                            "Duplicate or unordered manifest asset identity"
+                        );
+                        last_id = Some(row.asset_id.clone());
+                        rows.push(row);
+                        page_count += 1;
+                        ensure!(rows.len() <= MAX_ROWS, "Too many catalog assets");
+                    }
+                }
+                ensure!(
+                    page_count <= MANIFEST_PAGE_SIZE,
+                    "Catalog exceeded manifest page limit"
+                );
+                if page_count < MANIFEST_PAGE_SIZE {
+                    break;
+                }
+            }
+            Ok(rows)
         })
     }
     pub fn get(&self, filter: &str, vectors: bool) -> Result<Option<Record>> {
@@ -702,6 +919,10 @@ impl Store {
             "kind = 'asset' AND source_id = {source_id} AND path = {}",
             quote(path)
         );
+        let mut maintenance = self
+            .text_maintenance
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Text-index maintenance lock poisoned"))?;
         self.runtime.block_on(async {
             let table = self.table().await?;
             let total = table.count_rows(Some("kind = 'asset'".into())).await?;
@@ -715,6 +936,9 @@ impl Store {
                 total - replaced + rows.len() <= MAX_ROWS,
                 "Catalog segment limit reached; choose smaller source folders"
             );
+            if text_changed {
+                self.mark_text_dirty(&mut maintenance, replaced.max(rows.len()))?;
+            }
             let mut merge = table.merge_insert(&["asset_id"]);
             merge
                 .when_matched_update_all(None)
@@ -727,17 +951,28 @@ impl Store {
                 )))
                 .await
                 .context("Replace indexed file segments")?;
-            if text_changed {
-                self.text_index_dirty.store(true, Ordering::Release);
-            }
             Ok(())
         })
     }
     pub fn upsert(&self, row: &Record) -> Result<()> {
         ensure!(!self.read_only, "Catalog is read-only");
         let batch = batch(row)?;
+        let mut maintenance = self
+            .text_maintenance
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Text-index maintenance lock poisoned"))?;
         self.runtime.block_on(async {
             let table = self.table().await?;
+            let replaces_text = table
+                .count_rows(Some(format!(
+                    "asset_id = {} AND media_kind = 'text'",
+                    quote(&row.asset_id)
+                )))
+                .await?
+                > 0;
+            if row.media_kind == "text" || replaces_text {
+                self.mark_text_dirty(&mut maintenance, 1)?;
+            }
             let mut merge = table.merge_insert(&["asset_id"]);
             merge
                 .when_matched_update_all(None)
@@ -748,29 +983,29 @@ impl Store {
                     schema(),
                 )))
                 .await?;
-            if row.media_kind == "text" {
-                self.text_index_dirty.store(true, Ordering::Release);
-            }
             Ok(())
         })
     }
     pub fn delete(&self, filter: &str) -> Result<()> {
         ensure!(!self.read_only, "Catalog is read-only");
+        let mut maintenance = self
+            .text_maintenance
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Text-index maintenance lock poisoned"))?;
         self.runtime.block_on(async {
             let table = self.table().await?;
             let text_changed = table
                 .count_rows(Some(format!(
                     "({filter}) AND kind = 'asset' AND media_kind = 'text'"
                 )))
-                .await?
-                > 0;
+                .await?;
+            if text_changed > 0 {
+                self.mark_text_dirty(&mut maintenance, text_changed)?;
+            }
             table
                 .delete(filter)
                 .await
                 .context("Delete catalog records")?;
-            if text_changed {
-                self.text_index_dirty.store(true, Ordering::Release);
-            }
             Ok(())
         })
     }
@@ -795,43 +1030,216 @@ impl Store {
         source: Option<i64>,
         media_kind: Option<MediaKind>,
     ) -> Result<Vec<SearchHit>> {
+        self.search_filtered_grouped(query, vector, limit, source, media_kind, false)
+    }
+    pub fn search_filtered_grouped(
+        &self,
+        query: &str,
+        vector: &[f32],
+        limit: usize,
+        source: Option<i64>,
+        media_kind: Option<MediaKind>,
+        group_text_by_file: bool,
+    ) -> Result<Vec<SearchHit>> {
         validate_embedding(vector)?;
         ensure!((1..=1000).contains(&limit), "Invalid search limit");
         let hybrid = media_kind == Some(MediaKind::Text);
+        ensure!(
+            !group_text_by_file || hybrid,
+            "File grouping requires the Text media filter"
+        );
         if hybrid {
             crate::agent::validate_query(query)?;
         }
         self.runtime.block_on(async {
             let table = self.snapshot().await?;
             let filter = filtered_assets(source, media_kind);
-            let candidates = if hybrid {
+            let mut candidates = if hybrid {
                 hybrid_candidate_limit(limit)
             } else {
                 limit
             };
-            let dense = Self::dense_candidates(&table, vector, candidates, &filter).await?;
+            let mut dense = Self::dense_candidates(&table, vector, candidates, &filter).await?;
             if !hybrid {
-                // Preserve the public dense-only order, including numerical
-                // edge cases clamped to the same valid cosine similarity.
-                let mut dense = dense;
+                // Preserve cosine ordering; snippet extraction cannot alter rank.
                 dense.sort_by(|a, b| {
                     (1.0 - b.1)
                         .clamp(-1.0, 1.0)
                         .total_cmp(&(1.0 - a.1).clamp(-1.0, 1.0))
                         .then(a.0.asset_id.cmp(&b.0.asset_id))
                 });
-                return Ok(dense
+                let mut hits = dense
                     .into_iter()
                     .map(|(row, distance)| SearchHit {
                         row,
                         distance,
                         hybrid_score: None,
+                        additional_matches: Vec::new(),
                     })
-                    .collect());
+                    .collect::<Vec<_>>();
+                Self::populate_snippets(&table, query, &mut hits).await?;
+                return Ok(hits);
             }
-            let lexical = Self::lexical_candidates(&table, query, candidates, &filter).await?;
-            fuse_candidates(dense, lexical, vector, limit)
+            let mut lexical = Self::lexical_candidates(&table, query, candidates, &filter).await?;
+            // A long document can consume the initial passage budget. Widen each
+            // leg only while it has more candidates and too few unique files.
+            // All attempts use this snapshot and retain the 1000-per-leg cap.
+            while group_text_by_file
+                && candidates < 1000
+                && ((dense.len() == candidates && unique_documents(&dense) < limit)
+                    || (lexical.len() == candidates && unique_documents(&lexical) < limit))
+            {
+                candidates = candidates.saturating_mul(2).min(1000);
+                dense = Self::dense_candidates(&table, vector, candidates, &filter).await?;
+                lexical = Self::lexical_candidates(&table, query, candidates, &filter).await?;
+            }
+            let mut hits = if group_text_by_file {
+                fuse_document_candidates(dense, lexical, vector, limit)?
+            } else {
+                fuse_candidates(dense, lexical, vector, limit)?
+            };
+            Self::populate_snippets(&table, query, &mut hits).await?;
+            Ok(hits)
         })
+    }
+    /// Native retrieval ablations for the labeled evaluation harness. BM25 does
+    /// not require a model/vector; its distance is unused by the public adapter.
+    pub fn search_text_evaluation(
+        &self,
+        query: &str,
+        vector: &[f32],
+        limit: usize,
+        source: Option<i64>,
+        mode: TextSearchMode,
+    ) -> Result<Vec<SearchHit>> {
+        crate::agent::validate_query(query)?;
+        ensure!(
+            (1..=1000).contains(&limit),
+            "Invalid evaluation search limit"
+        );
+        if mode != TextSearchMode::Bm25 {
+            validate_embedding(vector)?;
+        }
+        self.runtime.block_on(async {
+            let table = self.snapshot().await?;
+            let filter = filtered_assets(source, Some(MediaKind::Text));
+            let candidates = hybrid_candidate_limit(limit);
+            let mut hits = match mode {
+                TextSearchMode::Bm25 => {
+                    Self::lexical_candidates(&table, query, candidates, &filter)
+                        .await?
+                        .into_iter()
+                        .take(limit)
+                        .map(|(row, _)| SearchHit {
+                            row,
+                            distance: 0.0,
+                            hybrid_score: None,
+                            additional_matches: Vec::new(),
+                        })
+                        .collect()
+                }
+                TextSearchMode::Dense => {
+                    Self::dense_candidates(&table, vector, candidates, &filter)
+                        .await?
+                        .into_iter()
+                        .take(limit)
+                        .map(|(row, distance)| SearchHit {
+                            row,
+                            distance,
+                            hybrid_score: None,
+                            additional_matches: Vec::new(),
+                        })
+                        .collect()
+                }
+                TextSearchMode::Hybrid => fuse_candidates(
+                    Self::dense_candidates(&table, vector, candidates, &filter).await?,
+                    Self::lexical_candidates(&table, query, candidates, &filter).await?,
+                    vector,
+                    limit,
+                )?,
+            };
+            Self::populate_snippets(&table, query, &mut hits).await?;
+            Ok(hits)
+        })
+    }
+    async fn populate_snippets(table: &Table, query: &str, hits: &mut [SearchHit]) -> Result<()> {
+        if query.trim().is_empty() {
+            return Ok(());
+        }
+        let ids = hits
+            .iter()
+            .flat_map(|hit| std::iter::once(hit).chain(&hit.additional_matches))
+            .filter(|hit| hit.row.media_kind == "text")
+            .map(|hit| hit.row.asset_id.clone())
+            .collect::<Vec<_>>();
+        ensure!(ids.len() <= 2000, "Too many snippet candidates");
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let query_terms = lancedb::tokenize(query, &text_index_config())
+            .context("Tokenize search snippet query")?
+            .into_iter()
+            .map(|token| token.text)
+            .collect::<HashSet<_>>();
+        let mut passages = HashMap::new();
+        for page in ids.chunks(64) {
+            let filter = format!(
+                "kind = 'asset' AND media_kind = 'text' AND asset_id IN ({})",
+                page.iter()
+                    .map(|id| quote(id))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let mut stream = table
+                .query()
+                .only_if(filter)
+                .limit(page.len())
+                .select(Select::columns(&["asset_id", "indexed_text"]))
+                .execute()
+                .await
+                .context("Read winning stored text passages")?;
+            while let Some(batch) = stream.try_next().await? {
+                let ids = array::<StringArray>(&batch, "asset_id")?;
+                let text = array::<StringArray>(&batch, "indexed_text")?;
+                for index in 0..batch.num_rows() {
+                    ensure!(
+                        !ids.is_null(index) && !text.is_null(index),
+                        "Missing winning text passage"
+                    );
+                    ensure!(
+                        passages
+                            .insert(ids.value(index).to_owned(), text.value(index).to_owned())
+                            .is_none(),
+                        "Duplicate winning text passage"
+                    );
+                }
+            }
+        }
+        for hit in hits.iter_mut().flat_map(|hit| {
+            std::iter::once(&mut hit.row).chain(
+                hit.additional_matches
+                    .iter_mut()
+                    .map(|extra| &mut extra.row),
+            )
+        }) {
+            if hit.media_kind != "text" {
+                continue;
+            }
+            hit.indexed_text = Some(
+                passages
+                    .remove(&hit.asset_id)
+                    .context("Winning passage disappeared from snapshot")?,
+            );
+            validate_indexed_text(hit)?;
+            let indexed = hit.indexed_text.take().expect("validated stored passage");
+            let passage = indexed
+                .strip_prefix(&format!("{}\n", hit.filename))
+                .context("Invalid winning passage filename")?;
+            hit.text_excerpt = Some(match_centered_excerpt(passage, &query_terms)?);
+            // Search projections never retain the private passage or vector.
+            hit.embedding = None;
+        }
+        Ok(())
     }
     async fn dense_candidates(
         table: &Table,
@@ -908,20 +1316,40 @@ impl Store {
         Ok(hits)
     }
     pub fn checkpoint(&self) -> Result<()> {
-        // Rows are already durable. Rebuild just the named derived index with
-        // our explicit buffer/worker budget. Native index optimization reloads
-        // unpersisted builder defaults and cannot accept a budget in this version.
-        // Replacement is an atomic index-manifest commit; never drop first,
-        // compact data, or prune versions needed by pinned readers.
+        // Pinned Lance 10 OptimizeOptions supports index_names/append, but cannot
+        // pass memory_limit_mb/num_workers through the reloaded FTS params. Do
+        // not pretend that an unbounded incremental build meets our budget.
+        // Thresholded replacement remains explicit and never compacts or prunes.
         self.runtime.block_on(async {
-            let table = self.table().await?;
-            if !self.read_only && self.text_index_dirty.load(Ordering::Acquire) {
-                table.create_index(&["indexed_text"], Index::FTS(text_index_config()))
-                    .name(TEXT_INDEX_NAME.to_owned()).replace(true)
-                    .execute().await.context("Indexed files are committed, but rebuilding the text BM25 index failed; retry the checkpoint")?;
-                Self::validate_text_index(&table).await?;
-                self.text_index_dirty.store(false, Ordering::Release);
+            if self.read_only {
+                self.table().await?;
+                return Ok(());
             }
+            // Serialize before opening a snapshot: no newer text generation may
+            // be acknowledged by an index built from an older table handle.
+            let mut state = self.text_maintenance.lock()
+                .map_err(|_| anyhow::anyhow!("Text-index maintenance lock poisoned"))?;
+            let table = self.table().await?;
+            if !state.dirty() {
+                return Ok(());
+            }
+            let text_rows = table.count_rows(Some("kind = 'asset' AND media_kind = 'text'".into())).await?;
+            let now = unix_seconds()?;
+            if !state.due(text_rows, now) {
+                return Ok(());
+            }
+            table.create_index(&["indexed_text"], Index::FTS(text_index_config()))
+                .name(TEXT_INDEX_NAME.to_owned()).replace(true)
+                .execute().await.context("Indexed files are committed, but rebuilding the text BM25 index failed; retry the checkpoint")?;
+            Self::validate_text_index(&table).await?;
+            let mut completed = state.clone();
+            completed.index_uuid = Self::text_index_uuid(&table).await?;
+            completed.indexed_generation = completed.data_generation;
+            completed.changed_rows = 0;
+            completed.last_indexed_at = now;
+            completed.recovery_due = false;
+            self.persist_text_maintenance(&completed)?;
+            *state = completed;
             Ok(())
         })
     }
@@ -956,6 +1384,121 @@ fn filtered_assets(source: Option<i64>, media_kind: Option<MediaKind>) -> String
 }
 fn hybrid_candidate_limit(limit: usize) -> usize {
     limit.saturating_mul(4).clamp(100, 1000)
+}
+
+fn unique_documents(candidates: &[(Record, f32)]) -> usize {
+    candidates
+        .iter()
+        .map(|(row, _)| (row.source_id, row.path.as_str()))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Use the same ICU/lowercase/folding analyzer as BM25. The public tokenizer
+/// reports token positions, not byte offsets, so locate a matching token with
+/// bounded UTF-8 prefix probes, then verify the final window with that analyzer.
+/// Filename-only, semantic-only and unlocatable matches use the stored prefix.
+fn match_centered_excerpt(passage: &str, query_terms: &HashSet<String>) -> Result<String> {
+    if passage.len() <= MAX_TEXT_EXCERPT_BYTES || query_terms.is_empty() {
+        return Ok(text_excerpt(passage).to_owned());
+    }
+    let config = text_index_config();
+    let tokens =
+        lancedb::tokenize(passage, &config).context("Tokenize stored passage for snippet")?;
+    let Some(target) = tokens
+        .iter()
+        .find(|token| query_terms.contains(&token.text))
+    else {
+        return Ok(text_excerpt(passage).to_owned());
+    };
+    let boundaries = passage
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(passage.len()))
+        .collect::<Vec<_>>();
+    let mut low = 0;
+    let mut high = boundaries.len() - 1;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let prefix = lancedb::tokenize(&passage[..boundaries[mid]], &config)
+            .context("Locate stored passage snippet match")?;
+        if prefix
+            .iter()
+            .any(|token| token.position == target.position && token.text == target.text)
+        {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    let center = boundaries[low].saturating_sub(target.text.len() / 2);
+    let mut start = center
+        .saturating_sub(MAX_TEXT_EXCERPT_BYTES / 2)
+        .min(passage.len().saturating_sub(MAX_TEXT_EXCERPT_BYTES));
+    while !passage.is_char_boundary(start) {
+        start += 1;
+    }
+    let snippet = text_excerpt(&passage[start..]);
+    let verified = lancedb::tokenize(snippet, &config)
+        .context("Verify stored passage snippet match")?
+        .iter()
+        .any(|token| query_terms.contains(&token.text));
+    if verified {
+        return Ok(snippet.to_owned());
+    }
+    // Context-sensitive ICU boundaries or a term longer than the display budget
+    // may not yield a verified complete token in a window. Keep a deterministic,
+    // bounded passage-only fallback, rather than inventing substring semantics.
+    Ok(text_excerpt(passage).to_owned())
+}
+
+fn fuse_document_candidates(
+    mut dense: Vec<(Record, f32)>,
+    mut lexical: Vec<(Record, f32)>,
+    query: &[f32],
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
+    dense.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.asset_id.cmp(&b.0.asset_id)));
+    lexical.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.asset_id.cmp(&b.0.asset_id)));
+    let mut document_scores: HashMap<(i64, String), f64> = HashMap::new();
+    for candidates in [&dense, &lexical] {
+        let mut seen = HashSet::new();
+        for (row, _) in candidates {
+            let key = (row.source_id, row.path.clone());
+            if seen.insert(key.clone()) {
+                // Rank files after collapsing the leg, not by the original
+                // passage rank. Additional passages never add to this score.
+                *document_scores.entry(key).or_default() += 1.0 / (RRF_K + seen.len() as f64);
+            }
+        }
+    }
+    let passage_hits = fuse_candidates(dense, lexical, query, 2000)?;
+    let mut groups: HashMap<(i64, String), SearchHit> = HashMap::new();
+    for hit in passage_hits {
+        let key = (hit.row.source_id, hit.row.path.clone());
+        if let Some(group) = groups.get_mut(&key) {
+            if group.additional_matches.len() < MAX_ADDITIONAL_MATCHES {
+                group.additional_matches.push(hit);
+            }
+        } else {
+            groups.insert(key, hit);
+        }
+    }
+    let mut hits = groups
+        .into_iter()
+        .map(|(key, mut hit)| {
+            hit.hybrid_score = document_scores.get(&key).copied();
+            hit
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|a, b| {
+        b.hybrid_score
+            .unwrap()
+            .total_cmp(&a.hybrid_score.unwrap())
+            .then(a.row.asset_id.cmp(&b.row.asset_id))
+    });
+    hits.truncate(limit);
+    Ok(hits)
 }
 
 fn cosine_distance(query: &[f32], candidate: &[f32]) -> Result<f32> {
@@ -1000,7 +1543,8 @@ fn fuse_candidates(
                     SearchHit {
                         row,
                         distance,
-                        hybrid_score: Some(1.0 / (RRF_K + rank as f64 + 1.0))
+                        hybrid_score: Some(1.0 / (RRF_K + rank as f64 + 1.0)),
+                        additional_matches: Vec::new(),
                     }
                 )
                 .is_none(),
@@ -1029,6 +1573,7 @@ fn fuse_candidates(
                     row,
                     distance,
                     hybrid_score: Some(contribution),
+                    additional_matches: Vec::new(),
                 },
             );
         }
@@ -1224,7 +1769,7 @@ mod tests {
         assert!(lexical(&store, "passagebeacon", None).is_empty());
     }
     #[test]
-    fn committed_unindexed_text_survives_reopen_and_next_text_checkpoint_refreshes_it() {
+    fn committed_unindexed_text_survives_reopen_and_unchanged_checkpoint_refreshes_it() {
         let root = tempfile::tempdir().unwrap();
         let index_id = |store: &Store| {
             store.runtime.block_on(async {
@@ -1277,9 +1822,12 @@ mod tests {
         assert_eq!(contents(root.path()), before_read);
         let writer = Store::open(root.path(), false).unwrap();
         writer.checkpoint().unwrap();
-        // The process-local dirty flag is intentionally not recovered from
-        // global fragment counts, which would also rebuild on image-only writes.
-        assert_eq!(index_id(&writer), original_index);
+        // The write-ahead generation survives process loss, so an unchanged
+        // scan's checkpoint repairs the index without waiting for new text.
+        assert_ne!(index_id(&writer), original_index);
+        let recovered_index = index_id(&writer);
+        writer.checkpoint().unwrap();
+        assert_eq!(index_id(&writer), recovered_index);
         writer
             .upsert(&text_record("next-text", "second.txt", "nexttextbeacon", 1))
             .unwrap();
@@ -1604,6 +2152,523 @@ mod tests {
                 Some(MediaKind::Text)
             )
             .is_err());
+    }
+    #[test]
+    fn winning_snippet_uses_the_stored_tail_and_leaves_browse_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), false).unwrap();
+        let passage = format!(
+            "{} Café tailneedle 北京欢迎你 {}",
+            "background ".repeat(250),
+            "after ".repeat(60)
+        );
+        let row = text_record("snippet", "filenamebeacon.txt", &passage, 0);
+        store.upsert(&row).unwrap();
+        let before = contents(root.path());
+        for query in ["tailneedle", "cafe", "北京"] {
+            let hits = store
+                .search_filtered(
+                    query,
+                    row.embedding.as_ref().unwrap(),
+                    1,
+                    None,
+                    Some(MediaKind::Text),
+                )
+                .unwrap();
+            let hit = &hits[0].row;
+            let excerpt = hit.text_excerpt.as_ref().unwrap();
+            assert!(excerpt.len() <= MAX_TEXT_EXCERPT_BYTES);
+            assert!(excerpt.contains("tailneedle"), "{query}: {excerpt}");
+            assert!(hit.indexed_text.is_none());
+            assert!(hit.embedding.is_none());
+            assert!(!excerpt.contains("filenamebeacon"));
+            assert!(!excerpt.contains("/test/"));
+        }
+        for query in ["filenamebeacon", "semantic-only-no-term", "!!!"] {
+            let hits = store
+                .search_filtered(
+                    query,
+                    row.embedding.as_ref().unwrap(),
+                    1,
+                    None,
+                    Some(MediaKind::Text),
+                )
+                .unwrap();
+            assert_eq!(
+                hits[0].row.text_excerpt.as_deref(),
+                Some(text_excerpt(&passage))
+            );
+        }
+        assert_eq!(
+            store
+                .browse_filtered(0, 1, None, Some(MediaKind::Text))
+                .unwrap()
+                .1[0]
+                .text_excerpt,
+            row.text_excerpt
+        );
+        assert_eq!(contents(root.path()), before);
+    }
+    #[test]
+    fn snippet_analyzer_matches_unicode_case_folding_and_literal_terms() {
+        for (term, query) in [
+            ("Café", "cafe"),
+            ("北京", "北京"),
+            ("O'Reilly", "o'reilly"),
+            ("ZXQ-98127", "zxq-98127"),
+        ] {
+            let passage = format!("{} {term} {}", "猫 ".repeat(600), "end ".repeat(100));
+            let terms = lancedb::tokenize(query, &text_index_config())
+                .unwrap()
+                .into_iter()
+                .map(|token| token.text)
+                .collect();
+            let snippet = match_centered_excerpt(&passage, &terms).unwrap();
+            assert!(snippet.contains(term), "{term}: {snippet}");
+            assert!(snippet.len() <= MAX_TEXT_EXCERPT_BYTES);
+            assert!(passage.contains(&snippet));
+        }
+        let passage = format!("{} after", "é".repeat(1500));
+        let terms = HashSet::from(["missing".to_owned()]);
+        assert_eq!(
+            match_centered_excerpt(&passage, &terms).unwrap(),
+            text_excerpt(&passage)
+        );
+    }
+    #[test]
+    fn document_fusion_collapses_each_leg_before_assigning_ranks_without_length_bonus() {
+        let query = image("q", 0).embedding.unwrap();
+        let mut a = text_record("a0", "a.txt", "first", 0);
+        a.path = "/a.txt".into();
+        let mut a1 = a.clone();
+        a1.asset_id = "a1".into();
+        a1.segment_index = 1;
+        let b = text_record("b", "b.txt", "second", 1);
+        let base = fuse_document_candidates(
+            vec![(a.clone(), 0.0), (b.clone(), 1.0)],
+            vec![(b.clone(), 8.0), (a.clone(), 4.0)],
+            &query,
+            10,
+        )
+        .unwrap();
+        let crowded = fuse_document_candidates(
+            vec![(a.clone(), 0.0), (a1.clone(), 0.5), (b.clone(), 1.0)],
+            vec![(b.clone(), 8.0), (a1.clone(), 5.0), (a.clone(), 4.0)],
+            &query,
+            10,
+        )
+        .unwrap();
+        let scores = |hits: &[SearchHit]| {
+            hits.iter()
+                .map(|hit| (hit.row.path.clone(), hit.hybrid_score.unwrap()))
+                .collect::<HashMap<_, _>>()
+        };
+        assert_eq!(scores(&base), scores(&crowded));
+        assert!(base
+            .iter()
+            .all(|hit| (hit.hybrid_score.unwrap() - (1.0 / 61.0 + 1.0 / 62.0)).abs() < 1e-12));
+        let a_group = crowded.iter().find(|hit| hit.row.path == "/a.txt").unwrap();
+        assert_eq!(a_group.additional_matches.len(), 1);
+        assert!(a_group.additional_matches[0].additional_matches.is_empty());
+        let mut other_source = a.clone();
+        other_source.source_id = 43;
+        other_source.asset_id = "other-source".into();
+        assert_eq!(
+            fuse_document_candidates(vec![(a, 0.0), (other_source, 0.0)], vec![], &query, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+    #[test]
+    fn grouped_search_widens_bounded_candidates_and_returns_expandable_passages() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), false).unwrap();
+        let rows = (0..120)
+            .map(|index| {
+                let mut row = text_record(
+                    &format!("crowded-{index:03}"),
+                    "long.txt",
+                    "sharedbeacon",
+                    0,
+                );
+                row.path = "/long.txt".into();
+                row.segment_index = index;
+                row
+            })
+            .collect::<Vec<_>>();
+        store.replace_file(42, "/long.txt", &rows).unwrap();
+        let other = text_record("other", "other.txt", "sharedbeacon several other words", 1);
+        store.upsert(&other).unwrap();
+        let query = image("q", 0).embedding.unwrap();
+        let hits = store
+            .search_filtered_grouped("sharedbeacon", &query, 2, None, Some(MediaKind::Text), true)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_ne!(hits[0].row.path, hits[1].row.path);
+        let long = hits.iter().find(|hit| hit.row.path == "/long.txt").unwrap();
+        assert_eq!(long.additional_matches.len(), MAX_ADDITIONAL_MATCHES);
+        assert!((long.hybrid_score.unwrap() - 2.0 / 61.0).abs() < 1e-12);
+        assert!(long
+            .additional_matches
+            .iter()
+            .all(|hit| hit.row.indexed_text.is_none() && hit.row.embedding.is_none()));
+        assert!(store
+            .search_filtered_grouped(
+                "sharedbeacon",
+                &query,
+                2,
+                None,
+                Some(MediaKind::Audio),
+                true
+            )
+            .is_err());
+        let passages = store
+            .search_filtered("sharedbeacon", &query, 2, None, Some(MediaKind::Text))
+            .unwrap();
+        assert!(passages.iter().all(|hit| hit.additional_matches.is_empty()));
+    }
+    #[test]
+    fn source_manifest_pages_one_snapshot_without_vectors_or_private_passages() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), false).unwrap();
+        for (file, count) in [("first", 1024), ("second", 9)] {
+            let rows = (0..count)
+                .map(|index| {
+                    let mut row = text_record(
+                        &format!("{file}-{index:04}"),
+                        "note.txt",
+                        "private passage",
+                        0,
+                    );
+                    row.path = format!("/{file}.txt");
+                    row.segment_index = index;
+                    row
+                })
+                .collect::<Vec<_>>();
+            store.replace_file(42, &rows[0].path, &rows).unwrap();
+        }
+        let mut other = text_record("other-source", "other.txt", "separate", 0);
+        other.source_id = 43;
+        store.upsert(&other).unwrap();
+        let manifest = store.source_manifest(42).unwrap();
+        assert_eq!(manifest.len(), 1033);
+        assert!(manifest
+            .windows(2)
+            .all(|pair| pair[0].asset_id < pair[1].asset_id));
+        assert!(manifest.iter().all(|row| row.source_id == 42
+            && row.embedding.is_none()
+            && row.indexed_text.is_none()
+            && row.text_excerpt.is_some()));
+        assert_eq!(store.source_manifest(43).unwrap().len(), 1);
+        assert!(store.source_manifest(44).unwrap().is_empty());
+    }
+    #[test]
+    fn text_evaluation_ablations_use_native_legs_and_bm25_needs_no_vector() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), false).unwrap();
+        store
+            .upsert(&text_record("lexical", "lexical.txt", "exactneedle", 1))
+            .unwrap();
+        store
+            .upsert(&text_record(
+                "semantic",
+                "semantic.txt",
+                "different words",
+                0,
+            ))
+            .unwrap();
+        let query = image("q", 0).embedding.unwrap();
+        let lexical = store
+            .search_text_evaluation("exactneedle", &[], 10, None, TextSearchMode::Bm25)
+            .unwrap();
+        assert_eq!(lexical.len(), 1);
+        assert_eq!(lexical[0].row.asset_id, "lexical");
+        assert!(lexical[0].hybrid_score.is_none());
+        let dense = store
+            .search_text_evaluation("exactneedle", &query, 10, None, TextSearchMode::Dense)
+            .unwrap();
+        assert_eq!(dense[0].row.asset_id, "semantic");
+        let hybrid = store
+            .search_text_evaluation("exactneedle", &query, 10, None, TextSearchMode::Hybrid)
+            .unwrap();
+        assert_eq!(hybrid[0].row.asset_id, "lexical");
+        assert!(hybrid[0].hybrid_score.is_some());
+    }
+    #[test]
+    fn text_maintenance_thresholds_bound_repeated_small_edit_rebuilds() {
+        let start = std::time::Instant::now();
+        let now = 1_000_000;
+        let mut state = TextMaintenance {
+            format: 1,
+            last_indexed_at: now,
+            ..Default::default()
+        };
+        let mut thresholded = 0;
+        for _ in 0..100 {
+            state.data_generation += 1;
+            state.changed_rows += 50;
+            if state.due(10_000, now) {
+                thresholded += 1;
+                state.indexed_generation = state.data_generation;
+                state.changed_rows = 0;
+            }
+        }
+        // The old immediate policy rebuilt 100 times for these 100 scans;
+        // this deterministic policy simulation rebuilds five times instead.
+        assert_eq!(thresholded, 5);
+        assert_eq!(state.data_generation, state.indexed_generation);
+        state.data_generation += 1;
+        state.changed_rows = 1;
+        assert!(!state.due(10_000, now));
+        assert!(state.due(10_000, now + MAX_INDEX_AGE_SECONDS));
+        assert!(state.due(SMALL_TEXT_CORPUS, now));
+        state.recovery_due = true;
+        assert!(state.due(10_000, now));
+        eprintln!("maintenance policy simulation: 100 small-edit scans; immediate=100 rebuilds, thresholded={thresholded}; policy-only elapsed={:?} (not an index-build benchmark)", start.elapsed());
+    }
+    /// Real Lance/FTS work on synthetic vectors, with no model downloads. Run
+    /// explicitly with --ignored --nocapture; this is not a relevance benchmark.
+    #[test]
+    #[ignore = "synthetic native maintenance benchmark; run explicitly"]
+    fn benchmark_small_edit_maintenance_with_readers_and_restart() {
+        let corpus_rows = std::env::var("FRACTAL_STORE_BENCH_ROWS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("integer benchmark row count"))
+            .unwrap_or(5000);
+        let edits = std::env::var("FRACTAL_STORE_BENCH_EDITS")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("integer benchmark edit count")
+            })
+            .unwrap_or(20);
+        assert!((4097..=50_000).contains(&corpus_rows));
+        assert!((1..=100).contains(&edits));
+        for immediate in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let writer = Store::open(root.path(), false).unwrap();
+            let rows = (0..corpus_rows)
+                .map(|index| {
+                    text_record(
+                        &format!("bench-{index:06}"),
+                        "note.txt",
+                        if index == 0 {
+                            "baselineonly original passage"
+                        } else {
+                            "background synthetic searchable passage"
+                        },
+                        index % 2,
+                    )
+                })
+                .collect::<Vec<_>>();
+            // A single fixture transaction avoids benchmarking fixture creation
+            // rather than the one-file edits under comparison.
+            let batches = rows.iter().map(batch).collect::<Result<Vec<_>>>().unwrap();
+            writer.runtime.block_on(async {
+                let table = writer.table().await.unwrap();
+                let mut state = writer.text_maintenance.lock().unwrap();
+                writer.mark_text_dirty(&mut state, rows.len()).unwrap();
+                let mut merge = table.merge_insert(&["asset_id"]);
+                merge.when_not_matched_insert_all();
+                merge
+                    .execute(Box::new(RecordBatchIterator::new(
+                        batches.into_iter().map(Ok),
+                        schema(),
+                    )))
+                    .await
+                    .unwrap();
+            });
+            writer.checkpoint().unwrap();
+            let reader = Store::open(root.path(), true).unwrap();
+            let pinned = reader.runtime.block_on(reader.snapshot()).unwrap();
+            let initial_index = writer.runtime.block_on(async {
+                Store::text_index_uuid(&writer.table().await.unwrap())
+                    .await
+                    .unwrap()
+            });
+            let mut last_index = initial_index;
+            let mut rebuilds = 0;
+            let mut update_ms = Vec::new();
+            let mut read_ms = Vec::new();
+            for edit in 0..edits {
+                let mut changed = rows[0].clone();
+                let passage = format!("latestbeacon version{edit} changed searchable passage");
+                changed.text_excerpt = Some(passage.clone());
+                changed.indexed_text = Some(format!("note.txt\n{passage}"));
+                changed.modified = edit.to_string();
+                let start = std::time::Instant::now();
+                writer
+                    .replace_file(changed.source_id, &changed.path, &[changed.clone()])
+                    .unwrap();
+                if immediate {
+                    writer.text_maintenance.lock().unwrap().recovery_due = true;
+                }
+                writer.checkpoint().unwrap();
+                update_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                let index = writer.runtime.block_on(async {
+                    Store::text_index_uuid(&writer.table().await.unwrap())
+                        .await
+                        .unwrap()
+                });
+                rebuilds += usize::from(index != last_index);
+                last_index = index;
+                let start = std::time::Instant::now();
+                assert_eq!(lexical(&reader, "latestbeacon", None), ["bench-000000"]);
+                assert!(lexical(&reader, "baselineonly", None).is_empty());
+                read_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                // A concurrent historical reader must retain its original rows
+                // and index even after replacement/maintenance commits.
+                reader.runtime.block_on(async {
+                    assert_eq!(
+                        Store::lexical_candidates(
+                            &pinned,
+                            "baselineonly",
+                            10,
+                            &filtered_assets(None, Some(MediaKind::Text))
+                        )
+                        .await
+                        .unwrap()
+                        .len(),
+                        1
+                    );
+                });
+            }
+            update_ms.sort_by(f64::total_cmp);
+            read_ms.sort_by(f64::total_cmp);
+            let percentile = |samples: &[f64], percent: usize| {
+                samples[(samples.len() * percent).div_ceil(100).saturating_sub(1)]
+            };
+            let state = writer.text_maintenance.lock().unwrap().clone();
+            let (fragments, indexed_rows, unindexed_rows) = writer.runtime.block_on(async {
+                let table = writer.table().await.unwrap();
+                let stats = table.stats().await.unwrap();
+                let index = table.index_stats(TEXT_INDEX_NAME).await.unwrap().unwrap();
+                (
+                    stats.fragment_stats.num_fragments,
+                    index.num_indexed_rows,
+                    index.num_unindexed_rows,
+                )
+            });
+            let disk_bytes = walkdir::WalkDir::new(root.path())
+                .into_iter()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| entry.metadata().unwrap().len())
+                .sum::<u64>();
+            // The sidecar is already durable before drop, as with a crash after
+            // a row commit. No new text is needed for reopened maintenance.
+            drop(writer);
+            let start = std::time::Instant::now();
+            let reopened = Store::open(root.path(), false).unwrap();
+            reopened.checkpoint().unwrap();
+            let restart_recovery_ms = start.elapsed().as_secs_f64() * 1000.0;
+            assert!(!reopened.text_maintenance.lock().unwrap().dirty());
+            assert_eq!(lexical(&reader, "latestbeacon", None), ["bench-000000"]);
+            if immediate {
+                assert_eq!(rebuilds, edits);
+            } else {
+                assert_eq!(rebuilds, 0);
+            }
+            let peak_rss = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|status| {
+                    status
+                        .lines()
+                        .find(|line| line.starts_with("VmHWM:"))
+                        .map(str::to_owned)
+                });
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "benchmark": "native-synthetic-small-file-edits",
+                    "policy": if immediate { "immediate-full-replacement" } else { "thresholded-full-replacement" },
+                    "corpusRows": corpus_rows, "edits": edits, "rebuildsDuringEdits": rebuilds,
+                    "dataGeneration": state.data_generation, "indexedGeneration": state.indexed_generation,
+                    "changedRowsPending": state.changed_rows,
+                    "updateAndCheckpointP50Ms": percentile(&update_ms, 50),
+                    "updateAndCheckpointP95Ms": percentile(&update_ms, 95),
+                    "twoCurrentReaderQueriesP50Ms": percentile(&read_ms, 50),
+                    "twoCurrentReaderQueriesP95Ms": percentile(&read_ms, 95),
+                    "fragments": fragments, "indexedRows": indexed_rows, "unindexedRows": unindexed_rows,
+                    "retainedDiskBytesBeforeRecovery": disk_bytes,
+                    "restartRecoveryMs": restart_recovery_ms,
+                    "processLifetimePeakRss": peak_rss,
+                    "notes": "Synthetic vectors and short passages; build budget is not an RSS cap; process peak is cumulative across both arms; historical-reader assertions included; initialization excluded"
+                })
+            );
+        }
+    }
+    #[test]
+    fn maintenance_generation_intent_is_persisted_before_commit_and_never_read_only_written() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), false).unwrap();
+        store
+            .upsert(&text_record("text", "note.txt", "durable", 0))
+            .unwrap();
+        let path = store.path.join(TEXT_MAINTENANCE_STATE);
+        let dirty: TextMaintenance =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(dirty.dirty());
+        assert_eq!(dirty.data_generation, 1);
+        assert_eq!(dirty.indexed_generation, 0);
+        drop(store);
+        let reader = Store::open(root.path(), true).unwrap();
+        let before = contents(root.path());
+        reader.checkpoint().unwrap();
+        assert_eq!(contents(root.path()), before);
+        let writer = Store::open(root.path(), false).unwrap();
+        assert!(writer.text_maintenance.lock().unwrap().recovery_due);
+        writer.checkpoint().unwrap();
+        let clean: TextMaintenance =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!clean.dirty());
+        assert_eq!(clean.indexed_generation, 1);
+        // Intent without a subsequent row commit is safe and recoverable too.
+        {
+            let mut state = writer.text_maintenance.lock().unwrap();
+            writer.mark_text_dirty(&mut state, 1).unwrap();
+        }
+        drop(writer);
+        let writer = Store::open(root.path(), false).unwrap();
+        writer.checkpoint().unwrap();
+        assert!(!writer.text_maintenance.lock().unwrap().dirty());
+        assert_eq!(writer.status().unwrap().0, 1);
+    }
+    #[test]
+    fn schema_four_without_maintenance_sidecar_remains_readable_and_recovers_once() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), false).unwrap();
+        store
+            .upsert(&text_record(
+                "old-schema-four",
+                "note.txt",
+                "existingbeacon",
+                0,
+            ))
+            .unwrap();
+        let path = store.path.join(TEXT_MAINTENANCE_STATE);
+        drop(store);
+        std::fs::remove_file(&path).unwrap();
+        let before = contents(root.path());
+        let reader = Store::open(root.path(), true).unwrap();
+        assert_eq!(
+            lexical(&reader, "existingbeacon", None),
+            ["old-schema-four"]
+        );
+        assert_eq!(contents(root.path()), before);
+        let writer = Store::open(root.path(), false).unwrap();
+        assert!(writer.text_maintenance.lock().unwrap().recovery_due);
+        writer.checkpoint().unwrap();
+        assert!(!writer.text_maintenance.lock().unwrap().dirty());
+        assert_eq!(
+            writer
+                .runtime
+                .block_on(async { writer.table().await.unwrap().schema().await.unwrap() })
+                .as_ref(),
+            schema().as_ref()
+        );
     }
     fn image(id: &str, axis: usize) -> Record {
         let mut embedding = vec![0.; EMBEDDING_DIM];

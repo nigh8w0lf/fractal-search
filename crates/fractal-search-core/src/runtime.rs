@@ -9,13 +9,13 @@ use ort::{
     },
     value::Tensor,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// CUDA is an explicit opt-in. Model assets and embedding profiles are identical
@@ -82,6 +82,31 @@ struct ModelFile {
     sha256: String,
 }
 
+fn verify_model_file(model_dir: &Path, file: &ModelFile) -> Result<()> {
+    let path = model_dir.join(&file.path);
+    let size = fs::metadata(&path).with_context(|| format!("Missing EmbeddingGemma 2 asset {path:?}; use Fractal Search’s Set up model button or the development scripts/fetch-embeddinggemma2.py downloader"))?.len();
+    ensure!(
+        size == file.bytes,
+        "Invalid model asset size for {path:?}: expected {}, found {size}",
+        file.bytes
+    );
+    let mut source = fs::File::open(&path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    ensure!(
+        format!("{:x}", hash.finalize()) == file.sha256,
+        "SHA-256 mismatch for model asset {path:?}"
+    );
+    Ok(())
+}
+
 // ort rc.10 rejects zero dimensions in from_array; allocate real empty tensors.
 fn empty_media_features() -> Result<Tensor<f32>> {
     Ok(Tensor::new(
@@ -106,17 +131,82 @@ fn media_feature_tensor(ids: &[i64], token: i64, features: Vec<f32>) -> Result<T
     }
 }
 
-/// Model verification is performed once per process before any session loads.
+#[path = "runtime_owner.rs"]
+mod owner;
+pub use owner::{IdlePolicy, RuntimeIdlePolicy};
+use owner::{Resources, RuntimeOwner};
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModalityDiagnostics {
+    pub loaded: bool,
+    pub idle_timeout_seconds: Option<f64>,
+    pub idle_for_ms: Option<f64>,
+    pub load_count: u64,
+    pub release_count: u64,
+    pub last_load_duration_ms: Option<f64>,
+    pub last_reload_duration_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeDiagnostics {
+    pub text: ModalityDiagnostics,
+    pub vision: ModalityDiagnostics,
+    pub audio: ModalityDiagnostics,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SessionLoad {
+    count: u64,
+    releases: u64,
+    last_duration: Option<Duration>,
+    last_reload_duration: Option<Duration>,
+}
+
+impl SessionLoad {
+    fn record(&mut self, duration: Duration) {
+        if self.count != 0 {
+            self.last_reload_duration = Some(duration);
+        }
+        self.count += 1;
+        self.last_duration = Some(duration);
+    }
+
+    fn diagnostics(
+        self,
+        loaded: bool,
+        policy: IdlePolicy,
+        last_used: Option<Instant>,
+        now: Instant,
+    ) -> ModalityDiagnostics {
+        ModalityDiagnostics {
+            loaded,
+            idle_timeout_seconds: match policy {
+                IdlePolicy::KeepWarm => None,
+                IdlePolicy::ReleaseAfter(duration) => Some(duration.as_secs_f64()),
+            },
+            idle_for_ms: last_used
+                .map(|last| now.saturating_duration_since(last).as_secs_f64() * 1000.0),
+            load_count: self.count,
+            release_count: self.releases,
+            last_load_duration_ms: self
+                .last_duration
+                .map(|duration| duration.as_secs_f64() * 1000.0),
+            last_reload_duration_ms: self
+                .last_reload_duration
+                .map(|duration| duration.as_secs_f64() * 1000.0),
+        }
+    }
+}
+
+/// Owns serial admission, lazy initialization, inference, and idle release. The
+/// reaper drops sessions only after every active and admitted operation drains.
+/// It never owns catalog/settings data. Metadata construction stays model-free.
 pub struct NativeRuntime {
     model_dir: PathBuf,
-    threads: usize,
     provider: ExecutionProvider,
-    profiling_directory: Option<PathBuf>,
-    verified: bool,
-    vision: Option<Session>,
-    audio: Option<Session>,
-    text: Option<Session>,
-    tokenizer: Option<preprocess::QueryTokenizer>,
+    owner: RuntimeOwner<RuntimeSessions>,
 }
 
 impl NativeRuntime {
@@ -126,6 +216,171 @@ impl NativeRuntime {
 
     /// Validate configuration without loading model assets or initializing a GPU.
     pub fn with_provider(
+        model_dir: PathBuf,
+        threads: usize,
+        provider: ExecutionProvider,
+    ) -> Result<Self> {
+        let sessions = RuntimeSessions::with_provider(model_dir.clone(), threads, provider)?;
+        Ok(Self {
+            model_dir,
+            provider,
+            owner: RuntimeOwner::new(sessions, RuntimeIdlePolicy::default())?,
+        })
+    }
+
+    pub fn provider(&self) -> ExecutionProvider {
+        self.provider
+    }
+    pub fn model_dir(&self) -> &Path {
+        &self.model_dir
+    }
+
+    pub fn set_idle_policy(&self, policy: RuntimeIdlePolicy) -> Result<()> {
+        self.owner.set_policy(policy)
+    }
+
+    pub fn idle_policy(&self) -> Result<RuntimeIdlePolicy> {
+        self.owner.inspect(|_, policy, _| policy)
+    }
+
+    pub fn diagnostics(&self) -> Result<RuntimeDiagnostics> {
+        self.owner.inspect(|sessions, policy, last_used| {
+            let loaded = Resources::loaded(sessions);
+            let now = Instant::now();
+            RuntimeDiagnostics {
+                text: sessions.loads[0].diagnostics(loaded[0], policy.text, last_used[0], now),
+                vision: sessions.loads[1].diagnostics(loaded[1], policy.vision, last_used[1], now),
+                audio: sessions.loads[2].diagnostics(loaded[2], policy.audio, last_used[2], now),
+            }
+        })
+    }
+
+    pub fn loaded(&self) -> bool {
+        self.owner
+            .inspect(|sessions, _, _| sessions.loaded())
+            .expect("Runtime state poisoned; restart the service")
+    }
+
+    pub fn text_loaded(&self) -> bool {
+        self.owner
+            .inspect(|sessions, _, _| sessions.text_loaded())
+            .expect("Runtime state poisoned; restart the service")
+    }
+
+    pub fn assets_present(&self) -> bool {
+        self.owner
+            .inspect(|sessions, _, _| sessions.assets_present())
+            .expect("Runtime state poisoned; restart the service")
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        self.owner.execute(owner::NONE, RuntimeSessions::verify)
+    }
+
+    /// Profiling keeps sessions resident until finish_profiling is called, so an
+    /// idle timer cannot discard a profile before the caller collects its path.
+    pub fn enable_profiling(&self, directory: PathBuf) -> Result<()> {
+        self.owner
+            .execute(owner::NONE, |sessions| sessions.enable_profiling(directory))
+    }
+
+    pub fn finish_profiling(&self) -> Result<Vec<PathBuf>> {
+        self.owner
+            .execute(owner::NONE, RuntimeSessions::finish_profiling)
+    }
+
+    /// Warm only the shared text backbone; both media encoders remain lazy.
+    pub fn prepare_text(&self) -> Result<()> {
+        self.owner
+            .execute(owner::TEXT, RuntimeSessions::prepare_text)
+    }
+
+    /// Exact formatted token count, requiring only tokenizer.json and no ONNX
+    /// model session. Counting does not extend any loaded model's idle timer.
+    pub fn document_token_count(&self, title: &str, text: &str) -> Result<usize> {
+        self.owner.execute(owner::NONE, |sessions| {
+            sessions.prepare_tokenizer()?;
+            sessions
+                .tokenizer
+                .as_ref()
+                .context("Text tokenizer not initialized")?
+                .document_token_count(title, text)
+        })
+    }
+
+    pub fn embed_text(&self, query: &str) -> Result<Vec<f32>> {
+        self.owner
+            .execute(owner::TEXT, |sessions| sessions.embed_text(query))
+    }
+
+    pub fn embed_document(&self, title: &str, text: &str) -> Result<Vec<f32>> {
+        self.owner
+            .execute(owner::TEXT, |sessions| sessions.embed_document(title, text))
+    }
+
+    pub fn embed_images(&self, images: &[image::RgbImage]) -> Result<Vec<Vec<f32>>> {
+        self.owner
+            .execute(owner::VISION, |sessions| sessions.embed_images(images))
+    }
+
+    pub fn embed_audio(&self, samples: &[f32]) -> Result<Vec<f32>> {
+        self.owner
+            .execute(owner::AUDIO, |sessions| sessions.embed_audio(samples))
+    }
+
+    pub fn embed_video(&self, frames: &[image::RgbImage]) -> Result<Vec<f32>> {
+        self.owner
+            .execute(owner::VISION, |sessions| sessions.embed_video(frames))
+    }
+}
+
+impl Embedder for NativeRuntime {
+    fn embed_image(&mut self, image: &image::RgbImage) -> Result<Vec<f32>> {
+        NativeRuntime::embed_images(self, std::slice::from_ref(image))?
+            .into_iter()
+            .next()
+            .context("Vision returned no embedding")
+    }
+    fn embed_images(&mut self, images: &[image::RgbImage]) -> Result<Vec<Vec<f32>>> {
+        NativeRuntime::embed_images(self, images)
+    }
+    fn embed_text(&mut self, query: &str) -> Result<Vec<f32>> {
+        NativeRuntime::embed_text(self, query)
+    }
+    fn embed_document(&mut self, title: &str, text: &str) -> Result<Vec<f32>> {
+        NativeRuntime::embed_document(self, title, text)
+    }
+    fn document_token_count(&mut self, title: &str, text: &str) -> Result<usize> {
+        NativeRuntime::document_token_count(self, title, text)
+    }
+    fn embedding_profile(&self) -> Option<String> {
+        Some(MODEL_PROFILE.into())
+    }
+    fn embed_audio(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
+        NativeRuntime::embed_audio(self, samples)
+    }
+    fn embed_video(&mut self, frames: &[image::RgbImage]) -> Result<Vec<f32>> {
+        NativeRuntime::embed_video(self, frames)
+    }
+}
+
+/// Verification is retained across unloads. Only this owner-accessed object can
+/// hold or mutate ONNX sessions; callers can never retain a session reference.
+struct RuntimeSessions {
+    model_dir: PathBuf,
+    threads: usize,
+    provider: ExecutionProvider,
+    profiling_directory: Option<PathBuf>,
+    verified: bool,
+    vision: Option<Session>,
+    audio: Option<Session>,
+    text: Option<Session>,
+    tokenizer: Option<preprocess::QueryTokenizer>,
+    loads: [SessionLoad; 3],
+}
+
+impl RuntimeSessions {
+    fn with_provider(
         model_dir: PathBuf,
         threads: usize,
         provider: ExecutionProvider,
@@ -145,10 +400,8 @@ impl NativeRuntime {
             audio: None,
             text: None,
             tokenizer: None,
+            loads: [SessionLoad::default(); 3],
         })
-    }
-    pub fn provider(&self) -> ExecutionProvider {
-        self.provider
     }
     /// Opt-in diagnostics for developer benchmarks; never enabled by desktop startup.
     pub fn enable_profiling(&mut self, directory: PathBuf) -> Result<()> {
@@ -196,27 +449,7 @@ impl NativeRuntime {
             manifest.repository, manifest.revision, self.model_dir
         );
         for file in manifest.files {
-            let path = self.model_dir.join(&file.path);
-            let size = fs::metadata(&path).with_context(|| format!("Missing EmbeddingGemma 2 asset {path:?}; use Fractal Search’s Set up model button or the development scripts/fetch-embeddinggemma2.py downloader"))?.len();
-            ensure!(
-                size == file.bytes,
-                "Invalid model asset size for {path:?}: expected {}, found {size}",
-                file.bytes
-            );
-            let mut source = fs::File::open(&path)?;
-            let mut hash = Sha256::new();
-            let mut buffer = vec![0; 1024 * 1024];
-            loop {
-                let count = source.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                hash.update(&buffer[..count]);
-            }
-            ensure!(
-                format!("{:x}", hash.finalize()) == file.sha256,
-                "SHA-256 mismatch for model asset {path:?}"
-            );
+            verify_model_file(&self.model_dir, &file)?;
         }
         self.verified = true;
         Ok(())
@@ -310,11 +543,13 @@ impl NativeRuntime {
             return Ok(());
         }
         self.verify()?;
+        let start = Instant::now();
         self.vision = Some(self.session(
             "onnx/vision_encoder.onnx",
             &["pixel_values", "pixel_position_ids"],
             &["image_features"],
         )?);
+        self.loads[1].record(start.elapsed());
         Ok(())
     }
     fn load_audio(&mut self) -> Result<()> {
@@ -322,22 +557,44 @@ impl NativeRuntime {
             return Ok(());
         }
         self.verify()?;
+        let start = Instant::now();
         self.audio = Some(self.session(
             "onnx/audio_encoder.onnx",
             &["input_features", "input_features_mask"],
             &["audio_features"],
         )?);
+        self.loads[2].record(start.elapsed());
         Ok(())
     }
+    fn prepare_tokenizer(&mut self) -> Result<()> {
+        if self.tokenizer.is_none() {
+            if !self.verified {
+                // Token counting needs only the pinned tokenizer, never weight
+                // files or native sessions. Verify that asset before using it.
+                let manifest: Manifest =
+                    serde_json::from_str(include_str!("../models/embeddinggemma2.json"))?;
+                let file = manifest
+                    .files
+                    .iter()
+                    .find(|file| file.path == "tokenizer.json")
+                    .context("Pinned model manifest does not contain tokenizer.json")?;
+                verify_model_file(&self.model_dir, file)?;
+            }
+            self.tokenizer = Some(preprocess::QueryTokenizer::from_file(
+                &self.model_dir.join("tokenizer.json"),
+            )?);
+        }
+        Ok(())
+    }
+
     /// Warm only the shared text backbone; the vision encoder remains lazy.
     pub fn prepare_text(&mut self) -> Result<()> {
         if self.text.is_some() {
             return Ok(());
         }
         self.verify()?;
-        self.tokenizer = Some(preprocess::QueryTokenizer::from_file(
-            &self.model_dir.join("tokenizer.json"),
-        )?);
+        self.prepare_tokenizer()?;
+        let start = Instant::now();
         self.text = Some(self.session(
             "onnx/model.onnx",
             &[
@@ -349,6 +606,7 @@ impl NativeRuntime {
             ],
             &["last_hidden_state", "sentence_embedding"],
         )?);
+        self.loads[0].record(start.elapsed());
         Ok(())
     }
 
@@ -525,9 +783,6 @@ impl NativeRuntime {
             .context("Model returned no video embedding")
     }
 
-    pub fn model_dir(&self) -> &Path {
-        &self.model_dir
-    }
     pub fn assets_present(&self) -> bool {
         let manifest: Manifest =
             match serde_json::from_str(include_str!("../models/embeddinggemma2.json")) {
@@ -541,9 +796,50 @@ impl NativeRuntime {
     }
 }
 
-impl Embedder for NativeRuntime {
+impl Resources for RuntimeSessions {
+    fn loaded(&self) -> [bool; 3] {
+        [
+            self.text.is_some(),
+            self.vision.is_some(),
+            self.audio.is_some(),
+        ]
+    }
+
+    fn release(&mut self, modality: usize) {
+        let name = match modality {
+            0 => {
+                drop(self.text.take());
+                "text"
+            }
+            1 => {
+                drop(self.vision.take());
+                "vision"
+            }
+            2 => {
+                drop(self.audio.take());
+                "audio"
+            }
+            _ => unreachable!("Unknown model modality"),
+        };
+        // Reload reopens model files. Revalidate pinned hashes rather than
+        // trusting bytes that may have changed while the session was absent.
+        self.verified = false;
+        self.loads[modality].releases += 1;
+        eprintln!(
+            "[Model] Released idle {name} session provider={} device={:?}",
+            self.provider.name(),
+            self.provider.device_id()
+        );
+    }
+
+    fn release_enabled(&self) -> bool {
+        self.profiling_directory.is_none()
+    }
+}
+
+impl Embedder for RuntimeSessions {
     fn embed_images(&mut self, images: &[image::RgbImage]) -> Result<Vec<Vec<f32>>> {
-        NativeRuntime::embed_images(self, images)
+        RuntimeSessions::embed_images(self, images)
     }
     fn embed_image(&mut self, image: &image::RgbImage) -> Result<Vec<f32>> {
         self.embed_images(std::slice::from_ref(image))?
@@ -552,13 +848,13 @@ impl Embedder for NativeRuntime {
             .context("Vision returned no embedding")
     }
     fn embed_document(&mut self, title: &str, text: &str) -> Result<Vec<f32>> {
-        NativeRuntime::embed_document(self, title, text)
+        RuntimeSessions::embed_document(self, title, text)
     }
     fn embed_audio(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
-        NativeRuntime::embed_audio(self, samples)
+        RuntimeSessions::embed_audio(self, samples)
     }
     fn embed_video(&mut self, frames: &[image::RgbImage]) -> Result<Vec<f32>> {
-        NativeRuntime::embed_video(self, frames)
+        RuntimeSessions::embed_video(self, frames)
     }
     fn embed_text(&mut self, query: &str) -> Result<Vec<f32>> {
         ensure!(!query.trim().is_empty(), "Search query must not be empty");
@@ -591,6 +887,48 @@ impl Embedder for NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_configuration_and_diagnostics_do_not_load_models() {
+        let runtime = NativeRuntime::new(PathBuf::from("/missing-model-assets"), 1).unwrap();
+        let initial = runtime.diagnostics().unwrap();
+        assert!(!initial.text.loaded && !initial.vision.loaded && !initial.audio.loaded);
+        assert_eq!(initial.text.idle_timeout_seconds, Some(900.0));
+        assert_eq!(initial.vision.idle_timeout_seconds, Some(300.0));
+        assert_eq!(initial.audio.idle_timeout_seconds, Some(300.0));
+        assert_eq!(initial.text.load_count, 0);
+        assert_eq!(initial.text.last_reload_duration_ms, None);
+        runtime
+            .set_idle_policy(RuntimeIdlePolicy::KEEP_WARM)
+            .unwrap();
+        assert_eq!(runtime.idle_policy().unwrap(), RuntimeIdlePolicy::KEEP_WARM);
+        assert_eq!(
+            runtime.diagnostics().unwrap().text.idle_timeout_seconds,
+            None
+        );
+        assert!(!runtime.loaded());
+        let error = runtime
+            .document_token_count("title", "passage")
+            .unwrap_err();
+        assert!(error.to_string().contains("tokenizer.json"));
+        assert!(!runtime.loaded());
+    }
+
+    #[test]
+    fn reload_diagnostics_distinguish_first_load_and_reload() {
+        let mut load = SessionLoad::default();
+        load.record(Duration::from_millis(12));
+        assert_eq!(load.count, 1);
+        assert_eq!(load.last_reload_duration, None);
+        load.releases += 1;
+        load.record(Duration::from_millis(7));
+        let diagnostic = load.diagnostics(true, IdlePolicy::KeepWarm, None, Instant::now());
+        assert_eq!(diagnostic.load_count, 2);
+        assert_eq!(diagnostic.release_count, 1);
+        assert_eq!(diagnostic.last_load_duration_ms, Some(7.0));
+        assert_eq!(diagnostic.last_reload_duration_ms, Some(7.0));
+        assert!(serde_json::to_value(diagnostic).unwrap()["lastReloadDurationMs"].is_number());
+    }
 
     #[test]
     fn absent_modalities_have_real_zero_row_tensors_without_model_weights() {
@@ -736,5 +1074,22 @@ mod tests {
             ExecutionProvider::Cuda { device_id: 0 }
         )
         .is_err());
+    }
+    #[test]
+    fn released_sessions_require_asset_reverification_before_reload() {
+        let mut sessions = RuntimeSessions::with_provider(
+            PathBuf::from("/missing-model-assets"),
+            1,
+            ExecutionProvider::Cpu,
+        )
+        .unwrap();
+        sessions.verified = true;
+        owner::Resources::release(&mut sessions, 0);
+        assert!(!sessions.verified);
+        assert!(sessions
+            .prepare_text()
+            .unwrap_err()
+            .to_string()
+            .contains("Missing EmbeddingGemma 2 asset"));
     }
 }
