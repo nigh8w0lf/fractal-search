@@ -46,6 +46,8 @@ From this repository's root:
 
 Omit `--dev` for a release build. First-run **Set up model**, also available under Settings → Performance, downloads and verifies the pinned assets (about 2.96 GB). **Choose folder** selects an existing verified model cache. Do not download models just to run metadata checks.
 
+Development builds optimize the native core's image/preprocessing loops at level 3 while retaining the app's development profile and level-2 dependency optimization. CPU/CUDA inference fetches only the sentence embedding; CUDA's CPU worker pools sleep while waiting for work instead of spinning. These changes retain the pinned FP32 vectors and catalog contract. The [synthetic indexing benchmark](quickshell-app/README.md#synthetic-indexing-benchmark) records scan timings, CPU usage and search-score parity between binaries.
+
 Open an existing installation without building or touching the checkout:
 
 ```bash
@@ -69,6 +71,8 @@ scripts/package-fractal-search.sh --dev --no-build --cuda --output /absolute/new
 ```
 
 Output directories must not already exist. `--no-build` packages all three existing binaries and checks their CPU/CUDA capability; it does not rebuild them. Install with the bundle's `install.sh`. UI and backend must be installed together. Updates drain the backend before swapping files; preserve its previous active state when using the installer directly. The repository launcher summons it afterwards.
+
+After a successful install, obsolete runtime builds are removed automatically. The current and immediately previous builds are retained, including across reinstalls; builds still running or containing the configured CUDA library directory are retained until a later update. Failed installs do not prune builds. Cleanup is limited to recognized runtime bundle directories and preserves catalogs, models, shared CUDA libraries and unrelated files. Cleanup errors are reported without rolling back the successful installation.
 
 ## Architecture and source map
 
@@ -129,7 +133,7 @@ A source edit is not an installed update: rebuild/package/install to change the 
 
 ## Validation and further reading
 
-[AGENTS.md](AGENTS.md) contains runnable checks and task-specific validation guidance. The native UI smoke uses a private nested compositor, temporary catalogs and synthetic photos. Shared-desktop keyboard/mouse automation is prohibited.
+[AGENTS.md](AGENTS.md) contains runnable checks and task-specific validation guidance. The native UI smoke uses a private nested compositor, temporary catalogs and synthetic media to check filters, typed queries, settings, safe restart and viewer resummoning. Shared-desktop keyboard/mouse automation is prohibited.
 
 - [Detailed plugin usage and historical validation](quickshell-app/README.md)
 - [CUDA runtime requirements and real-inference validation](quickshell-app/CUDA.md)

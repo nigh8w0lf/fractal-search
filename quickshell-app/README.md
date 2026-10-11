@@ -53,6 +53,10 @@ Use **Set up model** on first open to download the pinned assets (~2.96 GB) with
 
 `--model-dir PATH` and `--threads N` can configure a development installation. CPU is the default; the thread default is half the available logical CPUs, rounded up and capped at six. Providers are never silently selected. The installed service prepares the text-search model in the background on startup; the vision and audio models load only when indexing needs them. Loaded models remain resident while the backend runs. Standalone developer commands retain lazy loading unless passed `--warm-search`.
 
+The development build optimizes native core loops at level 3, with dependency optimization remaining at level 2. Inference requests only the sentence embedding, avoiding the unused backbone token output. CUDA's CPU worker pools sleep while waiting for work; CPU threading stays unchanged. The [synthetic indexing benchmark](#synthetic-indexing-benchmark) compares scan timings, CPU usage and search scores using temporary data.
+
+After a successful install, obsolete runtime builds are removed automatically. The current and immediately previous builds are retained, including across reinstalls; builds still running or containing the configured CUDA library directory are retained until a later update. Failed installs do not prune builds. Cleanup is limited to recognized runtime bundle directories and preserves catalogs, models, shared CUDA libraries and unrelated files. Cleanup errors are reported without rolling back the successful installation.
+
 ### CUDA acceleration and diagnostics
 
 Performance also offers **Image batch size**, from 1 to 8 with a default of 1, for both CPU and CUDA indexing. Saving it prompts **Restart now** or **Later**; the current worker keeps its active size until restart, and a pending change remains visible. Restart now safely drains indexing, preserves completed files and reconnects without closing the desktop shell. Larger batches use more memory; consecutive images share inference with the same fixed preprocessing budget, preserving each image's embedding and the catalog profile. Skipped/unchanged files and batch tails can produce smaller batches. Inference failures stay fatal without batch-size or provider retries.
@@ -179,7 +183,7 @@ cargo run -p fractal-search-core --example validate_embeddinggemma2 -- \
 
 The example uses real image decoding/tokenization and requires cosine similarity of at least 0.9999 against the reference. Reference fixtures can be generated with the optional Python development tool described in the [model guide](../docs/MODELS.md). Python is not required to run the plugin.
 
-The [embedding validation](../docs/MODELS.md#validation) describes checks against the pinned export. Historical prior-model fixture results do not validate this replacement. Report numerical parity and retrieval measurements only after running the current checks; they are not a labeled-library relevance benchmark.
+The [embedding validation](../docs/MODELS.md#providers-and-validation) describes checks against the pinned export. Historical prior-model fixture results do not validate this replacement. Report numerical parity and retrieval measurements only after running the current checks; they are not a labeled-library relevance benchmark.
 
 Run the opt-in backend integration/lifecycle smoke check with a built binary and pinned model cache:
 
@@ -190,6 +194,28 @@ python3 quickshell-app/tests/smoke_backend.py \
 ```
 
 Omit `--fixtures` to use generated PNG inputs and the small synthetic corrupt-JPEG fixture only. Its hexadecimal text is decoded into the temporary test directory; no image fixture is tracked in Git. The script tests indexing, search pagination, preview dimensions, incremental rescans, missing-thumbnail repair, corrupt-file continuation and repair (including a JPEG extraneous-byte warning), saved preferences, folder-filtered ranking, source removal, native file-change watching, strict requests, cancellation, catalog locking, shutdown/reopen and EOF drain. All runtime catalogs and images are created under `/tmp` and removed afterward.
+
+#### Synthetic indexing benchmark
+
+`benchmark_indexing.py` warms the models with two tiny generated images, then times a scan of eight patterned 1024×1536 PNG images at batch size 2. It records wall time, process CPU time, images per second and decode/preparation/inference/store timings in `report.json`, with `backend.log` alongside it. Three queries compare 24 image-search scores; this is a synthetic indexing and score-parity check, not a labeled relevance benchmark.
+
+Run sequentially with compilation and other inference paused, using the same verified model cache and provider environment for both binaries. Each output directory must be new. For CUDA development binaries:
+
+```bash
+env FRACTAL_SEARCH_PROVIDER=cuda FRACTAL_SEARCH_DEVICE_ID=0 \
+  LD_LIBRARY_PATH=/absolute/path/to/cuda-libraries:"$PWD/target/debug" \
+  python3 quickshell-app/tests/benchmark_indexing.py \
+  /absolute/path/to/previous/fractal-search /absolute/path/to/models \
+  /tmp/fractal-indexing-before
+
+env FRACTAL_SEARCH_PROVIDER=cuda FRACTAL_SEARCH_DEVICE_ID=0 \
+  LD_LIBRARY_PATH=/absolute/path/to/cuda-libraries:"$PWD/target/debug" \
+  python3 quickshell-app/tests/benchmark_indexing.py \
+  target/debug/fractal-search /absolute/path/to/models \
+  /tmp/fractal-indexing-after --compare /tmp/fractal-indexing-before/report.json
+```
+
+For CPU, set `FRACTAL_SEARCH_PROVIDER=cpu`, leave `FRACTAL_SEARCH_DEVICE_ID` unset and use a binary with its required runtime libraries available. The comparison rejects changes in provider/device, runtime threads, batch size, image count/dimensions, CPU affinity or nice level, and requires maximum search-score error at most `1e-4`. It records affinity/nice without changing them and uses a temporary catalog, leaving the installed library untouched. One warmed scan does not establish sustained indexing performance; compiler/build differences between binaries must also be reported.
 
 #### Fresh reconstructed-source validation (2026-10-07)
 
@@ -206,7 +232,44 @@ The cloud workspace used Rust 1.99 and CPU ONNX Runtime 1.22.0. Validation-only 
 
 A separate initial five-image indexing request exceeded the generic 60-second metadata deadline while progressing normally. Only that long-running request now uses the retrieval comparator's bounded 300-second async wait. Every assertion and all other metadata/cancellation deadlines remain unchanged; the full lifecycle rerun passed.
 
-Native Quickshell/Omarchy rendering/input, actual CUDA hardware/provider placement, GPU-ready packaging, full batch-eight inference, release performance and large-corpus relevance/storage/latency remain unverified. CUDA-feature checks used CPU ORT; Node/static checks are not render tests. Synthetic parity compares HF preprocessing plus the pinned ONNX export, not the original Google training checkpoint or a labeled relevance benchmark.
+At this cloud checkpoint, native Quickshell/Omarchy rendering/input, actual CUDA hardware/provider placement, GPU-ready packaging, full batch-eight inference, release performance and large-corpus relevance/storage/latency were unverified. CUDA-feature checks used CPU ORT; Node/static checks are not render tests. Synthetic parity compares HF preprocessing plus the pinned ONNX export, not the original Google training checkpoint or a labeled relevance benchmark.
+
+#### Predator native and CUDA validation (2026-10-07)
+
+Local `main` fast-forwarded to merge `317e39a`; PR #1 head `121acbf` was verified as an ancestor. All checks used synthetic temporary catalogs. The installed previous-model plugin, its data, CUDA configuration and desktop processes were preserved. The eleven pinned assets (2,960,874,003 bytes) were downloaded with explicit approval, individually size/SHA-256 verified and saved to the persistent `~/.cache/fractal-search/models/embeddinggemma2-daa72c51` cache.
+
+- CUDA-feature binaries built with the locked dependency set. Formatting and the full CUDA-feature workspace suite passed **108 tests**, with three ignored by default. The real FFmpeg segmentation and pinned-tokenizer ignored tests passed separately. The Unix-socket test that was blocked in the cloud passed with host socket access
+- `validate_cuda` passed twelve real CPU/CUDA comparisons across all four modalities; minimum cosine `0.9999999999971763`, maximum component error `2.94e-7`. Actual profiles verified CUDA matrix/attention execution in the vision encoder, audio encoder and shared backbone, with zero CPU matrix/attention events. CUDA daemon indexing/search and invalid-device rejection without CPU retry passed. See [CUDA.md](CUDA.md#embeddinggemma-2-hardware-validation-on-predator-2026-10-07) for evidence and resource constraints
+- The full opt-in batching test passed CPU sizes 1–8 for both geometry groups. CUDA passed sizes 1–3 in the tiny/elongated group and failed at size 4 while allocating a 2,537,256,960-byte attention buffer on the 8 GiB GPU. CUDA sizes 5–8 and the second geometry group were not reached; no smaller-batch or CPU retry occurred
+- QML lint, model-free multimodal/accelerator UI checks, the Controller hybrid regression and all six diagnostics UI cases passed. Private-bus Rust picker checks passed cancellation/Close, Unicode, early responses, invalid replies and missing/disconnected portal cases
+- Native Hyprland/Quickshell rendering and QtTest input passed empty/error/loading states, actual CUDA-backed image/text/audio/video indexing, all media/folder filters, repeated typed hybrid queries, navigation, narrow results/settings, tabs/toggles, diagnostic display, batch-setting Later/restart handling and retained-query reconnect. Sixteen actual `imv` viewer close/resummon cycles passed with both hide settings, maximum 0.150 seconds. Missing-original errors and clean stop passed. Captures/logs remain in `/tmp/fsr-lc0asnio/`. File-manager reveal used a command fixture that verifies dispatch
+- One targeted real CUDA socket pass at explicitly selected batch size 1 verified detach/reconnect during indexing, request-ID reuse, retained skipped-file reporting and search. Cancellation completed the in-flight inference, preserved stable IDs and did not prune an unvisited missing asset. SIGTERM drained normally; reopening and explicit clean shutdown passed. Report/logs remain in `/tmp/fractal-predator-daemon-lifecycle-20261007b/`. Model-free socket checks also covered permissions, exclusive clients, strict requests, all empty media scopes, repeated missing-model errors and reopen
+
+The native harness now waits for configured compositor output geometry, checks loading synchronously on admission so a fast CUDA query cannot race the assertion, uses a bounded 60-second cold-query wait after restart and checks the current missing-media error. It also exercises mixed-media selectors and repeated native typing. These are test-harness corrections and coverage changes; production QML/Rust was not changed.
+
+GPU-ready packaging, an update of the installed plugin, physical launcher-key/native desktop-picker/real file-manager interactions, release performance and large-corpus relevance/storage/latency were not tested. The native checks run in an isolated compositor and do not inject shared-desktop input. CUDA batch-eight inference remains blocked by the observed allocation failure.
+
+#### Development optimization validation (2026-10-08)
+
+The current development changes optimize `fractal-search-core` at level 3, fetch only `sentence_embedding` from the validated backbone, and disable CUDA-session CPU worker spinning. The pinned FP32 model/profile, preprocessing budgets, CPU threading and failure/cancellation contracts are unchanged.
+
+Formatting passed. `cargo test --workspace --locked --offline --jobs 1` passed **108 tests**, with zero failures and three ignored: two picker, 19 backend, three MCP and 84 core tests, including the host Unix-socket test. The successful log is `/tmp/fractal-search-quickwins-test-cpu-agent-retry.log`. Compilation retained unrestricted CPU affinity; the Cargo job limit controlled concurrent linking after an earlier linker received SIGKILL before tests ran (`/tmp/fractal-search-quickwins-test-cpu-agent.log`). The cause of that termination was not established.
+
+`cargo check --workspace --locked --offline --features cuda --jobs 12` also passed (`/tmp/fractal-search-quickwins-check-cuda-agent.log`). The CUDA-feature workspace test suite passed the same **108 tests**, with zero failures and three ignored, using `cargo test --workspace --locked --offline --features cuda --jobs 1`; its final confirmation log and exit-zero record are `/tmp/fractal-search-quickwins-test-cuda-agent-confirmed.log` and `/tmp/fractal-search-quickwins-test-cuda-agent-confirmed.exit`.
+
+The CUDA binaries and `validate_cuda` example built together (`/tmp/fractal-search-quickwins-build-cuda-agent.log`). Both desktop and MCP capability commands reported compiled CPU/CUDA support. Post-update dependency diagnostics passed all nine required libraries on driver 610.57.04/device 0 (`/tmp/fractal-search-quickwins-providers.json`). Real `validate_cuda` inference then passed twelve CPU/CUDA embedding comparisons across images, mixed-shape batches, queries, documents, audio and video: minimum cosine `0.9999999999971763`, maximum component error `2.94e-7`. Profiles verified CUDA matrix/attention execution in all three graphs with zero CPU matrix/attention events. The report and six profiles are in `/tmp/fractal-search-quickwins-parity-20261008/`; see [CUDA evidence](CUDA.md#development-optimization-validation-2026-10-08).
+
+The real CUDA daemon smoke passed provider forwarding, indexing/search, model-directory provider retention, invalid-device rejection without CPU retry and clean shutdown (`/tmp/fractal-search-quickwins-smoke-cuda.log`). The hardware runner completed successfully and resumed the previously installed service; its state record is `/tmp/fractal-search-quickwins-hardware-state.json`. Full CUDA batch sizes 1–8 were not rerun; the earlier batch-four allocation failure remains historical evidence, not a fresh pass.
+
+The synthetic indexing A/B comparison passed with **24 identical search scores** (maximum error zero). Both runs used CUDA device 0, six runtime threads, batch size 2 and eight 1024×1536 images, with affinity to logical CPUs 10 and 11 and nice level 10, without concurrent compilation.
+
+| Measurement | Installed baseline | Updated development binary |
+| --- | ---: | ---: |
+| Eight-image scan wall time | 7.119 seconds | 5.130 seconds |
+| Process CPU time | 9.56 seconds | 5.18 seconds |
+| Throughput | 1.124 images/second | 1.559 images/second |
+
+This single comparison observed 38.77% higher throughput and 45.82% lower CPU time. The installed baseline was built with Rust 1.98.1; the updated binary used Rust 1.99.0 after a host system update. The difference cannot be attributed entirely to the three source optimizations. Restricted benchmark affinity, a single warmed synthetic scan and an optimized development build do not establish unrestricted desktop, release or large-library performance. Reports/logs are under `/tmp/fractal-search-quickwins-before-valid-20261008/` and `/tmp/fractal-search-quickwins-after-20261008/`; the baseline's original report is preserved as `report.original.json` before adding device-0 invocation metadata.
 
 ## Historical validation before the model replacement
 
@@ -256,13 +319,13 @@ Automated keyboard/mouse tests must run in an isolated compositor. Do not inject
 
 The hide-after-open path hides the overlay directly; it lowers the panel only when the preference keeps it visible. Summoning restores the overlay layer before mapping its native window, avoiding a hide/remap race with the external-viewer layer change.
 
-Run the viewer/resummon regression in a private nested Hyprland session (requires `imv`, `grim`, Quickshell and host compositor/GPU access):
+Run the viewer/resummon regression in a private nested Hyprland session (requires Hyprland/`hyprctl`, `imv`, `grim`, Quickshell with QtTest, FFmpeg/ffprobe and host compositor/GPU access):
 
 ```bash
 python3 quickshell-app/tests/smoke_resummon.py target/debug/fractal-search /absolute/path/to/models
 ```
 
-It uses a private session bus, synthetic images and a temporary catalog, tests both checkbox states with 16 actual viewer open/close cycles, and checks empty/loading/search/preview states, missing-original errors and clean shutdown. Artifacts and a compositor capture remain in the printed `/tmp/fsr-*` directory. On 2026-10-02 the corrected panel regained visibility and focus within 0.151 seconds in these checks; the reported 10–15 second delay was not reproduced in the isolated baseline, so physical Super+I verification remains necessary.
+It waits for configured output geometry, uses a private session bus, synthetic images/text/audio/video and a temporary catalog, tests both checkbox states with 16 actual viewer open/close cycles, and checks media/folder selectors, repeated typed hybrid queries, narrow results/settings, safe batch-setting restart, empty/loading/search/preview states, missing-original errors and clean shutdown. Cold retained-query checks have the same bounded 60-second deadline as initial search. Artifacts and compositor captures remain in the printed `/tmp/fsr-*` directory. On 2026-10-02 the corrected panel regained visibility and focus within 0.151 seconds in these checks; the reported 10–15 second delay was not reproduced in the isolated baseline, so physical Super+I verification remains necessary.
 
 ## CUDA, diagnostics and MCP validation (2026-10-02)
 

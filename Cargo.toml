@@ -8,6 +8,11 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
 
+# Keep native resize/patch/thumbnail loops optimized in desktop development
+# builds without rebuilding the database dependencies as a release profile.
+[profile.dev.package.fractal-search-core]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = "thin"

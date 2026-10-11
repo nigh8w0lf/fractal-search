@@ -5,6 +5,7 @@ use ort::{
     execution_providers::CPUExecutionProvider,
     session::{
         builder::{GraphOptimizationLevel, SessionBuilder},
+        run_options::{OutputSelector, RunOptions},
         Session,
     },
     value::Tensor,
@@ -241,6 +242,11 @@ impl NativeRuntime {
                     use ort::execution_providers::CUDAExecutionProvider;
                     // TF32 changes FP32 precision on Ampere and newer GPUs. Keep
                     // the existing catalog profile's precision on every GPU.
+                    // CPU shape/control work still runs in a CUDA session, but
+                    // its worker pools must sleep while waiting for GPU work.
+                    let builder = builder
+                        .with_intra_op_spinning(false)?
+                        .with_inter_op_spinning(false)?;
                     Ok(builder.with_execution_providers([
                         CUDAExecutionProvider::default()
                             .with_device_id(device_id)
@@ -389,14 +395,21 @@ impl NativeRuntime {
         let ids = Tensor::from_array(([batch, sequence], inputs.input_ids.into_boxed_slice()))?;
         let mask =
             Tensor::from_array(([batch, sequence], inputs.attention_mask.into_boxed_slice()))?;
+        // Fetch only the retrieval vector. Returning last_hidden_state would
+        // copy the unused token matrix back to CPU on every CUDA inference.
+        let options = RunOptions::new()?
+            .with_outputs(OutputSelector::no_default().with("sentence_embedding"));
         let outputs = self
             .text
             .as_mut()
             .context("Text session not initialized")?
-            .run(ort::inputs![
-                "input_ids" => ids, "attention_mask" => mask, "image_features" => images,
-                "video_features" => video, "audio_features" => audio
-            ])?;
+            .run_with_options(
+                ort::inputs![
+                    "input_ids" => ids, "attention_mask" => mask, "image_features" => images,
+                    "video_features" => video, "audio_features" => audio
+                ],
+                &options,
+            )?;
         let (shape, values) = outputs["sentence_embedding"].try_extract_tensor::<f32>()?;
         ensure!(
             shape.as_ref() == [batch as i64, EMBEDDING_DIM as i64],

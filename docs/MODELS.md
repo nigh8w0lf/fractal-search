@@ -30,6 +30,8 @@ The export declares Apache-2.0. Preserve applicable licenses and attribution whe
 
 The shared graph takes int64 `input_ids`/`attention_mask` and float32 image/video/audio feature matrices with 512 columns. Absent modalities still receive real empty `[0, 512]` tensors. Use `sentence_embedding`, which already includes projection, masked mean pooling and normalization. `last_hidden_state` is not the current retrieval representation. Video features go to `video_features`, not `image_features`.
 
+The runtime validates both declared backbone outputs, then selects only `sentence_embedding` for each inference call. It does not fetch the unused `last_hidden_state` token matrix to host memory. CUDA sessions disable CPU worker-pool spinning; CPU sessions retain their existing threading behavior. Neither optimization changes preprocessing, precision, output normalization or the catalog profile.
+
 ### Queries and documents
 
 Queries automatically receive `task: search result | query: `. Documents receive `title: {filename} | text: {passage}`, with `none` for an empty title. Users enter ordinary text without manually supplying prefixes. Tokenization preserves case/Unicode and inserts BOS/EOS from the pinned template. Literal strings such as `<|image|>` in text are treated as text content, not missing media features.
@@ -71,3 +73,5 @@ python3 quickshell-app/tests/compare_embeddinggemma2_retrieval.py \
 For metadata-only preprocessing validation, pass `--preprocess-only` to both generator and validator and provide the five pinned metadata/tokenizer JSON files. HF reference libraries are still required; no weights or inference are used. Use `--max-image-batch` to bound full reference inference memory.
 
 The validator checks tokens, masks, patches and feature tensors, then requires embedding cosine at least 0.9999. The retrieval comparator requires score error at most `1e-4`. These are acceptance thresholds, not claims of unrun checks. Synthetic parity does not establish labeled-library relevance, large-corpus latency, GPU memory use or batch-eight inference. Previous results do not validate reconstructed source; rerun checks against the current tree and record actual limitations.
+
+The optimized development runtime's [2026-10-08 CPU/CUDA validation](../quickshell-app/CUDA.md#development-optimization-validation-2026-10-08) passed twelve embedding comparisons across all four modalities and verified CUDA matrix/attention execution in all three graphs. The separate [synthetic indexing comparison](../quickshell-app/README.md#development-optimization-validation-2026-10-08) retained 24 identical search scores. Those reports retain their workload/compiler limitations; full CUDA batch-eight and labeled relevance were not established.

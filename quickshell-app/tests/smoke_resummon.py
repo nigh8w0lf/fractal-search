@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Open/close real viewers and resummon in a private nested Hyprland session.
 
-Requires Hyprland, Quickshell, imv, grim, pinned models and host GPU/socket access.
-Only synthetic photos and a temporary catalog are used; no shared desktop input.
+Requires Hyprland, hyprctl, Quickshell, imv, grim, FFmpeg, pinned models and host
+GPU/socket access. Only synthetic media and a temporary catalog are used; no
+shared desktop input.
 """
 import argparse
 import json
@@ -23,7 +24,7 @@ def main():
     parser.add_argument('binary', type=Path)
     parser.add_argument('models', type=Path)
     args = parser.parse_args()
-    for command in ['Hyprland', 'quickshell', 'imv', 'grim', 'dbus-daemon']:
+    for command in ['Hyprland', 'hyprctl', 'quickshell', 'imv', 'grim', 'dbus-daemon', 'ffmpeg', 'ffprobe']:
         assert shutil.which(command), f'Missing test dependency: {command}'
     # Hyprland appends its build hash and timestamp to Unix socket paths.
     root = Path(tempfile.mkdtemp(prefix='fsr-', dir='/tmp'))
@@ -70,6 +71,19 @@ hl.config({input={follow_mouse=0},animations={enabled=false},misc={disable_hyprl
         env['WAYLAND_DISPLAY'] = sockets[0].name.removesuffix('.lock')
         signatures = list((runtime / 'hypr').iterdir()); assert len(signatures) == 1
         env['HYPRLAND_INSTANCE_SIGNATURE'] = signatures[0].name
+        # The socket can appear before the nested output is configured. Starting
+        # Qt then creates a placeholder screen and can strand the layer surface
+        # at its provisional size, so wait for actual compositor output geometry.
+        deadline = time.monotonic() + 15
+        while True:
+            assert compositor.poll() is None, (root / 'hyprland.log').read_text()
+            probe = subprocess.run(['hyprctl', '-j', 'monitors'], env=env,
+                                   capture_output=True, text=True, timeout=3)
+            monitors = json.loads(probe.stdout) if probe.returncode == 0 else []
+            if any(monitor.get('width', 0) > 0 and monitor.get('height', 0) > 0 for monitor in monitors):
+                break
+            assert time.monotonic() < deadline, 'Nested compositor has no configured output'
+            time.sleep(.05)
         # Activated desktop services must inherit the private compositor too.
         bus = subprocess.Popen(['dbus-daemon', '--session', '--nofork', '--print-address'],
                                env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -128,6 +142,24 @@ while not (root / 'restart.complete').exists():
         panel_source.write_text(panel_source.read_text().replace('import QtQuick\n', 'import QtQuick\nimport QtTest\n').replace('id: panel', 'id: panel; TestCase { id: input; when: false }', 1).replace('ResultActions {', 'ResultActions { id: previewTestActions', 1).replace(
             'function refreshDiagnostics()',
             'function scrollSettings(amount: real): void { settingsPage.testScroll.contentItem.contentY = amount; }\n        function clickTab(name: string): void { const button = input.findChild(settingsPage, name); if (!button) throw new Error("Missing tab " + name); input.mouseClick(button); }\n        function clickOpen(): void { const button = input.findChild(previewTestActions, "openImageButton"); if (!button) throw new Error("Missing open action"); input.mouseClick(button); }\n        function tabKey(key: int): void { input.keyClick(key); }\n        function clickReveal(): void { input.mouseClick(input.findChild(previewTestActions, "revealImageButton")); }\n        function toggleWatch(): void { input.mouseClick(input.findChild(settingsPage, "watchChangesToggle")); }\n        function chooseImageBatch(size: int): void { const choice = input.findChild(settingsPage, "imageBatchSizeChoice"); if (!choice) throw new Error("Missing image batch size"); input.mouseClick(choice); input.keyClick(Qt.Key_Home); for (let n = 1; n < size; ++n) input.keyClick(Qt.Key_Down); input.keyClick(Qt.Key_Return); }\n        function clickRestartNow(): void { input.mouseClick(restartDialog.confirmButton); }\n        function refreshDiagnostics()'))
+        panel_source.write_text(panel_source.read_text().replace('query: app.query,', 'query: app.query, mediaKind: app.mediaKind, previewText: app.previewText(),').replace('function refreshDiagnostics()', '''function chooseFilter(name: string, index: int): void {
+            const choice = input.findChild(canvas, name);
+            if (!choice) throw new Error("Missing filter " + name);
+            input.mouseClick(choice); input.keyClick(Qt.Key_Home);
+            for (let n = 0; n < index; ++n) input.keyClick(Qt.Key_Down);
+            input.keyClick(Qt.Key_Return);
+        }
+        function typeQuery(text: string): void {
+            searchField.forceActiveFocus(); input.keyClick(Qt.Key_A, Qt.ControlModifier);
+            if (!text.length) input.keyClick(Qt.Key_Backspace);
+            for (let n = 0; n < text.length; ++n) input.keyClick(text.charAt(n));
+            input.keyClick(Qt.Key_Return);
+        }
+        function queryAndLoading(text: string): bool {
+            app.search(text);
+            return app.loading;
+        }
+        function refreshDiagnostics()'''))
         # An opaque desktop window exercises remapping above another app.
         shell = ui / 'shell.qml'
         shell.write_text(shell.read_text().replace('ShellRoot {', '''ShellRoot {
@@ -153,7 +185,7 @@ with (root / 'viewer.log').open('a') as log:
         def call(target, method, *arguments):
             result = subprocess.run(['quickshell', 'ipc', '--path', str(ui), 'call', '--', target, method, *arguments],
                                     env=env, text=True, capture_output=True, timeout=3)
-            assert result.returncode == 0, result.stderr + (root / 'ui.log').read_text()
+            assert result.returncode == 0 and not result.stdout.startswith(('Too many arguments', 'Not enough arguments', 'No such')), result.stdout + result.stderr + (root / 'ui.log').read_text()
             return result.stdout.strip()
 
         def wait(predicate, timeout=10):
@@ -181,8 +213,9 @@ with (root / 'viewer.log').open('a') as log:
         call('test', 'index', str(photos))
         wait(lambda s: s['indexing'], timeout=10)
         wait(lambda s: not s['indexing'] and s['assetCount'] == 2, timeout=60)
-        call('search', 'query', 'red image')
-        wait(lambda s: s['loading'])
+        # Observe admission synchronously: a warmed GPU query can complete
+        # before the next separate IPC snapshot reaches the main QML thread.
+        assert call('test', 'queryAndLoading', 'red image') == 'true'
         wait(lambda s: not s['loading'] and s['count'] == 2 and bool(s['previewUrl']), timeout=60)
 
         call('test', 'acknowledge')
@@ -262,7 +295,9 @@ with (root / 'viewer.log').open('a') as log:
         backend, client, socket, log = launch(args.binary.resolve(), args.models.resolve(), backend_root, env)
         children.append(backend); logs.append(log); client.close()
         (root / 'restart.complete').touch()
-        restarted = wait(lambda s: s['ready'] and not s['loading'] and s['activeImageBatchSize'] == 4 and not s['batchRestartRequired'])
+        # Reconnection retains the query, which can load the new model before
+        # results return. Use the same bounded cold-search deadline as above.
+        restarted = wait(lambda s: s['ready'] and not s['loading'] and s['activeImageBatchSize'] == 4 and not s['batchRestartRequired'], timeout=60)
         assert restarted['assetCount'] == 2 and restarted['visible']
         call('test', 'manageTestService', 'false')
         call('test', 'resize', '0', '0')
@@ -291,11 +326,51 @@ with (root / 'viewer.log').open('a') as log:
                 wait(lambda s: s['visible'] and s['panelVisible'] and s['active'], timeout=2)
                 latencies.append(time.monotonic() - started)
             print(f'8 viewer cycles passed with hide={hide}; maximum summon time {max(latencies):.3f}s', flush=True)
+
+        media = root / 'media'; media.mkdir()
+        (media / 'notes.md').write_text('A red bicycle beside the cafe. Exact identifier QX42.', encoding='utf-8')
+        subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
+                        'sine=frequency=440:sample_rate=16000:duration=1', str(media / 'tone.wav')],
+                       check=True, capture_output=True, timeout=30)
+        subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
+                        'color=c=blue:s=96x64:r=2:d=1', '-an', '-c:v', 'mpeg4', str(media / 'clip.mp4')],
+                       check=True, capture_output=True, timeout=30)
+        call('test', 'index', str(media))
+        wait(lambda s: not s['indexing'] and s['assetCount'] == 5 and s['fileCount'] == 5, timeout=180)
+        call('test', 'browse')
+        all_media = wait(lambda s: not s['loading'] and s['count'] == 5)
+        for index, kind, count in [(1, 'image', 2), (2, 'text', 1), (3, 'audio', 1), (4, 'video', 1), (0, None, 5)]:
+            call('test', 'chooseFilter', 'mediaKindFilter', str(index))
+            state = wait(lambda s: not s['loading'] and s['mediaKind'] == kind and s['count'] == count)
+            if kind in ['text', 'audio']:
+                assert not state['previewUrl'] and state['previewText'], state
+            elif kind == 'video':
+                assert state['previewUrl'], state
+        media_source_index = 1 + next(index for index, source in enumerate(all_media['sources']) if source['directory'] == str(media))
+        call('test', 'chooseFilter', 'sourceFilter', str(media_source_index))
+        filtered = wait(lambda s: not s['loading'] and s['count'] == 3)
+        assert next(source for source in filtered['sources'] if source['id'] == filtered['sourceId'])['directory'] == str(media)
+        call('test', 'chooseFilter', 'mediaKindFilter', '2')
+        call('test', 'typeQuery', 'red bicycle')
+        call('test', 'typeQuery', 'QX42')
+        hybrid = wait(lambda s: not s['loading'] and s['activeQuery'] == 'QX42' and s['count'] == 1)
+        assert hybrid['selectedAsset']['hasHybridScore'], hybrid
+        call('test', 'resize', '480', '440')
+        time.sleep(.3)
+        subprocess.run(['grim', str(root / 'narrow-hybrid-text.png')], env=env, check=True, timeout=5)
+        call('test', 'chooseFilter', 'mediaKindFilter', '0')
+        call('test', 'chooseFilter', 'sourceFilter', '0')
+        call('test', 'typeQuery', '')
+        wait(lambda s: not s['loading'] and s['count'] == 5)
+        call('test', 'chooseFilter', 'mediaKindFilter', '1')
+        wait(lambda s: not s['loading'] and s['count'] == 2)
+        call('test', 'resize', '0', '0')
+        print('Real mixed-media indexing, all media/folder filters, repeated native typing, hybrid labels and narrow results passed', flush=True)
         call('test', 'browse')
         selected = wait(lambda s: not s['loading'] and not s['previewLoading'] and s['previewUrl'] and s['selectedAsset'])['selectedAsset']
         Path(selected['path']).unlink()
         call('test', 'clickOpen')
-        wait(lambda s: 'Original image is missing' in s['error'] and s['visible'])
+        wait(lambda s: 'Original media file is missing' in s['error'] and s['visible'])
         call('test', 'acknowledge')
         call('search', 'toggle')
         call('search', 'summon')

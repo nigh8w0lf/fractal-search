@@ -35,7 +35,7 @@ done
 for SEARCH_DIR in "$SEARCH_CONFIG_HOME" "$SEARCH_DATA_HOME" "$SEARCH_RUNTIME_DIR"; do
   [[ $SEARCH_DIR == /* && $SEARCH_DIR != *$'\n'* && $SEARCH_DIR != *$'\r'* ]] || { echo 'Install paths must be absolute single-line paths' >&2; exit 1; }
 done
-for SEARCH_TOOL in jq sha256sum systemctl curl; do
+for SEARCH_TOOL in jq sha256sum systemctl curl flock; do
   command -v "$SEARCH_TOOL" >/dev/null || { echo "Missing $SEARCH_TOOL. Install with: omarchy pkg add $SEARCH_TOOL" >&2; exit 1; }
 done
 for SEARCH_TOOL in ffmpeg ffprobe; do
@@ -72,6 +72,14 @@ if ((SEARCH_BIND_CLOSE)); then SEARCH_VERSION+="-close"; fi
 [[ ! -e $SEARCH_PLUGIN || -f $SEARCH_PLUGIN/.fractal-search-install ]] || { echo 'Refusing to overwrite an unmanaged fractal.search plugin' >&2; exit 1; }
 if [[ -e $SEARCH_UNIT ]] && ! awk '/^# Managed by Fractal Search installer$/ {found=1} END {exit !found}' "$SEARCH_UNIT"; then
   echo 'Refusing to overwrite an unmanaged search service' >&2; exit 1
+fi
+# Serialize updates and pruning before reading the installed configuration.
+mkdir -p -- "$SEARCH_RUNTIME"
+exec {SEARCH_INSTALL_LOCK}>"$SEARCH_RUNTIME/.install.lock"
+flock -n "$SEARCH_INSTALL_LOCK" || { echo 'Another Fractal Search install is running.' >&2; exit 1; }
+SEARCH_PREVIOUS=''
+if [[ -f $SEARCH_PLUGIN/.fractal-search-install ]]; then
+  SEARCH_PREVIOUS=$(cat -- "$SEARCH_PLUGIN/.fractal-search-install")
 fi
 SEARCH_RUNTIME_CONFIG="$SEARCH_PLUGIN/.fractal-search-runtime.json"
 if [[ -f $SEARCH_RUNTIME_CONFIG ]]; then
@@ -264,6 +272,11 @@ if ((!SEARCH_SKIP_SHELL)); then
   ((SEARCH_STABLE >= 6)) || { echo "The installed panel did not load. Check quickshell log for Omarchy; rolling back." >&2; exit 1; }
 fi
 SEARCH_DONE=1
+# Cleanup errors must not roll back a successfully installed plugin.
+"$SEARCH_BUNDLE/prune-runtimes.sh" "$SEARCH_RUNTIME" "$SEARCH_DEST" "$SEARCH_PREVIOUS" "$SEARCH_CUDA_LIB_DIR" || {
+  echo 'Installation succeeded, but old-build cleanup failed. Fix the reported error and rerun the installer.' >&2
+  exit 1
+}
 echo "Installed Fractal Search $SEARCH_VERSION"
 echo 'Open: omarchy-shell shell toggle fractal.search'
 echo 'Models: use Set up model on first open; verified cached files are reused.'

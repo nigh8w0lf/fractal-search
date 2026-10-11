@@ -90,13 +90,14 @@ python3 quickshell-app/tests/smoke_multimodal.py target/debug/fractal-search tar
 python3 quickshell-app/tests/smoke_installer.py /absolute/path/to/prebuilt/bundle
 ```
 
-The resummon check requires Hyprland, Quickshell with QtTest, imv, grim, dbus-daemon and host graphics/socket access. It creates a private nested compositor/session bus, indexes synthetic images, checks settings tabs/toggles and narrow layout, exercises Open file and a FileManager1 command fixture, and repeats viewer close/resummon with both checkbox states. Its fixture validates reveal dispatch, not a real file manager. See CUDA.md for real GPU checks and the scoped README for private-bus native-picker tests.
+The resummon check requires Hyprland, hyprctl, Quickshell with QtTest, imv, grim, dbus-daemon, ffmpeg/ffprobe and host graphics/socket access. It waits for configured output geometry in a private nested compositor/session bus, indexes synthetic images/text/audio/video, checks actual media/folder selectors and repeated typed hybrid queries, settings tabs/toggles and narrow layout, exercises Open file and a FileManager1 command fixture, and repeats viewer close/resummon with both checkbox states. Its fixture validates reveal dispatch, not a real file manager. See CUDA.md for real GPU checks and the scoped README for private-bus native-picker tests.
 
 Run simulated keyboard/mouse input only in the isolated compositor. Shared-desktop inspection must be read-only or scoped plugin IPC. Keep `FRACTAL_SEARCH_UI_TEST=1` confined to test processes. Never kill the desktop shell or inject global input to finish a test. If sandbox permissions block sockets/devices, report the environmental failure or use the available approval mechanism; do not weaken production code.
 
 ## Packaging and handoff
 
 - Use `scripts/package-fractal-search.sh` and the bundle's `install.sh`, or `./start-quickshell-search.sh --dev` to build/install/summon. For CUDA updates include `--cuda` and preserve the selected provider/library path. `--no-build --summon` only opens an existing installation when no install options are supplied.
+- Successful installs prune obsolete runtime bundles, retaining the current/previous builds and runtimes in use; keep pruning after the rollback boundary and test with temporary directories.
 - Install UI and backend together; Omarchy's generic git-plugin installer does not build/install the backend. The installer generates RuntimeConfig and versioned paths. Do not patch only the installed QML as the final deliverable.
 - Preserve catalog/model caches, login registration, runtime provider settings and personal bindings. Direct installation stops the existing service; preserve its previous active state and check rollback failures. The repository launcher summons afterwards. Inspect logs and plugin `ping` after installation.
 - Use the Omarchy skill for desktop customization. Do not change shortcuts without authorization. Do not edit `/usr/share/omarchy/`; user-owned plugins hot reload. A slow plugin load may need `OMARCHY_SHELL_IPC_TIMEOUT=15s` for the installer, not a desktop restart.

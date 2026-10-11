@@ -12,6 +12,8 @@ Data: `${XDG_DATA_HOME:-~/.local/share}/fractal-search`. Models: `${XDG_CACHE_HO
 
 Updates: run the new bundle's installer. It drains the old service before replacing the UI/runtime. Models and catalog remain in place. `SHA256SUMS` detects incomplete or damaged bundles; it is not a release signature.
 
+After a successful install, obsolete runtime builds are removed automatically. The current and immediately previous builds are retained, including across reinstalls; builds still running or containing the configured CUDA library directory are retained until a later update. Failed installs do not prune builds. Cleanup is limited to recognized runtime bundle directories and preserves catalogs, models, shared CUDA libraries and unrelated files. Cleanup errors are reported without rolling back the successful installation.
+
 Opening Fractal starts a stopped service and prepares the text-search model in the background. **Settings → Load search model at login** starts that preparation at graphical login instead, before you open the panel. It is off by default, persists across updates and is disabled on uninstall. Changing the option does not stop the current service. The vision model remains lazy, and startup does not download models. The unit drains on graphical logout; the desktop shell is never stopped.
 
 Native folder selection uses the bundled portal helper and the system’s separate picker process. GTK picker code is not loaded into Omarchy’s shared shell. Cancellation closes the portal request; missing portal support and helper errors are reported visibly.

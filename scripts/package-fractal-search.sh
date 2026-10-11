@@ -45,7 +45,7 @@ cp -- "$SEARCH_MCP" "$SEARCH_OUTPUT/bin/fractal-search-mcp"
 if ((SEARCH_CUDA)); then
   cp -L -- "$SEARCH_TARGET/$SEARCH_PROFILE/libonnxruntime_providers_shared.so" "$SEARCH_TARGET/$SEARCH_PROFILE/libonnxruntime_providers_cuda.so" "$SEARCH_OUTPUT/bin/"
 fi
-cp -- quickshell-app/manifest.json quickshell-app/packaging/install.sh quickshell-app/packaging/uninstall.sh quickshell-app/packaging/close-window.sh quickshell-app/packaging/close-binding.sh quickshell-app/packaging/README.md quickshell-app/packaging/NOTICE "$SEARCH_OUTPUT/"
+cp -- quickshell-app/manifest.json quickshell-app/packaging/install.sh quickshell-app/packaging/prune-runtimes.sh quickshell-app/packaging/uninstall.sh quickshell-app/packaging/close-window.sh quickshell-app/packaging/close-binding.sh quickshell-app/packaging/README.md quickshell-app/packaging/NOTICE "$SEARCH_OUTPUT/"
 for SEARCH_QML in quickshell-app/ui/*.qml quickshell-app/ui/qmldir; do
   [[ ${SEARCH_QML##*/} == shell.qml ]] && continue
   cp -- "$SEARCH_QML" "$SEARCH_OUTPUT/ui/"

@@ -116,7 +116,13 @@ def main():
         for name, text in wrappers.items():
             p = fakebin / name; p.write_text(text); p.chmod(0o755)
         environment = dict(os.environ, PATH=str(fakebin)+':'+os.environ['PATH'])
+        obsolete = data / 'fractal-search/runtime/0.1.0-aaaaaaaaaaaa-cpu'
+        if not obsolete.exists():
+            (obsolete / 'bin').mkdir(parents=True)
+            (obsolete / 'bin/fractal-search').write_text('old build fixture')
+            (obsolete / 'bundle.json').write_text('{}')
         failed = install(False, env=environment)
+        assert obsolete.exists(), 'Failed installation pruned an older build'
         assert 'restoring the previous' in failed.stderr
         assert panel.read_bytes() == original_ui
         assert unit.read_bytes() == original_unit
@@ -125,6 +131,7 @@ def main():
         assert 'native runtime dependencies' in install(False, ['--skip-shell'], environment).stderr
         assert unit.read_bytes() == original_unit
         install(extra=['--skip-shell', '--bind-close'])
+        assert not obsolete.exists(), 'Successful installation did not prune an older build'
         installed_bindings = bindings.read_text()
         assert installed_bindings.startswith(original_bindings)
         assert installed_bindings.count('-- BEGIN Fractal Search close binding') == 1

@@ -15,7 +15,7 @@ retries a failed CUDA session on CPU.
 CUDA accelerates the native EmbeddingGemma 2 vision, audio and shared/text ONNX sessions. Decoding,
 patch preparation, tokenization and LanceDB retrieval remain on CPU. ONNX Runtime
 may place small shape/control operations on CPU; actual placement must be verified. The validation below verifies that matrix and attention kernels
-execute on CUDA in both models. TF32 is disabled to preserve the FP32 embedding
+execute on CUDA in all three graphs. TF32 is disabled to preserve the FP32 embedding
 profile. Existing CPU embeddings use the same profile; changing providers does
 not require a reindex.
 
@@ -25,11 +25,17 @@ loading a model or initializing a GPU. The normal status response reports
 retains the selected provider/device. The daemon explicitly forwards both to its
 resident worker.
 
+Inference fetches only `sentence_embedding`, avoiding a copy of the unused
+`last_hidden_state` token matrix to host memory. CUDA sessions disable CPU
+worker-pool spinning so those threads sleep while waiting for work. CPU sessions
+retain their existing threading behavior. The FP32/profile and image budgets
+are unchanged; these optimizations do not require reindexing.
+
 ## Image batching
 
 Settings → Performance → **Image batch size** accepts 1–8 (default 1). Save it and choose **Restart now** to apply it, or **Later** to keep the running size until the next service start. Both manual and watched scans use that startup value. Compatible consecutive images share inference; tails and changes in patch budget produce smaller batches. GPU out-of-memory and other inference errors remain visible without retrying at a smaller size or on CPU.
 
-To verify every batch size against single-image embeddings on CPU and CUDA with synthetic images at 128 and 1024 patch budgets, use an existing verified cache and the provider library path:
+To verify every batch size against single-image embeddings on CPU and CUDA with tiny/elongated and landscape/portrait synthetic images under the pinned 280-soft-token image budget (2,520 padded patch slots), use an existing verified cache and the provider library path:
 
 ```bash
 env FRACTAL_SEARCH_BATCH_TEST_MODELS=/absolute/path/to/models \
@@ -124,9 +130,8 @@ failure must be resolved through the appropriate host permissions.
 Run from the repository root with pinned model assets already available:
 
 ```bash
-cargo build --locked -p fractal-search --features cuda
-cargo build --locked -p fractal-search-core --features cuda --example validate_cuda
-cargo test --locked -p fractal-search-core --features cuda
+cargo build --workspace --bins --example validate_cuda --features cuda --locked
+cargo test --workspace --features cuda --locked
 
 env LD_LIBRARY_PATH=/tmp/fractal-search-cuda-deps/lib:"$PWD/target/debug/examples" \
   target/debug/examples/validate_cuda \
@@ -142,6 +147,9 @@ Choose a new benchmark output directory each time. The explicit `target/debug`
 or `examples` loader path is required for development binaries: ORT's provider
 libraries sit beside them but are loaded dynamically. The packaged launchers
 configure this path automatically.
+Build the binaries and example together to retain the workspace's dependency
+feature set and reuse existing artifacts; building only the core example can
+trigger a separate LanceDB/DataFusion rebuild.
 
 `validate_cuda` creates three synthetic PNG images, compares CPU/CUDA normalized
 vectors for single images, a mixed-shape batch, queries, documents, audio and video, and requires
@@ -155,7 +163,86 @@ without catalog writes, invalid configuration rejection, explicit CLI selection
 overriding the environment and reaching the worker, model-directory changes,
 real indexing/search, invalid-device failure without CPU retry and clean shutdown.
 
-### Evidence from NVIDIA RTX 2080 Max-Q (8 GiB), 2026-10-02
+### Development optimization validation, 2026-10-08
+
+The current optimized development runtime passed the CPU and CUDA-feature
+workspace suites: 108 tests in each, zero failures and three ignored by default.
+The CUDA binaries and `validate_cuda` example built together; the build log is
+`/tmp/fractal-search-quickwins-build-cuda-agent.log`. Both desktop and MCP
+capabilities reported compiled CPU/CUDA support. Dependency diagnostics passed
+all nine required libraries after the host system update, on driver 610.57.04
+and device 0 (`/tmp/fractal-search-quickwins-providers.json`).
+
+Real `validate_cuda` inference passed twelve CPU/CUDA comparisons across single
+images, mixed-shape image batches, queries, documents, audio and video. Minimum
+cosine was `0.9999999999971763`; maximum component error was
+`2.942979335784912e-7`. The three CUDA profiles recorded:
+
+| Graph | CUDA matrix/attention events | CPU matrix/attention events |
+| --- | ---: | ---: |
+| Vision encoder | 1,584 | 0 |
+| Audio encoder | 159 | 0 |
+| Shared backbone | 3,880 | 0 |
+
+CPU shape/control events remained present. The report and all six CPU/CUDA
+profiles are under `/tmp/fractal-search-quickwins-parity-20261008/`; the run log
+is `/tmp/fractal-search-quickwins-parity.log`. The CUDA daemon smoke also passed
+real indexing/search, provider forwarding/retention, invalid-device rejection
+without CPU retry and clean stop (`/tmp/fractal-search-quickwins-smoke-cuda.log`).
+The hardware runner succeeded and resumed the previously installed service,
+recorded in `/tmp/fractal-search-quickwins-hardware-state.json`.
+
+The [synthetic indexing A/B comparison](README.md#development-optimization-validation-2026-10-08)
+observed 7.119 → 5.130 seconds for eight images at batch size 2, 9.56 → 5.18 CPU
+seconds and 24 identical search scores. Provider/device, six runtime threads,
+image fixture, affinity to CPUs 10 and 11 and nice level 10 were unchanged.
+This single constrained development-build sample compared an installed Rust
+1.98.1 binary with a Rust 1.99.0 build, so it cannot isolate the source
+optimizations or establish unrestricted/release performance. Full CUDA batch
+sizes 1–8 were not rerun; this evidence does not supersede the batch-four
+allocation failure documented below.
+
+### EmbeddingGemma 2 hardware validation on Predator, 2026-10-07
+
+The merged EmbeddingGemma 2 source at `317e39a` passed real inference on NVIDIA
+GeForce RTX 2080 Max-Q (8 GiB), driver 610.57.04, using the existing private
+CUDA 12.8.90/cuDNN 9.10.2.21 libraries and the eleven verified pinned assets at
+`~/.cache/fractal-search/models/embeddinggemma2-daa72c51`. The installed FG-CLIP2
+plugin and its catalog were preserved; all validation catalogs were synthetic
+and temporary.
+
+`validate_cuda` passed twelve CPU/CUDA comparisons across single images,
+mixed-shape image batches, queries, documents, audio and video. Minimum cosine
+was `0.9999999999971763`; maximum component error was `2.942979335784912e-7`.
+Actual ORT profiles recorded:
+
+| Graph | CUDA matrix/attention events | CPU matrix/attention events |
+| --- | ---: | ---: |
+| Vision encoder | 1,584 | 0 |
+| Audio encoder | 159 | 0 |
+| Shared backbone | 3,880 | 0 |
+
+CPU shape/control operations remained in those CUDA sessions. The report and
+six profiles are under `/tmp/fractal-predator-cuda-parity-20261007/`.
+`smoke_cuda.py` also passed real daemon indexing/search, provider retention and
+invalid-device rejection without CPU retry.
+
+The opt-in `image_batches_preserve_single_image_embeddings_on_cpu_and_cuda`
+test passed CPU sizes 1–8 for both geometry groups. CUDA passed sizes 1–3 for
+the tiny/elongated group, then size 4 failed in `MultiHeadAttention` while
+allocating a 2,537,256,960-byte buffer. The test exited nonzero without retrying
+at a smaller size or on CPU. CUDA sizes 5–8 and the landscape/portrait group
+were not reached. The batch log is `/tmp/fractal-predator-batch-1-8.log`.
+This establishes a memory limit under the current desktop conditions, not a
+passing CUDA batch-eight result. The resident previous-model service was kept
+running; after the test it used 638 MiB of the GPU's 8,192 MiB.
+
+These checks ran sequentially with nice level 10 and affinity to logical CPUs
+10 and 11, with no concurrent compilation. The benchmark's six ORT threads
+shared that affinity. Its recorded timings are resource-constrained diagnostic
+measurements, not unrestricted desktop or release-performance results.
+
+### Historical FG-CLIP2 evidence from NVIDIA RTX 2080 Max-Q (8 GiB), 2026-10-02
 
 Both host runs passed all nine embedding comparisons: minimum image cosine
 was 0.999999999888 and minimum text cosine exceeded 0.9999999999996. Profiles
