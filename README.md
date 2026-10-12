@@ -170,6 +170,7 @@ A source edit is not an installed update: rebuild/package/install to change the 
 - [QMD-inspired improvements, indexing/reuse, idle policies and limitations](docs/QMD-SEARCH-IMPROVEMENTS.md)
 - [Labeled retrieval evaluation](docs/QMD-EVALUATION.md)
 - [QMD validation results and blocked checks](docs/QMD-VALIDATION.md)
+- [Local QMD/512 integration checkpoint and unrun validation](docs/QMD-LOCAL-INTEGRATION.md)
 
 This is a local development project. Model weights and generated bundles are not checked in. Public release/signing and redistribution review remain separate work; preserve [bundle notices](quickshell-app/packaging/NOTICE).
 
