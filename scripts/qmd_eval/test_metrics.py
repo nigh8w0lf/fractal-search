@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 
-from qmd_eval import fixtures, metrics
+from qmd_eval import fixtures, harness, metrics
 from qmd_eval.harness import DEFAULT_CORPUS, ROOT, validate_hits, validate_rankings, validate_native_metadata, validate_timed_sample
 
 
@@ -232,16 +232,24 @@ class FixtureTests(unittest.TestCase):
                     validate_rankings(self.fixture, {"quality_rankings": incomplete}, passage_ids, mode)
 
     def test_native_provenance_mismatch_rejected(self):
-        indexed = {"model_profile": "model", "text_search_profile": "lexical-contract", "extraction_profile": "chunk-contract", "provider": "cpu", "threads": 6}
+        indexed = {"model_profile": harness.MODEL_PROFILE, "embedding_dimension": harness.EMBEDDING_DIM, "text_search_profile": "lexical-contract", "extraction_profile": "chunk-contract", "provider": "cpu", "threads": 6}
         result = indexed | {"operation": "search", "mode": "hybrid", "rank_limit": 1000}
         validate_native_metadata(indexed, result, "search", "hybrid")
-        for field in ("text_search_profile", "extraction_profile"):
+        for field in ("model_profile", "embedding_dimension", "text_search_profile", "extraction_profile"):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, "provenance changed"):
                 validate_native_metadata(indexed, result | {field: "other"}, "search", "hybrid")
         with self.assertRaisesRegex(ValueError, "provenance changed"):
             validate_native_metadata(indexed, {key: value for key, value in result.items() if key != "extraction_profile"}, "search", "hybrid")
         with self.assertRaisesRegex(ValueError, "budget disagrees"):
             validate_native_metadata(indexed, result | {"rank_limit": 6}, "search", "hybrid")
+
+    def test_old_or_missing_indexed_contract_is_rejected(self):
+        current = {"model_profile": harness.MODEL_PROFILE, "embedding_dimension": 512}
+        harness.validate_indexed_contract(current)
+        for invalid in ({}, current | {"embedding_dimension": 768},
+                        current | {"model_profile": "embeddinggemma2-daa72c51-fp32-multimodal-v1"}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "indexed 512"):
+                harness.validate_indexed_contract(invalid)
 
     def test_missing_models_produces_blocked_report_without_quality(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -824,8 +824,10 @@ impl Catalog {
                     |state| state.stamp == before,
                 );
             let same_profile = saved.as_ref().is_none_or(|state| {
-                state.embedding_profile == embedder.embedding_profile()
-                    && (!is_text || state.extraction_profile == media::TEXT_EXTRACTION_PROFILE)
+                state.matches_profile(
+                    embedder.embedding_profile().as_deref(),
+                    is_text.then_some(media::TEXT_EXTRACTION_PROFILE),
+                )
             });
             let verify_after = options.verify_content || is_racy(&before);
             // A nonce marks our new derived-state contract. Its missing/mismatched

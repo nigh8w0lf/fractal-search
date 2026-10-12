@@ -1,5 +1,7 @@
 # QMD improvement validation
 
+Historical validation of the QMD extension before the 512-dimensional indexed-profile change; these results do not validate that later change. Rerun checks against the current tree, and do not reuse its measured catalog sizes as 512D measurements.
+
 Validation date: 2026-10-08. Base: `317e39a9111d34964280854fe1ad9d68063aa35d`.
 
 ## Environment and scope

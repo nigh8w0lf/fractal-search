@@ -10,9 +10,28 @@ pub mod preprocess;
 #[cfg(feature = "runtime")]
 pub mod runtime;
 
-pub const EMBEDDING_DIM: usize = 768;
+/// Native pinned graph output, retained unchanged for upstream parity.
+pub const NATIVE_EMBEDDING_DIM: usize = 768;
+/// Default indexed/query Matryoshka dimension. Not a user-selectable profile.
+pub const EMBEDDING_DIM: usize = 512;
 pub const MAX_IMAGE_BATCH_SIZE: usize = 8;
-pub const MODEL_PROFILE: &str = "embeddinggemma2-daa72c51-fp32-multimodal-v1";
+pub const NATIVE_MODEL_PROFILE: &str = "embeddinggemma2-daa72c51-fp32-multimodal-v1";
+/// Catalog and derived-cache identity includes the leading-dimension projection.
+pub const MODEL_PROFILE: &str = "embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2";
+pub const EMBEDDING_PROJECTION: &str = "native768-leading512-l2-v1";
+/// A path-free compatibility error that the read-only agent may safely expose.
+#[cfg(feature = "catalog")]
+#[derive(Debug)]
+pub(crate) struct CatalogContractMismatch;
+#[cfg(feature = "catalog")]
+impl std::fmt::Display for CatalogContractMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Incompatible catalog schema, model profile or embedding contract: this build requires 512-dimensional Matryoshka vectors; preserve this catalog, use a fresh data directory and reindex in Fractal Search")
+    }
+}
+#[cfg(feature = "catalog")]
+impl std::error::Error for CatalogContractMismatch {}
+
 /// Schema-4 lexical field/tokenizer/RRF identity. The legacy name includes the
 /// original byte-window parameters; new extraction has its own independent
 /// media::TEXT_EXTRACTION_PROFILE and never changes this on-disk schema guard.
@@ -26,6 +45,8 @@ pub enum TextSearchMode {
     Hybrid,
 }
 
+/// Every modality and query returns one finite, unit-length EMBEDDING_DIM vector.
+/// Native full-width reference outputs are never part of this storage contract.
 pub trait Embedder {
     /// A verified implementation identity. None disables persistent vector reuse.
     fn embedding_profile(&self) -> Option<String> {

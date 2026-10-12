@@ -26,9 +26,15 @@ The export declares Apache-2.0. Preserve applicable licenses and attribution whe
 
 ## Embedding and catalog contract
 
-`embeddinggemma2-daa72c51-fp32-multimodal-v1` produces one finite, unit-normalized 768-dimensional vector per image, text passage, audio segment or temporal visual-video segment. Schema 4 and its separate lexical profile require a fresh catalog and explicit reindexing. Older catalogs are not deleted, converted or mixed with these vectors.
+The pinned FP32 graph and model asset manifest are unchanged: `sentence_embedding` natively contains 768 dimensions under the native graph contract `embeddinggemma2-daa72c51-fp32-multimodal-v1`. Production uses a separate indexed contract, `embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2`: validate the native output, keep the **leading 512 values**, then **L2-normalize that prefix**. Apply this identical projection to every image, text passage, audio segment, temporal visual-video segment and query. Indexed vectors must be finite, nonzero and unit normalized. Do not merely slice a normalized native vector and assume it stays normalized.
 
-The shared graph takes int64 `input_ids`/`attention_mask` and float32 image/video/audio feature matrices with 512 columns. Absent modalities still receive real empty `[0, 512]` tensors. Use `sentence_embedding`, which already includes projection, masked mean pooling and normalization. `last_hidden_state` is not the current retrieval representation. Video features go to `video_features`, not `image_features`.
+Schema stays **4**, with its separate lexical/extraction contracts. Catalog metadata validates the indexed model profile, dimension 512 and `fractal.embedding_projection = native768-leading512-l2-v1` together; a missing or conflicting projection guard is incompatible. The private vector-cache format is also versioned and keys its entries by the indexed dimension/projection contract. Existing schema-4 catalogs carrying the previous 768-dimensional profile are incompatible and fail clearly. Use a separate fresh `--data-dir /absolute/new/catalog` and explicitly reindex the desired folders; the current installation preserves old catalogs and never deletes, converts or mixes them automatically. The verified pinned model cache can be reused. No 768/256 dimension selector is exposed to users; explicit full-768 output is for native reference/parity tooling only.
+
+This follows [Google's Matryoshka guidance](https://huggingface.co/google/embeddinggemma-2#3-matryoshka-dimension-truncation). Published model-card scores at 512 versus native 768 dimensions are MTEB multilingual v2 61.17 versus 61.36, MIEB lite 64.32 versus 64.64, and MMEB v2 overall 58.38 versus 59.01. These are upstream benchmark results, not measurements of this app or its labeled corpus.
+
+Raw FP32 vector payloads fall from 3,072 to 2,048 bytes per segment, a one-third reduction before database/index overhead. Similarity scoring processes fewer coordinates, but application latency improvements require measurement. The native graph still computes all 768 outputs: this change does **not** reduce model weights, inference work, model RAM or VRAM.
+
+The shared graph takes int64 `input_ids`/`attention_mask` and float32 image/video/audio feature matrices with 512 columns. Absent modalities still receive real empty `[0, 512]` tensors. Use `sentence_embedding`, which already includes the graph's native projection, masked mean pooling and 768D normalization, then perform the separate leading-512/L2 indexed projection described above. `last_hidden_state` is not the current retrieval representation. Video features go to `video_features`, not `image_features`.
 
 The runtime validates both declared backbone outputs, then selects only `sentence_embedding` for each inference call. It does not fetch the unused `last_hidden_state` token matrix to host memory. CUDA sessions disable CPU worker-pool spinning; CPU sessions retain their existing threading behavior. Neither optimization changes preprocessing, precision, output normalization or the catalog profile.
 
@@ -58,7 +64,7 @@ Audio/video inputs are capped at 2 GiB/two hours. Video frames above 2,073,600 p
 
 ## Providers and validation
 
-CPU and CUDA use the same FP32 profile. CUDA is explicit, disables TF32, and fails visibly without retrying on CPU. The shared backbone loads for text or any media inference; vision/audio encoders remain lazy. Browsing and metadata load no models. See [CUDA.md](../quickshell-app/CUDA.md) for actual provider-placement validation.
+CPU and CUDA use the same native FP32 graphs and normalized 512D indexed profile. CUDA is explicit, disables TF32, and fails visibly without retrying on CPU. The shared backbone loads for text or any media inference; vision/audio encoders remain lazy. Browsing and metadata load no models. See [CUDA.md](../quickshell-app/CUDA.md) for actual provider-placement validation.
 
 Reference generation uses Hugging Face's Gemma4 image/audio preprocessing and the pinned tokenizer, followed by the pinned export in Python ONNX Runtime. It does not compare with Google's original PyTorch checkpoint. Optional development dependencies are NumPy, Pillow, Torch, Torchvision, Transformers exposing these processors, and ONNX Runtime; production inference remains Rust-only. The generator records dependency versions and performs no remote model-code execution or automatic asset download.
 
@@ -70,8 +76,30 @@ python3 quickshell-app/tests/compare_embeddinggemma2_retrieval.py \
   target/debug/fractal-search /absolute/model/cache /absolute/new/fixtures/fixtures.json
 ```
 
+The generator and Rust validator default to the **indexed 512D** contract. `environment.json` records `output_mode`, `embedding_dimension`, `native_embedding_dimension` and `model_profile`, alongside pinned export identity and dependency versions. All fixture modalities go through the same leading-512/L2 reference projection. The retrieval comparator checks the indexed profile and rejects mismatched fixture modes instead of silently comparing 768D scores with a 512D catalog.
+
+For explicit **native 768D graph parity**, use separate fixture output:
+
+```bash
+python3 scripts/prepare-embeddinggemma2-fixtures.py --native-output \
+  /absolute/model/cache /absolute/new/native-fixtures
+cargo run --locked -p fractal-search-core --example validate_embeddinggemma2 -- \
+  --native-output /absolute/model/cache /absolute/new/native-fixtures/fixtures.json
+```
+
+Existing full-768 reference fixtures remain useful in this explicit native validator mode. To compare them with the production 512D catalog, the retrieval comparator's `--native-fixtures` option explicitly projects their references first; it does not switch the catalog or queries to 768D. Freshly generated native fixtures include mode metadata; pre-mode native fixtures require this explicit option and every vector is still checked as native 768D.
+
+Model-free projection, fixture-mode and evaluation-protocol checks:
+
+```bash
+python3 scripts/test_embeddinggemma2_contract.py
+PYTHONPATH=scripts python3 -m unittest discover -s scripts/qmd_eval -p 'test_*.py' -v
+```
+
 For metadata-only preprocessing validation, pass `--preprocess-only` to both generator and validator and provide the five pinned metadata/tokenizer JSON files. HF reference libraries are still required; no weights or inference are used. Use `--max-image-batch` to bound full reference inference memory.
 
-The validator checks tokens, masks, patches and feature tensors, then requires embedding cosine at least 0.9999. The retrieval comparator requires score error at most `1e-4`. These are acceptance thresholds, not claims of unrun checks. Synthetic parity does not establish labeled-library relevance, large-corpus latency, GPU memory use or batch-eight inference. Previous results do not validate reconstructed source; rerun checks against the current tree and record actual limitations.
+The validator checks tokens, masks, patches and feature tensors, then requires embedding cosine at least 0.9999 in the explicitly selected indexed/native space. The retrieval comparator requires score error at most `1e-4`. These are acceptance thresholds, not claims of unrun checks. Synthetic parity does not establish labeled-library relevance, large-corpus latency, GPU memory use or batch-eight inference. Previous results do not validate reconstructed source; rerun checks against the current tree and record actual limitations.
 
 The optimized development runtime's [2026-10-08 CPU/CUDA validation](../quickshell-app/CUDA.md#development-optimization-validation-2026-10-08) passed twelve embedding comparisons across all four modalities and verified CUDA matrix/attention execution in all three graphs. The separate [synthetic indexing comparison](../quickshell-app/README.md#development-optimization-validation-2026-10-08) retained 24 identical search scores. Those reports retain their workload/compiler limitations; full CUDA batch-eight and labeled relevance were not established.
+
+These historical optimization measurements used the prior 768D indexed profile and do not establish integrated 512D parity or relevance.

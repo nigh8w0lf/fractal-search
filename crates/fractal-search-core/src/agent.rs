@@ -59,8 +59,13 @@ pub struct AgentCatalog {
 }
 
 fn database<T>(result: Result<T>) -> Result<T> {
-    result.map_err(|_| {
-        anyhow::anyhow!("Cannot read search catalog; inspect or repair it in Fractal Search")
+    result.map_err(|error| {
+        if error.is::<crate::CatalogContractMismatch>() {
+            // Recreate only the path-free typed message, never its contextual chain.
+            anyhow::anyhow!(crate::CatalogContractMismatch)
+        } else {
+            anyhow::anyhow!("Cannot read search catalog; inspect or repair it in Fractal Search")
+        }
     })
 }
 pub fn validate_asset_id(id: &str) -> Result<()> {
@@ -401,6 +406,23 @@ mod tests {
         let agent = AgentCatalog::open(&root.path().join("data")).unwrap();
         (root, desktop, agent)
     }
+    #[test]
+    fn compatibility_guidance_is_actionable_without_disclosing_error_context() {
+        let error =
+            anyhow::anyhow!(crate::CatalogContractMismatch).context("/private/catalog/path");
+        let message = database::<()>(Err(error)).unwrap_err().to_string();
+        assert!(
+            message.contains("512-dimensional")
+                && message.contains("reindex")
+                && message.contains("preserve")
+        );
+        assert!(!message.contains("/private"));
+        let other = database::<()>(Err(anyhow::anyhow!("/private/database/error")))
+            .unwrap_err()
+            .to_string();
+        assert!(!other.contains("/private"));
+    }
+
     #[test]
     fn agent_coexists_read_only_and_exposes_only_bounded_metadata() {
         let (root, _desktop, agent) = fixture();

@@ -208,6 +208,9 @@ fn main() -> Result<()> {
     )?;
     let report = json!({
         "deviceId":device_id,
+        "embeddingDimension":EMBEDDING_DIM,
+        "modelProfile":fractal_search_core::MODEL_PROFILE,
+        "outputMode":"indexed",
         "images":compare(&cpu.images, &cuda.images)?,
         "text":compare(&cpu.text, &cuda.text)?,
         "documents":compare(&cpu.documents, &cuda.documents)?,

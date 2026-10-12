@@ -12,6 +12,7 @@ import tempfile
 import time
 
 from . import fixtures, metrics
+from embeddinggemma2_contract import EMBEDDING_DIM, MODEL_PROFILE
 
 MODES = ("bm25", "dense", "hybrid")
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -126,10 +127,16 @@ def invoke(binary, request, work, output, name, timeout):
     return result
 
 
+def validate_indexed_contract(indexed):
+    if indexed.get("model_profile") != MODEL_PROFILE or indexed.get("embedding_dimension") != EMBEDDING_DIM:
+        raise ValueError("Native adapter must use the indexed 512-dimensional MRL profile; rebuild it from this source and use a fresh temporary catalog")
+
+
 def validate_native_metadata(indexed, result, operation, mode):
+    validate_indexed_contract(indexed)
     if result.get("operation") != operation or result.get("mode") != mode or result.get("rank_limit") != 1000:
         raise ValueError("Native operation, retrieval mode or result budget disagrees with request")
-    for key in ("model_profile", "text_search_profile", "extraction_profile", "provider", "threads"):
+    for key in ("model_profile", "embedding_dimension", "text_search_profile", "extraction_profile", "provider", "threads"):
         if result.get(key) != indexed[key]:
             raise ValueError(f"Native evaluation provenance changed between indexing and queries: {key}")
 
@@ -233,11 +240,13 @@ def run(args):
                     "mode": "hybrid", "provider": args.provider, "device_id": args.device_id,
                     "threads": args.threads, "rank_limit": 1000, "repeats": args.repeats, "warmups": args.warmups}
             indexed = invoke(binary, base | {"operation": "index"}, work, raw_output, "index", args.timeout)
+            validate_indexed_contract(indexed)
             if indexed["documents"] != len(manifest):
                 raise ValueError("Native indexed document count mismatch")
             report["fixture"]["passages"] = indexed["passage_count"]
             report["index_ms"] = indexed["index_ms"]
             report["model"]["profile"] = indexed["model_profile"]
+            report["model"]["embedding_dimension"] = indexed["embedding_dimension"]
             report["text_search_profile"] = indexed["text_search_profile"]
             report["extraction_profile"] = indexed["extraction_profile"]
             # Bound the corpus so document@100 never silently becomes metrics

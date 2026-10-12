@@ -24,7 +24,7 @@ The tabs remain visible while their contents scroll. Left/Right switches a focus
 
 ## Supported media and result segments
 
-All media share the pinned normalized 768-dimensional EmbeddingGemma 2 retrieval space. Results represent searchable segments; one file can produce several results. Counts distinguish `fileCount` (distinct source files) from `assetCount` (searchable segments).
+All media and queries share the pinned normalized 512-dimensional EmbeddingGemma 2 retrieval space. The unchanged FP32 model emits 768 dimensions; the app keeps the leading 512 values and L2-normalizes them before indexing or search. Results represent searchable segments; one file can produce several results. Counts distinguish `fileCount` (distinct source files) from `assetCount` (searchable segments).
 
 - Images: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC and HEIF retain one embedding per still image and the 280-soft-token image budget
 - Text: UTF-8 `.txt`, `.md` and `.markdown` files, at most 2 MiB, split into overlapping passages of at most 4,096 UTF-8 bytes with at most 256-byte overlap at Unicode boundaries, structural boundaries and actual formatted-input token checks, up to 1,024 passages/file. Explicit text rebuild upgrades unchanged legacy passages. This is plain-text passage indexing; Text mode adds BM25 + semantic hybrid retrieval; PDF, Office and OCR are not implemented
@@ -144,7 +144,7 @@ Default runtime data lives in `$XDG_DATA_HOME/fractal-search/` (normally `~/.loc
 
 The desktop backend creates and logs an empty catalog at startup when `catalog.lancedb/` is missing or completely empty. After deleting a catalog from a running service, stop and reopen Fractal Search, then add and index folders again; settings and model caches remain intact. Partial deletion, corruption and incompatible schemas remain visible errors. The read-only MCP server never creates or repairs a catalog.
 
-The 768-dimensional catalog records profile `embeddinggemma2-daa72c51-fp32-multimodal-v1`. Schema 4 adds a full-passage lexical contract and named FTS index alongside the FP32 shared/text, vision and audio exports, image/video preprocessing budgets, text passage formatting and audio feature extraction. This clean replacement requires a fresh catalog and reindexing; old model assets and embeddings are unsupported and never silently mixed. Model assets and licensing are described in the [model manifest](../crates/fractal-search-core/models/embeddinggemma2.json) and [model guide](../docs/MODELS.md).
+The normalized 512-dimensional catalog records profile `embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2`. The unchanged native FP32 graph still emits 768 dimensions; all modalities and queries use leading-512 truncation followed by L2 normalization. The app does not expose a dimension selector. Schema 4 adds a full-passage lexical contract and named FTS index alongside the FP32 shared/text, vision and audio exports, image/video preprocessing budgets, text passage formatting and audio feature extraction. The new indexed profile requires a separate fresh catalog and explicit reindexing. Existing 768-dimensional schema-4 catalogs fail visibly and are never converted, overwritten or deleted automatically. The same pinned model assets are reused. Raw vectors use 2,048 rather than 3,072 bytes each; this does not reduce model inference cost or VRAM. Model assets and licensing are described in the [model manifest](../crates/fractal-search-core/models/embeddinggemma2.json) and [model guide](../docs/MODELS.md).
 
 ## Desktop transport
 
@@ -160,6 +160,8 @@ Uncached semantic searches emit `searchProgress` events with the request `id` an
 
 Responses have `id`, `ok` and `result` or `error`. Events have `event` and `payload`; `indexProgress` also includes the indexing request ID. DTO fields use camelCase. Commands are `status`, `browse`, `search`, `index`, `preview`, `originalUrl`, `reveal`, `setModelDirectory`, `updateSettings`, `removeSource`, `theme`, `installModels`, `cancel`, `shutdown`. Directory arguments accept absolute local paths or local `file:` URLs. `status` is also a one-shot CLI mode that does not load models.
 
+
+`status.catalog.modelProfile` identifies the indexed 512D contract, `embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2`. It is distinct from the unchanged native 768D graph contract.
 
 `status.settings` contains `topMatches` (1–100, default 6), `resultLayout` (`listPreview` or `list`), `watchChanges` (default false), `closeAfterOpening` (default true), and `imageBatchSize` (1–8, default 1). `status.activeImageBatchSize` reports the size captured at worker startup. `status.settings` also includes `groupTextByFile` (false), `textIdleSeconds` (900) and `mediaIdleSeconds` (300); 0 keeps that model class warm. `updateSettings` requires the original five fields, defaults omitted extension fields for compatibility, and returns full status. Idle changes apply live; a batch-size change is saved without changing the running worker. These preferences persist alongside the configured model directory. `browse` and `search` accept optional `sourceId` (null means all folders) and `mediaKind` (`image`, `text`, `audio`, `video`, or null for All media). Nonempty Text searches use BM25 + semantic RRF; other scopes keep cosine ordering. `search` accepts `maxResults` (1–1,000); the UI supplies its top-match preference. `removeSource` requires a numeric `sourceId` and returns `{removed: segmentCount}`. `reveal` requires `assetId` and uses the desktop file-manager interface to select the original; unsupported reveal operations fail visibly.
 
@@ -180,14 +182,14 @@ cargo test --workspace --locked
 
 These commands cover all four workspace members: the native search core, daemon, folder picker and MCP server.
 
-With pinned assets and reference fixtures available, validate the resident runtime against the existing native-input fixtures:
+With pinned assets and newly generated indexed-512 reference fixtures available, validate the resident runtime:
 
 ```bash
 cargo run -p fractal-search-core --example validate_embeddinggemma2 -- \
-  /absolute/path/to/models /absolute/path/to/native-fixtures/fixtures.json
+  /absolute/path/to/models /absolute/path/to/indexed-fixtures/fixtures.json
 ```
 
-The example uses real image decoding/tokenization and requires cosine similarity of at least 0.9999 against the reference. Reference fixtures can be generated with the optional Python development tool described in the [model guide](../docs/MODELS.md). Python is not required to run the plugin.
+The example uses real image decoding/tokenization and requires cosine similarity of at least 0.9999 against the indexed 512D reference. Add `--native-output` before the model directory to validate existing native 768D fixtures explicitly. Reference fixtures can be generated with the optional Python development tool described in the [model guide](../docs/MODELS.md). Python is not required to run the plugin.
 
 The [embedding validation](../docs/MODELS.md#providers-and-validation) describes checks against the pinned export. Historical prior-model fixture results do not validate this replacement. Report numerical parity and retrieval measurements only after running the current checks; they are not a labeled-library relevance benchmark.
 
@@ -223,7 +225,11 @@ env FRACTAL_SEARCH_PROVIDER=cuda FRACTAL_SEARCH_DEVICE_ID=0 \
 
 For CPU, set `FRACTAL_SEARCH_PROVIDER=cpu`, leave `FRACTAL_SEARCH_DEVICE_ID` unset and use a binary with its required runtime libraries available. The comparison rejects changes in provider/device, runtime threads, batch size, image count/dimensions, CPU affinity or nice level, and requires maximum search-score error at most `1e-4`. It records affinity/nice without changing them and uses a temporary catalog, leaving the installed library untouched. One warmed scan does not establish sustained indexing performance; compiler/build differences between binaries must also be reported.
 
-#### Fresh reconstructed-source validation (2026-10-07)
+Compare only binaries with the same indexed embedding profile. The prior 768D and current 512D profiles are not a numerical score-parity comparison.
+
+#### Historical reconstructed-source validation (2026-10-07)
+
+This section predates the 512D indexed-profile change. Its native 768D parity and retrieval results do not establish current indexed 512D parity or relevance; rerun the current commands above.
 
 This implementation was reconstructed after a temporary workspace was removed. The checks below were rerun against the reconstructed source; earlier results were not reused as evidence.
 

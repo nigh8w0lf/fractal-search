@@ -3,6 +3,8 @@
 Fractal Search supports native CUDA inference in its Omarchy Shell plugin backend
 and read-only MCP server.
 
+The current indexed/query profile is normalized 512D MRL: native 768D FP32 outputs are truncated to the leading 512 and L2-normalized on both providers. This does not reduce graph inference work or VRAM. Historical timings below are not measurements of this dimension change; see the [current model contract](../docs/MODELS.md).
+
 ## Selection and behavior
 
 CPU remains the default. A CUDA-enabled build supports both providers; select CUDA
@@ -16,8 +18,9 @@ CUDA accelerates the native EmbeddingGemma 2 vision, audio and shared/text ONNX 
 patch preparation, tokenization and LanceDB retrieval remain on CPU. ONNX Runtime
 may place small shape/control operations on CPU; actual placement must be verified. The validation below verifies that matrix and attention kernels
 execute on CUDA in all three graphs. TF32 is disabled to preserve the FP32 embedding
-profile. Existing CPU embeddings use the same profile; changing providers does
-not require a reindex.
+profile. CPU and CUDA embeddings within the current indexed profile are compatible;
+changing providers alone does not require a reindex. Moving from the previous
+768D indexed profile to 512D still requires a fresh catalog and explicit reindexing.
 
 `fractal-search providers` returns compiled capabilities without opening a catalog,
 loading a model or initializing a GPU. The normal status response reports
