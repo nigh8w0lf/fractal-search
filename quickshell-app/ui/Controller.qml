@@ -51,6 +51,7 @@ Item {
     property int queryGeneration: 0
     property bool deferredSearch: false
     property var reindexQueue: []
+    property bool reindexTextPassages: false
     readonly property var settings: status.settings
     readonly property bool batchRestartRequired: ready && status.activeImageBatchSize !== settings.imageBatchSize
     readonly property color borderColor: Qt.rgba(foregroundColor.r, foregroundColor.g, foregroundColor.b, 0.25)
@@ -77,12 +78,16 @@ Item {
             activeImageBatchSize: 1,
             modelDirectory: "",
             themeFile: "",
+            runtimeDiagnostics: null,
             settings: {
                 topMatches: 6,
                 resultLayout: "listPreview",
                 watchChanges: false,
                 closeAfterOpening: true,
-                imageBatchSize: 1
+                imageBatchSize: 1,
+                groupTextByFile: false,
+                textIdleSeconds: 900,
+                mediaIdleSeconds: 300
             }
         })
     property var progress: ({
@@ -350,6 +355,10 @@ Item {
         }
     }
     function refreshStatus() {
+        // Performance polls only while visible. Coalesce refresh buttons and
+        // result-triggered refreshes too, so a slow service cannot grow a queue.
+        if (!ready || !worker.connected || closing || Object.keys(pending).some(id => pending[id].type === "status"))
+            return;
         request({
             type: "status"
         }, function (result) {
@@ -507,38 +516,93 @@ Item {
                 return;
             app.total = result.total;
             for (const asset of result.items) {
-                if (!asset.assetId || ["image", "text", "audio", "video"].indexOf(asset.mediaKind) < 0 || (app.isVisualAsset(asset) && !asset.thumbnailUrl)) {
-                    app.fail("Service returned incomplete media metadata. Reinstall matching UI and backend versions.");
+                const row = app.resultAsset(asset, true);
+                if (!row)
                     return;
-                }
-                const hasScore = asset.similarity !== null && asset.similarity !== undefined;
-                const hasHybridScore = asset.hybridScore !== null && asset.hybridScore !== undefined;
-                if ((hasScore && !Number.isFinite(asset.similarity)) || (hasHybridScore && (!Number.isFinite(asset.hybridScore) || app.mediaKind !== "text" || !app.activeQuery.length))) {
-                    app.fail("Service returned an invalid search score. Reinstall matching UI and backend versions.");
-                    return;
-                }
-                results.append({
-                    assetId: asset.assetId,
-                    filename: asset.filename,
-                    path: asset.path,
-                    mediaKind: asset.mediaKind,
-                    segmentIndex: asset.segmentIndex,
-                    startMs: asset.startMs === null ? -1 : asset.startMs,
-                    endMs: asset.endMs === null ? -1 : asset.endMs,
-                    textExcerpt: asset.textExcerpt || "",
-                    thumbnailUrl: asset.thumbnailUrl || "",
-                    width: asset.width,
-                    height: asset.height,
-                    similarity: hasScore ? asset.similarity : 0,
-                    hasScore: hasScore,
-                    hybridScore: hasHybridScore ? asset.hybridScore : 0,
-                    hasHybridScore: hasHybridScore
-                });
+                results.append(row);
             }
             if (!append && results.count)
                 app.select(0);
             app.refreshStatus();
         });
+    }
+    function boundedUtf8(value, maximum) {
+        if (typeof value !== "string")
+            return false;
+        let bytes = 0;
+        for (let i = 0; i < value.length; i++) {
+            const code = value.charCodeAt(i);
+            if (code < 0x80) bytes += 1;
+            else if (code < 0x800) bytes += 2;
+            else if (code >= 0xD800 && code <= 0xDBFF) {
+                const low = value.charCodeAt(++i);
+                if (!(low >= 0xDC00 && low <= 0xDFFF)) return false;
+                bytes += 4;
+            } else if (code >= 0xDC00 && code <= 0xDFFF) return false;
+            else bytes += 3;
+            if (bytes > maximum) return false;
+        }
+        return true;
+    }
+    function resultAsset(asset, allowAdditional) {
+        if (!asset || !asset.assetId || ["image", "text", "audio", "video"].indexOf(asset.mediaKind) < 0 || (isVisualAsset(asset) && !asset.thumbnailUrl)) {
+            fail("Service returned incomplete media metadata. Reinstall matching UI and backend versions.");
+            return null;
+        }
+        const hasScore = asset.similarity !== null && asset.similarity !== undefined;
+        const hasHybridScore = asset.hybridScore !== null && asset.hybridScore !== undefined;
+        if ((hasScore && !Number.isFinite(asset.similarity)) || (hasHybridScore && (!Number.isFinite(asset.hybridScore) || mediaKind !== "text" || !activeQuery.length))) {
+            fail("Service returned an invalid search score. Reinstall matching UI and backend versions.");
+            return null;
+        }
+        if (asset.textExcerpt != null && !boundedUtf8(asset.textExcerpt, 2048)) {
+            fail("Service returned an invalid text excerpt. Reinstall matching UI and backend versions.");
+            return null;
+        }
+        const additional = asset.additionalMatches == null ? [] : asset.additionalMatches;
+        if (!Array.isArray(additional) || additional.length > 5 || (additional.length && (!allowAdditional || asset.mediaKind !== "text" || mediaKind !== "text" || !activeQuery.length))) {
+            fail("Service returned invalid grouped text matches. Reinstall matching UI and backend versions.");
+            return null;
+        }
+        const matches = [];
+        for (const match of additional) {
+            if (!match || match.mediaKind !== "text" || match.path !== asset.path || match.assetId === asset.assetId || matches.some(item => item.assetId === match.assetId)) {
+                fail("Service returned inconsistent grouped text matches. Reinstall matching UI and backend versions.");
+                return null;
+            }
+            const row = resultAsset(match, false);
+            if (!row)
+                return null;
+            matches.push(row);
+        }
+        return {
+            assetId: asset.assetId,
+            filename: asset.filename,
+            path: asset.path,
+            mediaKind: asset.mediaKind,
+            segmentIndex: asset.segmentIndex,
+            startMs: asset.startMs == null ? -1 : asset.startMs,
+            endMs: asset.endMs == null ? -1 : asset.endMs,
+            startByte: asset.startByte == null ? -1 : asset.startByte,
+            endByte: asset.endByte == null ? -1 : asset.endByte,
+            startLine: asset.startLine == null ? -1 : asset.startLine,
+            endLine: asset.endLine == null ? -1 : asset.endLine,
+            textExcerpt: asset.textExcerpt || "",
+            thumbnailUrl: asset.thumbnailUrl || "",
+            width: asset.width,
+            height: asset.height,
+            similarity: hasScore ? asset.similarity : 0,
+            hasScore: hasScore,
+            hybridScore: hasHybridScore ? asset.hybridScore : 0,
+            hasHybridScore: hasHybridScore,
+            // Keep this bounded collection a JSON value rather than a mutable
+            // nested QML ListModel; it survives selection and result replacement.
+            additionalMatchesJson: JSON.stringify(matches),
+            additionalMatchCount: matches.length
+        };
+    }
+    function additionalMatches(asset) {
+        return asset && asset.additionalMatchesJson ? JSON.parse(asset.additionalMatchesJson) : [];
     }
     function search(text) {
         if (closing)
@@ -555,7 +619,7 @@ Item {
             return "Hybrid score " + asset.hybridScore.toFixed(5);
         return asset.hasScore ? "Cosine " + asset.similarity.toFixed(3) : "";
     }
-    function indexFolder(directory) {
+    function indexFolder(directory, rebuildText) {
         if (busy || !ready)
             return;
         indexing = true;
@@ -571,10 +635,12 @@ Item {
             failed: 0,
             filename: ""
         };
-        request({
-            type: "index",
-            directory: String(directory)
-        }, function (result) {
+        const command = {type: "index", directory: String(directory)};
+        if (rebuildText === true) {
+            command.reindexText = true;
+            command.verifyContent = true;
+        }
+        request(command, function (result) {
             app.indexing = false;
             if (app.closing)
                 return;
@@ -651,8 +717,14 @@ Item {
         if (!asset)
             return "";
         const kind = asset.mediaKind.charAt(0).toUpperCase() + asset.mediaKind.slice(1);
-        if (asset.mediaKind === "text")
-            return kind + " · passage " + (asset.segmentIndex + 1);
+        if (asset.mediaKind === "text") {
+            const passage = kind + " · passage " + (asset.segmentIndex + 1);
+            if (asset.startLine > 0 && asset.endLine >= asset.startLine)
+                return passage + " · " + (asset.startLine === asset.endLine ? "line " + asset.startLine : "lines " + asset.startLine + "–" + asset.endLine);
+            if (asset.startByte >= 0 && asset.endByte >= asset.startByte)
+                return passage + " · bytes " + asset.startByte + "–" + asset.endByte;
+            return passage;
+        }
         if (asset.mediaKind === "audio" || asset.mediaKind === "video")
             return kind + " · " + timeLabel(asset.startMs) + "–" + timeLabel(asset.endMs);
         return kind;
@@ -679,6 +751,12 @@ Item {
             segmentIndex: asset.segmentIndex,
             startMs: asset.startMs,
             endMs: asset.endMs,
+            startByte: asset.startByte,
+            endByte: asset.endByte,
+            startLine: asset.startLine,
+            endLine: asset.endLine,
+            additionalMatchesJson: asset.additionalMatchesJson,
+            additionalMatchCount: asset.additionalMatchCount,
             textExcerpt: asset.textExcerpt,
             thumbnailUrl: asset.thumbnailUrl,
             width: asset.width,
@@ -795,7 +873,7 @@ Item {
                 app.status = result;
                 if (changes.imageBatchSize !== undefined && app.batchRestartRequired)
                     app.restartRequired();
-                if (changes.topMatches !== undefined)
+                if (changes.topMatches !== undefined || changes.groupTextByFile !== undefined)
                     app.browse(false);
             }
         });
@@ -816,9 +894,10 @@ Item {
             }
         });
     }
-    function reindexAll() {
+    function reindexAll(rebuildText) {
         if (busy || !ready || !status.catalog.sources.length)
             return;
+        reindexTextPassages = rebuildText === true;
         reindexQueue = status.catalog.sources.map(source => source.directory);
         indexNext();
     }
@@ -827,7 +906,7 @@ Item {
             return;
         const directory = reindexQueue[0];
         reindexQueue = reindexQueue.slice(1);
-        indexFolder(directory);
+        indexFolder(directory, reindexTextPassages);
     }
     Timer {
         id: previewTimer

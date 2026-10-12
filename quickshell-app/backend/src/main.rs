@@ -7,10 +7,9 @@ mod watch;
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use fractal_search_core::{
-    catalog::{Asset, Catalog, Page},
+    catalog::{Asset, Catalog, IndexOptions, Page},
     media::MediaKind,
-    runtime::{ExecutionProvider, NativeRuntime},
-    Embedder,
+    runtime::{ExecutionProvider, IdlePolicy, NativeRuntime, RuntimeIdlePolicy},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -93,6 +92,10 @@ enum Command {
     },
     Index {
         directory: String,
+        #[serde(default)]
+        reindex_text: bool,
+        #[serde(default)]
+        verify_content: bool,
     },
     Preview {
         asset_id: String,
@@ -137,6 +140,34 @@ struct UiSettings {
     watch_changes: bool,
     close_after_opening: bool,
     image_batch_size: usize,
+    #[serde(default)]
+    group_text_by_file: bool,
+    #[serde(default = "default_text_idle")]
+    text_idle_seconds: u64,
+    #[serde(default = "default_media_idle")]
+    media_idle_seconds: u64,
+}
+fn default_text_idle() -> u64 {
+    900
+}
+fn default_media_idle() -> u64 {
+    300
+}
+fn idle_policy(seconds: u64) -> IdlePolicy {
+    if seconds == 0 {
+        IdlePolicy::KeepWarm
+    } else {
+        IdlePolicy::ReleaseAfter(Duration::from_secs(seconds))
+    }
+}
+impl UiSettings {
+    fn runtime_policy(&self) -> RuntimeIdlePolicy {
+        RuntimeIdlePolicy {
+            text: idle_policy(self.text_idle_seconds),
+            vision: idle_policy(self.media_idle_seconds),
+            audio: idle_policy(self.media_idle_seconds),
+        }
+    }
 }
 impl Default for UiSettings {
     fn default() -> Self {
@@ -146,6 +177,9 @@ impl Default for UiSettings {
             watch_changes: false,
             close_after_opening: true,
             image_batch_size: 1,
+            group_text_by_file: false,
+            text_idle_seconds: default_text_idle(),
+            media_idle_seconds: default_media_idle(),
         }
     }
 }
@@ -158,6 +192,10 @@ impl UiSettings {
         ensure!(
             (1..=fractal_search_core::MAX_IMAGE_BATCH_SIZE).contains(&self.image_batch_size),
             "Image batch size must be between 1 and 8"
+        );
+        ensure!(
+            self.text_idle_seconds <= 86400 && self.media_idle_seconds <= 86400,
+            "Idle timeouts must be 0 (keep warm) or at most 86400 seconds"
         );
         Ok(())
     }
@@ -294,6 +332,33 @@ fn theme(path: &Path) -> Result<Value> {
     }
     Ok(Value::Object(colors))
 }
+// Leave room for the reply envelope below the daemon’s 2 MiB frame ceiling.
+// Grouped matches may contain six escaped excerpts per result.
+const MAX_SEARCH_PAGE_BYTES: usize = 1_500_000;
+fn bounded_search_page(hits: &[Asset], offset: usize, limit: usize, text: bool) -> Result<Value> {
+    let mut page = serde_json::to_value(Page {
+        items: hits.iter().skip(offset).take(limit).cloned().collect(),
+        total: hits.len(),
+        offset,
+        limit,
+    })?;
+    page["searchMode"] = json!(if text { "hybrid" } else { "semantic" });
+    while serde_json::to_vec(&page)?.len() > MAX_SEARCH_PAGE_BYTES {
+        let items = page["items"]
+            .as_array_mut()
+            .context("Search page items missing")?;
+        ensure!(
+            items.len() > 1,
+            "A search result exceeds the response budget; reduce indexed metadata size"
+        );
+        items.pop();
+        let returned = items.len();
+        page["limit"] = json!(returned);
+        page["responseLimited"] = json!(true);
+    }
+    Ok(page)
+}
+
 fn status(
     catalog: &Catalog,
     runtime: &NativeRuntime,
@@ -303,7 +368,7 @@ fn status(
     active_image_batch_size: usize,
 ) -> Result<Value> {
     Ok(
-        json!({"protocolVersion":1,"catalog":catalog.status()?,"modelDirectory":runtime.model_dir(),"modelsPresent":runtime.assets_present(),"modelLoaded":runtime.loaded(),"textModelLoaded":runtime.text_loaded(),"textModelWarming":false,"provider":runtime.provider().name(),"deviceId":runtime.provider().device_id(),"threads":threads,"themeFile":theme_file,"settings":settings,"activeImageBatchSize":active_image_batch_size}),
+        json!({"protocolVersion":1,"catalog":catalog.status()?,"modelDirectory":runtime.model_dir(),"modelsPresent":runtime.assets_present(),"modelLoaded":runtime.loaded(),"textModelLoaded":runtime.text_loaded(),"textModelWarming":false,"provider":runtime.provider().name(),"deviceId":runtime.provider().device_id(),"threads":threads,"themeFile":theme_file,"settings":settings,"activeImageBatchSize":active_image_batch_size,"runtimeDiagnostics":runtime.diagnostics()?}),
     )
 }
 
@@ -447,6 +512,7 @@ fn serve(options: Options) -> Result<()> {
             .clamp(1, 6),
     );
     let mut runtime = NativeRuntime::with_provider(model_dir, threads, provider)?;
+    runtime.set_idle_policy(ui_settings.runtime_policy())?;
     let mut catalog = Catalog::open(&data_dir)?;
     fractal_search_core::initialize_image_decoders();
     let output = Arc::new(Mutex::new(std::io::stdout()));
@@ -579,8 +645,10 @@ fn serve(options: Options) -> Result<()> {
             &json!({"event":"warmupFinished","payload":{"ok":error.is_none(),"error":error}}),
         )?;
     }
-    let mut search_cache: Option<((String, Option<i64>, Option<MediaKind>, usize), Vec<Asset>)> =
-        None;
+    let mut search_cache: Option<(
+        (String, Option<i64>, Option<MediaKind>, usize, bool),
+        Vec<Asset>,
+    )> = None;
     while !STOP.load(Ordering::Relaxed) {
         let request = match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(request) => request,
@@ -690,7 +758,13 @@ fn serve(options: Options) -> Result<()> {
                 if let Some(id) = source_id {
                     catalog.source_directory(id)?;
                 }
-                let key = (query.clone(), source_id, media_kind, max_results);
+                let key = (
+                    query.clone(),
+                    source_id,
+                    media_kind,
+                    max_results,
+                    ui_settings.group_text_by_file,
+                );
                 if !search_cache.as_ref().is_some_and(|r| r.0 == key) {
                     if !runtime.text_loaded() {
                         emit(
@@ -706,12 +780,13 @@ fn serve(options: Options) -> Result<()> {
                     let embedding = runtime.embed_text(&query)?;
                     search_cache = Some((
                         key,
-                        catalog.search_filtered(
+                        catalog.search_filtered_grouped(
                             &query,
                             &embedding,
                             max_results,
                             source_id,
                             media_kind,
+                            ui_settings.group_text_by_file && media_kind == Some(MediaKind::Text),
                         )?,
                     ));
                 }
@@ -719,26 +794,23 @@ fn serve(options: Options) -> Result<()> {
                     .as_ref()
                     .context("Search cache not initialized")?
                     .1;
-                let mut page = serde_json::to_value(Page {
-                    items: hits.iter().skip(offset).take(limit).cloned().collect(),
-                    total: hits.len(),
-                    offset,
-                    limit,
-                })?;
-                page["searchMode"] = json!(if media_kind == Some(MediaKind::Text) {
-                    "hybrid"
-                } else {
-                    "semantic"
-                });
-                Ok(page)
+                bounded_search_page(hits, offset, limit, media_kind == Some(MediaKind::Text))
             }
-            Command::Index { directory } => {
+            Command::Index {
+                directory,
+                reindex_text,
+                verify_content,
+            } => {
                 search_cache = None;
                 let path = local_path(&directory)?;
-                let result = catalog.index_with_batch_size(
+                let result = catalog.index_with_options(
                     &path,
                     &mut runtime,
                     image_batch_size,
+                    IndexOptions {
+                        reindex_text,
+                        verify_content,
+                    },
                     || cancelled.load(Ordering::Relaxed) || STOP.load(Ordering::Relaxed),
                     |progress| {
                         emit(
@@ -775,6 +847,8 @@ fn serve(options: Options) -> Result<()> {
                         ui: settings.clone(),
                     },
                 )?;
+                runtime.set_idle_policy(settings.runtime_policy())?;
+                search_cache = None;
                 ui_settings = settings;
                 watcher = replacement;
                 status(
@@ -788,8 +862,9 @@ fn serve(options: Options) -> Result<()> {
             }
             Command::SetModelDirectory { directory } => {
                 let path = local_path(&directory)?.canonicalize()?;
-                let mut replacement =
+                let replacement =
                     NativeRuntime::with_provider(path.clone(), threads, runtime.provider())?;
+                replacement.set_idle_policy(ui_settings.runtime_policy())?;
                 replacement.verify()?;
                 save_settings(
                     &settings_path,
@@ -1023,6 +1098,7 @@ mod tests {
                 watch_changes: true,
                 close_after_opening: false,
                 image_batch_size: 4,
+                ..UiSettings::default()
             },
         };
         save_settings(&path, &settings).unwrap();
@@ -1067,5 +1143,51 @@ mod tests {
             invalid.image_batch_size = size;
             assert!(invalid.validate().is_ok());
         }
+    }
+    #[test]
+    fn grouped_search_pages_respect_escaped_json_frame_budget_and_continue() {
+        let sample = Asset {
+            asset_id: "asset_11111111-1111-4111-8111-111111111111".into(),
+            filename: "quoted\".md".into(),
+            path: format!("/{}", "\"".repeat(4090)),
+            thumbnail_url: String::new(),
+            width: 0,
+            height: 0,
+            media_kind: "text".into(),
+            segment_index: 0,
+            start_ms: None,
+            end_ms: None,
+            text_excerpt: Some("\"".repeat(2048)),
+            similarity: Some(1.),
+            hybrid_score: Some(0.03),
+            start_byte: Some(0),
+            end_byte: Some(4096),
+            start_line: Some(1),
+            end_line: Some(2),
+            additional_matches: Vec::new(),
+        };
+        let mut group = sample.clone();
+        group.additional_matches = vec![sample; 5];
+        let hits = vec![group; 100];
+        let mut offset = 0;
+        let mut pages = 0;
+        while offset < hits.len() {
+            let page = bounded_search_page(&hits, offset, 100, true).unwrap();
+            let bytes =
+                serde_json::to_vec(&json!({"id":u64::MAX,"ok":true,"result":page})).unwrap();
+            assert!(bytes.len() + 1 < 2 * 1024 * 1024);
+            assert_eq!(page["offset"].as_u64().unwrap() as usize, offset);
+            let count = page["items"].as_array().unwrap().len();
+            assert!(count > 0);
+            assert!(page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["additionalMatches"].as_array().unwrap().len() == 5));
+            offset += count;
+            pages += 1;
+        }
+        assert_eq!(offset, 100);
+        assert!(pages > 1);
     }
 }

@@ -16,3 +16,6 @@ ShortcutKey 1.0 ShortcutKey.qml
 SearchConfirmationDialog 1.0 SearchConfirmationDialog.qml
 ResultActions 1.0 ResultActions.qml
 AcceleratorSection 1.0 AcceleratorSection.qml
+GroupedTextMatches 1.0 GroupedTextMatches.qml
+ModelIdlePolicy 1.0 ModelIdlePolicy.qml
+ModelRuntimeSection 1.0 ModelRuntimeSection.qml

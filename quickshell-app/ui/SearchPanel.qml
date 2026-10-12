@@ -92,6 +92,8 @@ Item {
                 stopDialog.close();
             if (restartDialog.visible)
                 restartDialog.close();
+            if (rebuildTextDialog.visible)
+                rebuildTextDialog.close();
             if (imageFolder.visible)
                 imageFolder.close();
             if (modelFolder.visible)
@@ -136,9 +138,9 @@ Item {
         property bool exclusiveKeyboard: true
         readonly property int compactHeight: Math.ceil(Style.space(56) + hotkeysFooter.implicitHeight)
         readonly property bool hasStatus: app.errorMessage.length > 0 || app.notice.length > 0 || app.showIndexReport || (app.ready && !app.status.modelsPresent) || app.indexing || app.installingModels
-        readonly property bool expanded: app.page !== "summon" || hasStatus || errorDialog.visible || skippedFiles.visible || stopDialog.visible || restartDialog.visible
+        readonly property bool expanded: app.page !== "summon" || hasStatus || errorDialog.visible || skippedFiles.visible || stopDialog.visible || restartDialog.visible || rebuildTextDialog.visible
         readonly property int preferredWidth: Style.space(app.page === "results" ? 980 : app.page === "settings" ? 600 : 680)
-        readonly property int preferredHeight: app.page === "settings" ? Style.space(640) : app.page === "results" || errorDialog.visible || skippedFiles.visible ? Style.space(640) : (stopDialog.visible || restartDialog.visible) ? Style.space(320) : hasStatus ? Math.ceil(compactHeight + statusArea.implicitHeight + Style.space(32)) : compactHeight
+        readonly property int preferredHeight: app.page === "settings" ? Style.space(640) : app.page === "results" || errorDialog.visible || skippedFiles.visible ? Style.space(640) : (stopDialog.visible || restartDialog.visible || rebuildTextDialog.visible) ? Style.space(320) : hasStatus ? Math.ceil(compactHeight + statusArea.implicitHeight + Style.space(32)) : compactHeight
         readonly property int targetWidth: Math.min(panel.testWidth || preferredWidth, surfaceWidth)
         readonly property int targetHeight: Math.min(panel.testHeight || preferredHeight, surfaceHeight)
         implicitWidth: surfaceWidth
@@ -247,7 +249,7 @@ Item {
             // A new/remapped Qt window has a provisional size until Wayland
             // configures it. Present the card only once that buffer is ready.
             visible: window.surfaceReady
-            onVisibleChanged: if (visible && !skippedFiles.visible && !errorDialog.visible && !stopDialog.visible && !restartDialog.visible)
+            onVisibleChanged: if (visible && !skippedFiles.visible && !errorDialog.visible && !stopDialog.visible && !restartDialog.visible && !rebuildTextDialog.visible)
                 panel.focusSearch()
             anchors.centerIn: parent
             width: 0
@@ -270,27 +272,27 @@ Item {
             readonly property bool shortWindow: window.targetHeight < 450
             Shortcut {
                 sequence: "Ctrl+Q"
-                enabled: !app.closing && !imageFolder.visible && !modelFolder.visible && !restartDialog.visible
+                enabled: !app.closing && !imageFolder.visible && !modelFolder.visible && !restartDialog.visible && !rebuildTextDialog.visible
                 onActivated: panel.requestStop()
             }
             Shortcut {
                 sequence: "Ctrl+,"
-                enabled: app.page !== "settings" && !skippedFiles.visible && !errorDialog.visible && !removeDialog.visible && !stopDialog.visible && !restartDialog.visible
+                enabled: app.page !== "settings" && !skippedFiles.visible && !errorDialog.visible && !removeDialog.visible && !stopDialog.visible && !restartDialog.visible && !rebuildTextDialog.visible
                 onActivated: app.showSettings()
             }
             Shortcut {
                 sequence: "Escape"
-                enabled: !skippedFiles.visible && !errorDialog.visible && !removeDialog.visible && !stopDialog.visible && !restartDialog.visible && !imageFolder.visible && !modelFolder.visible
+                enabled: !skippedFiles.visible && !errorDialog.visible && !removeDialog.visible && !stopDialog.visible && !restartDialog.visible && !rebuildTextDialog.visible && !imageFolder.visible && !modelFolder.visible
                 onActivated: app.back()
             }
             Shortcut {
                 sequence: "Ctrl+Return"
-                enabled: app.page === "results" && !skippedFiles.visible && !stopDialog.visible && !restartDialog.visible
+                enabled: app.page === "results" && !skippedFiles.visible && !stopDialog.visible && !restartDialog.visible && !rebuildTextDialog.visible
                 onActivated: app.revealOriginal()
             }
             Shortcut {
                 sequence: "Ctrl+Enter"
-                enabled: app.page === "results" && !skippedFiles.visible && !stopDialog.visible && !restartDialog.visible
+                enabled: app.page === "results" && !skippedFiles.visible && !stopDialog.visible && !restartDialog.visible && !rebuildTextDialog.visible
                 onActivated: app.revealOriginal()
             }
 
@@ -573,6 +575,7 @@ Item {
                         SettingsPage {
                             id: settingsPage
                             visible: app.page === "settings"
+                            panelVisible: window.visible
                             Layout.fillWidth: true
                             Layout.fillHeight: true
                             Layout.margins: canvas.shortWindow ? 16 : 24
@@ -584,6 +587,7 @@ Item {
                             onShowSkippedFiles: skippedFiles.open()
                             onStopService: panel.requestStop()
                             onRestartService: panel.requestRestart()
+                            onRebuildText: rebuildTextDialog.open()
                             onRemoveFolder: (sourceId, directory) => {
                                 removeDialog.sourceId = sourceId;
                                 removeDialog.directory = directory;
@@ -769,6 +773,15 @@ Item {
                                                     SearchText {
                                                         Layout.fillWidth: true
                                                         Layout.minimumWidth: 0
+                                                        visible: resultRow.model.additionalMatchCount > 0
+                                                        text: "+ " + resultRow.model.additionalMatchCount + " matching passages in this file"
+                                                        color: app.secondaryText
+                                                        elide: Text.ElideRight
+                                                        font.pixelSize: SearchTheme.font.bodySmall
+                                                    }
+                                                    SearchText {
+                                                        Layout.fillWidth: true
+                                                        Layout.minimumWidth: 0
                                                         visible: resultRow.model.textExcerpt.length > 0
                                                         text: resultRow.model.textExcerpt.replace(/\s+/g, " ")
                                                         color: app.secondaryText
@@ -860,6 +873,11 @@ Item {
                                             elide: Text.ElideMiddle
                                             font.pixelSize: SearchTheme.font.bodySmall
                                         }
+                                        GroupedTextMatches {
+                                            Layout.fillWidth: true
+                                            maximumExcerptHeight: canvas.shortWindow ? Style.space(70) : Style.space(140)
+                                            app: app
+                                        }
                                         ResultActions {
                                             Layout.fillWidth: true
                                             app: app
@@ -897,6 +915,14 @@ Item {
                                     }
                                 }
                             }
+                            GroupedTextMatches {
+                                visible: !previewPane.visible && matches.length > 0
+                                Layout.fillWidth: true
+                                Layout.leftMargin: Style.space(12)
+                                Layout.rightMargin: Style.space(12)
+                                maximumExcerptHeight: canvas.shortWindow ? Style.space(70) : Style.space(140)
+                                app: app
+                            }
                             ResultActions {
                                 visible: app.results.count > 0 && !previewPane.visible
                                 Layout.fillWidth: true
@@ -906,7 +932,7 @@ Item {
                             SearchButton {
                                 Layout.alignment: Qt.AlignHCenter
                                 Layout.margins: 6
-                                visible: app.results.count < app.total && !app.activeQuery.length
+                                visible: app.results.count < app.total
                                 text: "Load more"
                                 colors: app.colors
                                 enabled: app.ready && !app.busy
@@ -1026,6 +1052,17 @@ Item {
                 confirmText: "Stop service"
                 onClosed: panel.focusSearch()
                 onAccepted: app.shutdown()
+            }
+            SearchConfirmationDialog {
+                id: rebuildTextDialog
+                parent: canvas
+                colors: app.colors
+                borderColor: app.borderColor
+                title: "Rebuild text passages?"
+                message: "Regenerate text passages and embeddings in every indexed folder, including unchanged text files. This can take time. Other supported files are checked for content changes.\n\nOriginal files stay in place. Active inference finishes safely if you stop; incomplete file replacements keep their previous complete results."
+                confirmText: "Rebuild text"
+                onClosed: panel.focusSearch()
+                onAccepted: app.reindexAll(true)
             }
             SearchConfirmationDialog {
                 id: removeDialog
@@ -1166,16 +1203,18 @@ Item {
         errorDialog.close();
         removeDialog.close();
         restartDialog.close();
+        rebuildTextDialog.close();
         stopDialog.open();
     }
     function requestRestart() {
-        if (app.closing || !app.batchRestartRequired || restartDialog.visible)
+        if (app.closing || !app.batchRestartRequired || restartDialog.visible || rebuildTextDialog.visible)
             return;
         queryTimer.stop();
         skippedFiles.close();
         errorDialog.close();
         removeDialog.close();
         stopDialog.close();
+        rebuildTextDialog.close();
         restartDialog.open();
     }
     // The desktop close binding must never close the app behind our overlay.

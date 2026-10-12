@@ -35,7 +35,7 @@ const BOI_TOKEN_ID: i64 = 255999;
 const EOI_TOKEN_ID: i64 = 258882;
 const MAX_PIXELS: u64 = 100_000_000;
 const MAX_SIDE: u32 = 65_536;
-const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 4096;
 
 pub struct ImageInputs {
@@ -605,24 +605,38 @@ impl QueryTokenizer {
     }
 
     pub fn encode_document(&self, title: &str, text: &str) -> Result<TextInputs> {
+        self.encode_prefixed(Self::format_document(title, text)?)
+    }
+
+    /// Actual formatted input count, including title/template and BOS/EOS.
+    /// Unlike embedding, this deliberately returns counts over the context
+    /// limit so extraction can split the source without truncating its tokens.
+    pub fn document_token_count(&self, title: &str, text: &str) -> Result<usize> {
+        Ok(self
+            .tokenize_formatted(Self::format_document(title, text)?)?
+            .get_ids()
+            .len())
+    }
+
+    fn format_document(title: &str, text: &str) -> Result<String> {
         validate_document_input(title, text)?;
         let title = if title.trim().is_empty() {
             "none"
         } else {
             title
         };
-        self.encode_prefixed(format!("title: {title} | text: {text}"))
+        Ok(format!("title: {title} | text: {text}"))
     }
 
-    fn encode_prefixed(&self, text: String) -> Result<TextInputs> {
+    fn tokenize_formatted(&self, text: String) -> Result<tokenizers::Encoding> {
         let encoding = self
             .tokenizer
             .encode(text, true)
             .map_err(|error| anyhow::anyhow!("Tokenizing EmbeddingGemma 2 text: {error}"))?;
         let ids = encoding.get_ids();
         ensure!(
-            (2..=MAX_SEQUENCE_LENGTH).contains(&ids.len()),
-            "Text exceeds model context of {MAX_SEQUENCE_LENGTH} tokens"
+            ids.len() >= 2,
+            "Tokenizer returned an empty formatted text sequence"
         );
         ensure!(
             ids.first() == Some(&(BOS_TOKEN_ID as u32))
@@ -637,6 +651,16 @@ impl QueryTokenizer {
         ensure!(
             !ids.iter().any(|&id| [258880, 258881, 258884].contains(&id)),
             "Media tokens are not allowed in plain text"
+        );
+        Ok(encoding)
+    }
+
+    fn encode_prefixed(&self, text: String) -> Result<TextInputs> {
+        let encoding = self.tokenize_formatted(text)?;
+        let ids = encoding.get_ids();
+        ensure!(
+            ids.len() <= MAX_SEQUENCE_LENGTH,
+            "Text exceeds model context of {MAX_SEQUENCE_LENGTH} tokens"
         );
         Ok(TextInputs {
             input_ids: ids.iter().map(|&id| i64::from(id)).collect(),
@@ -653,6 +677,81 @@ impl QueryTokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_document_tokenizer(bos_count: usize) -> QueryTokenizer {
+        use tokenizers::{
+            models::wordlevel::WordLevel, pre_tokenizers::whitespace::WhitespaceSplit,
+            processors::template::TemplateProcessing,
+        };
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("[UNK]".to_owned(), 0),
+                    ("<eos>".to_owned(), 1),
+                    ("<bos>".to_owned(), 2),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(WhitespaceSplit));
+        tokenizer.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single(format!("{}$A <eos>", "<bos> ".repeat(bos_count)))
+                .unwrap()
+                .special_tokens(vec![("<bos>", 2), ("<eos>", 1)])
+                .build()
+                .unwrap(),
+        ));
+        QueryTokenizer { tokenizer }
+    }
+
+    #[test]
+    fn document_token_count_matches_exact_format_title_and_special_tokens() {
+        let tokenizer = synthetic_document_tokenizer(1);
+        for (title, passage, expected) in [
+            ("report.md", "hello world", 8),
+            ("two word title", "hello world", 10),
+            (" \t", "hello world", 8),
+        ] {
+            let count = tokenizer.document_token_count(title, passage).unwrap();
+            assert_eq!(count, expected);
+            assert_eq!(
+                count,
+                tokenizer
+                    .encode_document(title, passage)
+                    .unwrap()
+                    .sequence_length
+            );
+        }
+        assert_eq!(
+            QueryTokenizer::format_document("  ", "hello").unwrap(),
+            "title: none | text: hello"
+        );
+        assert_eq!(
+            QueryTokenizer::format_document("note.md", "hello").unwrap(),
+            "title: note.md | text: hello"
+        );
+    }
+
+    #[test]
+    fn counting_returns_over_context_sequences_for_extraction_to_split() {
+        let tokenizer = synthetic_document_tokenizer(MAX_SEQUENCE_LENGTH);
+        assert!(tokenizer.document_token_count("t", "hello").unwrap() > MAX_SEQUENCE_LENGTH);
+        assert!(tokenizer
+            .encode_document("t", "hello")
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("model context"));
+        assert!(tokenizer.document_token_count("t", " ").is_err());
+        assert!(tokenizer
+            .document_token_count(&"x".repeat(1025), "hello")
+            .is_err());
+    }
 
     #[test]
     #[ignore = "requires FRACTAL_SEARCH_TEST_TOKENIZER pointing to the pinned tokenizer.json; no model weights"]

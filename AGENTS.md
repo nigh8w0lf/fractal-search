@@ -86,6 +86,7 @@ python3 quickshell-app/tests/smoke_accelerator_ui.py
 python3 quickshell-app/tests/smoke_diagnostics_ui.py
 python3 quickshell-app/tests/smoke_multimodal_ui.py
 python3 quickshell-app/tests/smoke_hybrid_text_ui.py
+python3 quickshell-app/tests/smoke_qmd_ui.py
 python3 quickshell-app/tests/smoke_multimodal.py target/debug/fractal-search target/debug/fractal-search-mcp /absolute/path/to/models
 python3 quickshell-app/tests/smoke_installer.py /absolute/path/to/prebuilt/bundle
 python3 quickshell-app/tests/smoke_dependency_layout.py
@@ -108,3 +109,7 @@ Run simulated keyboard/mouse input only in the isolated compositor. Shared-deskt
 - Keep both root onboarding docs and affected scoped docs aligned when behavior, source ownership, commands or workflows change. Report exact checks and material limitations; dated test counts must never stand in for current validation.
 
 - Accelerator status must distinguish configured, available and active providers. Grey out GPU when requirements fail; do not label a disconnected CUDA service as active CPU. Keep diagnostics collapsed by default, errors visible, and the full report copyable for sharing with an agent. Automatic preflight must not load models or switch providers.
+
+## QMD-inspired indexing and runtime extension
+
+Read [QMD-SEARCH-IMPROVEMENTS.md](docs/QMD-SEARCH-IMPROVEMENTS.md) for the non-destructive schema-4 extension: private generation-bound content/vector caches, separate extraction profile and explicit text reindex, real formatted-input token budgets, match-centered bounded snippets, optional Text document grouping, serial idle session ownership and restart-aware thresholded FTS replacement. Keep lexical/model/extraction contracts distinct. Never describe the bounded full-replacement fallback as native incremental posting maintenance or report synthetic quality/VRAM results as measurements. Run the labeled evaluation harness separately from numerical embedding parity.

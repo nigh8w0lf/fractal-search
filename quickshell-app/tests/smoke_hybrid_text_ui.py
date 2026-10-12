@@ -30,6 +30,8 @@ function create() {
     const commands = [];
     const c = {console:{error(){}}, ready:true, starting:false, closing:false, indexing:false,
         installingModels:false, loading:false, searchStarting:false, searchWarming:false,
+        get busy(){return this.loading || this.indexing || this.installingModels || this.closing || this.restarting},
+        reindexQueue:[], reindexTextPassages:false,
         stoppedCleanly:false, restarting:false, deferredSearch:false, pendingSearchText:'',
         query:'', activeQuery:'', sourceId:null, mediaKind:null, queryGeneration:0,
         resultRequestSerial:0, resultRequestPending:false, previewGeneration:0, previewLoading:false, previewRequestPending:false, previewRequestSerial:0,
@@ -138,7 +140,68 @@ c.reply(page,[fixture('image2','image')]); assert.equal(c.results.count,2); asse
 // Closing during a search invalidates retained text and late results.
 c.dismissRequested=()=>{}; c.search('closing'); old=c.commands.shift(); c.dismiss();
 c.reply(old,[fixture('closed','image',.9)]); assert.equal(c.results.count,0); assert.equal(c.activeQuery,'');
+// Grouped Text results preserve winning order and bounded additional passage metadata.
+c = create(); c.mediaKind='text'; c.sourceId=31; c.search('grouped query'); current=c.commands.shift();
+const winner = {...fixture('winner','text',.2,.035), path:'/synthetic/notes.md', startByte:128, endByte:512, startLine:7, endLine:18};
+const extra = {...fixture('extra','text',.9,.028), path:winner.path, segmentIndex:3, startByte:768, endByte:900, startLine:30, endLine:30};
+c.reply(current,[{...winner,additionalMatches:[extra]}]);
+assert.equal(c.results.count,1); assert.equal(c.selectedAsset.assetId,'winner');
+assert.equal(c.selectedAsset.additionalMatchCount,1);
+assert.equal(c.additionalMatches(c.selectedAsset)[0].assetId,'extra');
+assert.equal(c.additionalMatches(c.selectedAsset)[0].hasHybridScore,true);
+assert.equal(c.mediaLabel(c.selectedAsset),'Text · passage 1 · lines 7–18');
+assert.equal(c.mediaLabel(c.additionalMatches(c.selectedAsset)[0]),'Text · passage 4 · line 30');
+assert.equal(c.mediaLabel(c.resultAsset({...winner,startLine:null,endLine:null},true)),'Text · passage 1 · bytes 128–512');
+// A byte-bounded grouped page can be shorter than topMatches; append from its
+// actual item count without replacing selection or dropping extra passages.
+c.total=2;c.browse(true);current=c.commands.shift();
+assert.equal(current.command.type,'search');assert.equal(current.command.offset,1);
+c.reply(current,[{...winner,assetId:'other-file',path:'/synthetic/other.md'}]);
+assert.equal(c.results.count,2);assert.equal(c.selectedAsset.assetId,'winner');
+assert.equal(c.additionalMatches(c.selectedAsset)[0].assetId,'extra');
+c.revealOriginal(); current=c.commands.shift(); assert.equal(current.command.assetId,'winner');
+c.receive(JSON.stringify({id:current.id,ok:false,error:'fixture reveal failure'}));
+assert.equal(c.previewText(),'bounded excerpt');
+assert.equal(c.resultAsset({...winner,additionalMatches:[{...extra,path:'/other/file'}]},true),null);
+assert.equal(c.resultAsset({...winner,additionalMatches:[extra,extra]},true),null);
+assert.equal(c.resultAsset({...winner,additionalMatches:[{...extra,additionalMatches:[winner]}]},true),null);
+assert.equal(c.resultAsset({...winner,additionalMatches:Array(6).fill(extra)},true),null);
+assert.equal(c.resultAsset({...winner,additionalMatches:false},true),null);
+assert.equal(c.resultAsset({...winner,textExcerpt:'x'.repeat(2049)},true),null);
+assert.equal(c.resultAsset({...winner,textExcerpt:'漢'.repeat(683)},true),null,'Excerpt cap is UTF-8 bytes');
+assert.equal(c.resultAsset({...winner,textExcerpt:'😀'.repeat(513)},true),null);
+assert.ok(c.resultAsset({...winner,textExcerpt:'😀'.repeat(512)},true));
+assert.equal(c.resultAsset({...winner,textExcerpt:'\uD800'},true),null,'Reject unpaired UTF-16 surrogate');
+assert.equal(c.resultAsset({...winner,additionalMatches:Array.from({length:5},(_,i)=>({...extra,assetId:'extra'+i}))},true).additionalMatchCount,5);
+// Saving grouping refreshes the same query/filter scope and does not drop unrelated preferences.
+c.settings={topMatches:6,groupTextByFile:false,textIdleSeconds:900,mediaIdleSeconds:300,imageBatchSize:1};
+c.updateSettings({groupTextByFile:true}); current=c.commands.shift();
+assert.equal(current.command.settings.groupTextByFile,true); assert.equal(current.command.settings.textIdleSeconds,900);
+c.receive(JSON.stringify({id:current.id,ok:true,result:{settings:current.command.settings,catalog:{sources:[]}}}));
+current=c.commands.shift(); assert.equal(current.command.query,'grouped query'); assert.equal(current.command.sourceId,31); assert.equal(current.command.mediaKind,'text');
+c.reply(current,[winner]); assert.equal(c.selectedAsset.additionalMatchCount,0);
+c.mediaKind=null; assert.equal(c.resultAsset({...winner,hybridScore:null,additionalMatches:[{...extra,hybridScore:null}]},true),null,'All media retains segment mode');
+c.mediaKind='text'; c.activeQuery=''; assert.equal(c.resultAsset({...winner,hybridScore:null,additionalMatches:[{...extra,hybridScore:null}]},true),null,'Browsing retains segment mode');
+
+// Idle settings use the ordinary settings update, including zero Keep warm, without a restart or search.
+c=create(); c.settings={topMatches:6,groupTextByFile:false,textIdleSeconds:900,mediaIdleSeconds:300,imageBatchSize:1};
+c.updateSettings({textIdleSeconds:0,mediaIdleSeconds:86400}); current=c.commands.shift();
+assert.equal(current.command.settings.textIdleSeconds,0); assert.equal(current.command.settings.mediaIdleSeconds,86400);
+c.receive(JSON.stringify({id:current.id,ok:true,result:{settings:current.command.settings,catalog:{sources:[]}}}));
+assert.equal(c.commands.length,0); assert.equal(c.loading,false);
+
+// Only the explicit rebuild path verifies content and forces text embedding; ordinary rescan/add does neither.
+c=create(); c.status.catalog.sources=[{directory:'/synthetic/first'},{directory:'/synthetic/second'}];
+c.reindexAll(true); current=c.commands.shift();
+assert.equal(current.command.directory,'/synthetic/first'); assert.equal(current.command.reindexText,true); assert.equal(current.command.verifyContent,true);
+c.receive(JSON.stringify({id:current.id,ok:true,result:{failed:0,failures:[],cancelled:false,indexed:1,unchanged:0,removed:0}}));
+current=c.commands.shift(); assert.equal(current.command.directory,'/synthetic/second'); assert.equal(current.command.reindexText,true);
+c.cancelIndex(); current=c.commands.shift(); assert.equal(current.command.type,'cancel'); assert.equal(c.reindexQueue.length,0);
+c=create(); c.status.catalog.sources=[{directory:'/synthetic/ordinary'}]; c.reindexAll(); current=c.commands.shift();
+assert.equal(current.command.type,'index'); assert.equal(current.command.reindexText,undefined); assert.equal(current.command.verifyContent,undefined);
+c=create(); c.indexFolder('/synthetic/new'); current=c.commands.shift(); assert.equal(current.command.reindexText,undefined);
 console.log('PASS: actual Controller JS media/query/folder scope, bounded coalescing, model-free browsing, hybrid order/labels, debounce, warmup/reconnect and stale previews');
+console.log('PASS: grouped passage bounds/order/location/actions, segment-mode preservation, grouping refresh, live idle settings and explicit versus ordinary indexing');
 '''
     import json
     harness = harness.replace('__METHODS__', json.dumps(script))
