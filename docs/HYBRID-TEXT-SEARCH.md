@@ -16,7 +16,7 @@ Only text rows contain the internal `indexed_text` field. Its `filename-newline-
 
 ## Literal multilingual terms
 
-The pinned LanceDB 0.37.1 / Lance 10 tokenizer uses `icu/split`, lowercase and ASCII folding, with stemming and stop-word removal disabled. ICU provides bundled multilingual segmentation without a downloaded language model. Maximum token length is 4,096. Positions are not stored; this is literal term matching with OR semantics, not a phrase or Boolean query language. Quotes, apostrophes and words such as AND/OR are ordinary input, and punctuation may split terms. Byte-exact identifier and substring matching are not promised.
+The pinned LanceDB 0.37.1 source is vendored with a manifest-only patch disabling unused Jieba/Lindera features; see [patch provenance](../vendor/lancedb/PATCHES.md). ICU remains enabled, and existing index metadata and tokenization are unchanged. The Lance 10 tokenizer uses `icu/split`, lowercase and ASCII folding, with stemming and stop-word removal disabled. ICU provides bundled multilingual segmentation without a downloaded language model. Maximum token length is 4,096. Positions are not stored; this is literal term matching with OR semantics, not a phrase or Boolean query language. Quotes, apostrophes and words such as AND/OR are ordinary input, and punctuation may split terms. Byte-exact identifier and substring matching are not promised.
 
 Queries retain the 4,096 UTF-8-byte bound and NUL rejection. A punctuation-only query with no lexical tokens has an empty BM25 list and still runs semantic text search. A tokenizer, index or query failure is an error, never a silent vector-only fallback. Search text is passed through the native Match-query API rather than interpolated into SQL.
 

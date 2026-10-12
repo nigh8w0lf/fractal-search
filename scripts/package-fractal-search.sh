@@ -16,9 +16,9 @@ while (($#)); do
 done
 cd -- "$SEARCH_ROOT"
 if ((SEARCH_BUILD)); then
-  SEARCH_ARGS=(build --locked -p fractal-search)
+  SEARCH_ARGS=(build --locked -p fractal-search -p fractal-folder-picker -p fractal-search-mcp --bins)
   [[ $SEARCH_PROFILE == release ]] && SEARCH_ARGS+=(--release)
-  ((SEARCH_CUDA)) && SEARCH_ARGS+=(--features cuda)
+  ((SEARCH_CUDA)) && SEARCH_ARGS+=(--features fractal-search/cuda,fractal-search-mcp/cuda)
   cargo "${SEARCH_ARGS[@]}"
 fi
 SEARCH_TARGET=$(cargo metadata --no-deps --format-version 1 --locked | jq -er .target_directory)
@@ -46,6 +46,7 @@ if ((SEARCH_CUDA)); then
   cp -L -- "$SEARCH_TARGET/$SEARCH_PROFILE/libonnxruntime_providers_shared.so" "$SEARCH_TARGET/$SEARCH_PROFILE/libonnxruntime_providers_cuda.so" "$SEARCH_OUTPUT/bin/"
 fi
 cp -- quickshell-app/manifest.json quickshell-app/packaging/install.sh quickshell-app/packaging/prune-runtimes.sh quickshell-app/packaging/uninstall.sh quickshell-app/packaging/close-window.sh quickshell-app/packaging/close-binding.sh quickshell-app/packaging/README.md quickshell-app/packaging/NOTICE "$SEARCH_OUTPUT/"
+cp -- vendor/lancedb/LICENSE "$SEARCH_OUTPUT/LANCEDB-LICENSE"
 for SEARCH_QML in quickshell-app/ui/*.qml quickshell-app/ui/qmldir; do
   [[ ${SEARCH_QML##*/} == shell.qml ]] && continue
   cp -- "$SEARCH_QML" "$SEARCH_OUTPUT/ui/"

@@ -2,11 +2,17 @@
 
 An Omarchy Shell plugin with a Quickshell search panel and a bundled native Rust EmbeddingGemma 2 ONNX service. The panel runs inside the existing desktop shell; a systemd user service owns the model worker independently of UI reloads. Add a folder, index supported image/text/audio/video content, and search with a description. It generates thumbnails and bounded previews; originals stay in their selected folders. Image decoding, preprocessing and model inference run in the native service; audio/video decoding uses explicit system ffmpeg/ffprobe commands.
 
-`crates/fractal-search-core/` implements native decoding, bounded multimodal preprocessing, the pinned 8,192-token tokenizer contract and the LanceDB segment catalog. The workspace builds the plugin backend, native folder chooser and read-only MCP server together.
+`crates/fractal-search-core/` implements native decoding, bounded multimodal preprocessing, the pinned 8,192-token tokenizer contract and the LanceDB segment catalog. The workspace contains independent packages for the plugin backend, native folder chooser and read-only MCP server; packaging builds all three together. Targeted `cargo build -p fractal-folder-picker --locked` builds omit the inference/catalog and MCP stacks. Build the daemon with `-p fractal-search` and the MCP server with `-p fractal-search-mcp`; enable `--features cuda` for each of those packages when needed.
 
 ## Search and settings
 
 Type a description to search. Results use a compact list and a larger selected-result preview; **Open file** opens the whole original in its default app and **Show in folder** selects it in your file manager. Both actions remain available in the list-only layout and narrow windows. Arrow keys select results, Enter opens the selected file, Ctrl+Enter reveals it, and Escape goes back. There is no Browse all photos button.
+
+`DesktopFileOpener.qml` uses `gio open` for local-file MIME associations and
+terminal-based desktop entries. It reports missing commands, launch errors and
+15-second timeouts; successful admission hides/releases the panel according to
+Preferences. Desktop defaults are preserved, and post-launch application failures
+cannot be verified by the opener. The installer requires GLib's `gio` command.
 
 Settings has three tabs:
 
@@ -53,7 +59,7 @@ Use **Set up model** on first open to download the pinned assets (~2.96 GB) with
 
 `--model-dir PATH` and `--threads N` can configure a development installation. CPU is the default; the thread default is half the available logical CPUs, rounded up and capped at six. Providers are never silently selected. The installed service prepares the text-search model in the background on startup; the vision and audio models load only when indexing needs them. Loaded models remain resident while the backend runs. Standalone developer commands retain lazy loading unless passed `--warm-search`.
 
-The development build optimizes native core loops at level 3, with dependency optimization remaining at level 2. Inference requests only the sentence embedding, avoiding the unused backbone token output. CUDA's CPU worker pools sleep while waiting for work; CPU threading stays unchanged. The [synthetic indexing benchmark](#synthetic-indexing-benchmark) compares scan timings, CPU usage and search scores using temporary data.
+The development build optimizes native core loops at level 3, with dependency optimization remaining at level 2. Workspace debug information is level 1 and third-party debug information is disabled to limit artifact growth; incremental compilation remains enabled for faster rebuilds. The portal helper uses the shared Tokio runtime dependency, with its existing blocking API. See the [dependency review](../docs/DEPENDENCIES.md). Inference requests only the sentence embedding, avoiding the unused backbone token output. CUDA's CPU worker pools sleep while waiting for work; CPU threading stays unchanged. The [synthetic indexing benchmark](#synthetic-indexing-benchmark) compares scan timings, CPU usage and search scores using temporary data.
 
 After a successful install, obsolete runtime builds are removed automatically. The current and immediately previous builds are retained, including across reinstalls; builds still running or containing the configured CUDA library directory are retained until a later update. Failed installs do not prune builds. Cleanup is limited to recognized runtime bundle directories and preserves catalogs, models, shared CUDA libraries and unrelated files. Cleanup errors are reported without rolling back the successful installation.
 
@@ -172,7 +178,7 @@ cargo check --workspace --locked
 cargo test --workspace --locked
 ```
 
-These commands cover both workspace members: the native search core and plugin backend.
+These commands cover all four workspace members: the native search core, daemon, folder picker and MCP server.
 
 With pinned assets and reference fixtures available, validate the resident runtime against the existing native-input fixtures:
 

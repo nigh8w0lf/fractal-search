@@ -14,7 +14,7 @@ Read [README.md](README.md) first. These two root documents provide the current 
 
 ## Architecture and ownership
 
-The root Cargo workspace contains `crates/fractal-search-core` and `quickshell-app/backend` (package `fractal-search`). It builds `fractal-search`, `fractal-folder-picker` and `fractal-search-mcp`. Production inference is native ONNX Runtime; Python scripts are development tooling only.
+The root Cargo workspace contains `crates/fractal-search-core`, `quickshell-app/backend` (`fractal-search`), `quickshell-app/folder-picker` (`fractal-folder-picker`) and `quickshell-app/mcp` (`fractal-search-mcp`). It builds `fractal-search`, `fractal-folder-picker` and `fractal-search-mcp`. Production inference is native ONNX Runtime; Python scripts are development tooling only.
 
 - `SearchPanel.qml` owns launcher/results/settings geometry, focus, shortcuts and lifecycle. `Controller.qml` owns desktop socket requests, state, selected assets and operation progress.
 - `SettingsPage.qml` has **Folders**, **Preferences** and **Performance** tabs. Keep folder watching (Keep folders up to date) under Folders. Keep the tabs visible while content scrolls; preserve keyboard tab navigation. Model paths, runtime diagnostics and service management belong under Performance.
@@ -61,7 +61,7 @@ cargo check --workspace --locked --features cuda
 cargo test --workspace --locked --features cuda
 ```
 
-Build binaries for integration checks with `cargo build -p fractal-search --bins --locked` (add `--features cuda` when needed). CPU and CUDA builds share target paths; confirm capabilities with `target/debug/fractal-search providers` and `target/debug/fractal-search-mcp --providers` before packaging. Use an existing verified model cache for real inference, not a new download just for testing.
+Build binaries for integration checks with `cargo build -p fractal-search -p fractal-folder-picker -p fractal-search-mcp --bins --locked` (add `--features cuda` when needed). CPU and CUDA builds share target paths; confirm capabilities with `target/debug/fractal-search providers` and `target/debug/fractal-search-mcp --providers` before packaging. Use an existing verified model cache for real inference, not a new download just for testing.
 
 For QML lint, provide the host's `qs.Commons` import without modifying its installation:
 
@@ -88,6 +88,8 @@ python3 quickshell-app/tests/smoke_multimodal_ui.py
 python3 quickshell-app/tests/smoke_hybrid_text_ui.py
 python3 quickshell-app/tests/smoke_multimodal.py target/debug/fractal-search target/debug/fractal-search-mcp /absolute/path/to/models
 python3 quickshell-app/tests/smoke_installer.py /absolute/path/to/prebuilt/bundle
+python3 quickshell-app/tests/smoke_dependency_layout.py
+python3 quickshell-app/tests/smoke_file_opener.py
 ```
 
 The resummon check requires Hyprland, hyprctl, Quickshell with QtTest, imv, grim, dbus-daemon, ffmpeg/ffprobe and host graphics/socket access. It waits for configured output geometry in a private nested compositor/session bus, indexes synthetic images/text/audio/video, checks actual media/folder selectors and repeated typed hybrid queries, settings tabs/toggles and narrow layout, exercises Open file and a FileManager1 command fixture, and repeats viewer close/resummon with both checkbox states. Its fixture validates reveal dispatch, not a real file manager. See CUDA.md for real GPU checks and the scoped README for private-bus native-picker tests.
@@ -101,6 +103,7 @@ Run simulated keyboard/mouse input only in the isolated compositor. Shared-deskt
 - Install UI and backend together; Omarchy's generic git-plugin installer does not build/install the backend. The installer generates RuntimeConfig and versioned paths. Do not patch only the installed QML as the final deliverable.
 - Preserve catalog/model caches, login registration, runtime provider settings and personal bindings. Direct installation stops the existing service; preserve its previous active state and check rollback failures. The repository launcher summons afterwards. Inspect logs and plugin `ping` after installation.
 - Use the Omarchy skill for desktop customization. Do not change shortcuts without authorization. Do not edit `/usr/share/omarchy/`; user-owned plugins hot reload. A slow plugin load may need `OMARCHY_SHELL_IPC_TIMEOUT=15s` for the installer, not a desktop restart.
+- Keep shared Rust dependency versions in root `[workspace.dependencies]`; keep the picker independent of core/storage/MCP and preserve the manifest-only `vendor/lancedb` patch and its provenance; preserve explicit features and pinned inference/catalog contracts. See [dependency review](docs/DEPENDENCIES.md) before changing build-footprint settings.
 - Inspect the final diff for unrelated work, generated files and secrets. Change lockfiles only when dependency resolution changes. Do not commit build outputs, model assets, logs, runtime data or generated design mockups. Preserve attribution; publishing/licensing needs separate authorization.
 - Keep both root onboarding docs and affected scoped docs aligned when behavior, source ownership, commands or workflows change. Report exact checks and material limitations; dated test counts must never stand in for current validation.
 

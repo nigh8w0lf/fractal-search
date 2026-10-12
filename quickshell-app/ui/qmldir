@@ -1,6 +1,7 @@
 RuntimeConfig 1.0 RuntimeConfig.qml
 RuntimeDiagnostics 1.0 RuntimeDiagnostics.qml
 PortalFolderDialog 1.0 PortalFolderDialog.qml
+DesktopFileOpener 1.0 DesktopFileOpener.qml
 singleton SearchTheme 1.0 SearchTheme.qml
 Controller 1.0 Controller.qml
 ServiceAutostart 1.0 ServiceAutostart.qml

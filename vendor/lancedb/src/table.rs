@@ -1,0 +1,5397 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The LanceDB Authors
+
+//! LanceDB Table APIs
+
+use crate::blob::BlobFile;
+use arrow_array::{LargeBinaryArray, RecordBatch, RecordBatchReader};
+use arrow_schema::{Schema, SchemaRef};
+use async_trait::async_trait;
+use datafusion_execution::TaskContext;
+use datafusion_expr::Expr;
+use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::display::DisplayableExecutionPlan;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+pub use lance::dataset::ColumnAlteration;
+pub use lance::dataset::NewColumnTransform;
+pub use lance::dataset::ReadParams;
+pub use lance::dataset::Version;
+use lance::dataset::WriteMode;
+use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::{InsertBuilder, WriteParams};
+use lance::index::DatasetIndexExt;
+use lance::index::scalar::load_segment_params;
+use lance::io::{ObjectStoreParams, WrappingObjectStore};
+use lance_datafusion::utils::StreamingWriteSource;
+use lance_index::IndexCriteria;
+use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsAccessor};
+pub use query::AnyQuery;
+
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
+use lance_index::scalar::InvertedIndexParams;
+use lance_index::scalar::inverted::query::collect_query_tokens;
+use lance_namespace::LanceNamespace;
+use lance_namespace::error::NamespaceError;
+use lance_namespace::models::DescribeTableRequest;
+use lance_table::format::Manifest;
+use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::ManifestNamingScheme;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::format;
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::connection::NamespaceClientPushdownOperation;
+
+use crate::DistanceType;
+use crate::blob::BlobRangeRequest;
+use crate::data::scannable::{PeekedScannable, Scannable, estimate_write_partitions};
+use crate::database::Database;
+use crate::database::listing::LANCE_FILE_EXTENSION;
+use crate::database::read_freshness::TableFreshness;
+use crate::embeddings::{EmbeddingDefinition, EmbeddingRegistry, MemoryRegistry};
+use crate::error::{Error, Result};
+use crate::index::IndexStatistics;
+use crate::index::{Index, IndexBuilder};
+use crate::index::{IndexConfig, IndexStatisticsImpl, IndexType};
+use crate::job::Job;
+use crate::query::{IntoQueryVector, Query, QueryExecutionOptions, TakeQuery, VectorQuery};
+use crate::table::datafusion::insert::InsertExec;
+use crate::utils::{PatchReadParam, PatchWriteParam, resolve_arrow_field_path};
+
+use self::dataset::DatasetConsistencyWrapper;
+use self::merge::MergeInsertBuilder;
+
+pub mod add_columns;
+mod add_data;
+pub mod branch_merge;
+pub mod checkpoint;
+mod create_index;
+pub mod datafusion;
+pub(crate) mod dataset;
+pub mod delete;
+pub mod lsm_stats;
+pub mod merge;
+pub mod optimize;
+mod primary_key;
+pub mod query;
+pub mod schema_evolution;
+pub mod update;
+pub mod write_progress;
+use crate::index::waiter::wait_for_index;
+pub use add_columns::AddColumnsBuilder;
+#[cfg(feature = "remote")]
+pub(crate) use add_data::PreprocessingOutput;
+pub use add_data::{AddDataBuilder, AddDataMode, AddResult, NaNVectorBehavior};
+pub use branch_merge::{
+    BranchDiff, ColumnChange, ColumnSummary, IndexSummary, MergeBlocker, MergeBlockerCode,
+    MergeBranchResult, MergeBranchStatus, MergePreview, RowCountSummary,
+};
+pub use chrono::Duration;
+pub use delete::DeleteResult;
+use futures::future::join_all;
+pub use lance::dataset::refs::{BranchContents, Ref, TagContents, Tags as LanceTags};
+pub use lance::dataset::scanner::DatasetRecordBatchStream;
+pub use lance_index::optimize::OptimizeOptions;
+pub use lsm_stats::{BucketStats, GenerationStats, LsmStats, MemtableStats};
+pub use optimize::{CompactionOptions, OptimizeAction, OptimizeStats};
+pub use schema_evolution::{
+    AddColumnsResult, AlterColumnsResult, DropColumnsResult, FieldMetadataUpdate,
+    UpdateFieldMetadataResult,
+};
+use serde_with::skip_serializing_none;
+pub use update::{UpdateBuilder, UpdateResult};
+
+/// Walk a boxed error chain to find the innermost `NamespaceError`.
+///
+/// Callers like `DatasetBuilder::from_namespace` re-wrap their inner namespace error
+/// inside a fresh `lance::Error::Namespace`, so a single downcast at the top level
+/// won't find it. This walks `.source()` to unwrap arbitrarily nested layers.
+fn find_namespace_error<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a NamespaceError> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(ns_err) = e.downcast_ref::<NamespaceError>() {
+            return Some(ns_err);
+        }
+        current = e.source();
+    }
+    None
+}
+
+/// Map a `lance::Error` coming from a `lance-namespace` call into a `lancedb::Error`,
+/// preserving the fine-grained namespace error code (e.g. `TableNotFound`,
+/// `TableAlreadyExists`). Errors that aren't recognized namespace error variants fall
+/// through to a generic runtime error rather than `TableNotFound`/`TableAlreadyExists`.
+pub(crate) fn map_namespace_lance_error(err: lance::Error, table_name: &str) -> Error {
+    if let Some(code) = find_namespace_error(&err).map(NamespaceError::code) {
+        match code {
+            lance_namespace::error::ErrorCode::TableNotFound => {
+                return Error::TableNotFound {
+                    name: table_name.to_string(),
+                    source: Box::new(err),
+                };
+            }
+            lance_namespace::error::ErrorCode::TableAlreadyExists => {
+                return Error::TableAlreadyExists {
+                    name: table_name.to_string(),
+                };
+            }
+            _ => {}
+        }
+    }
+    match err {
+        lance::Error::Namespace { source, .. } => Error::Runtime {
+            message: format!("Namespace error: {}", source),
+        },
+        other => other.into(),
+    }
+}
+
+/// Map a `lance::Error::DatasetNotFound` for the table at `uri` into a `lancedb::Error`.
+///
+/// Lance reports "there is nothing at this location" and "there is a table directory
+/// here but nothing loadable inside it" with the same error. Only the first is a
+/// `TableNotFound`: a `<name>.lance` directory left behind by an interrupted drop and
+/// re-create is still reported by `Connection::table_names`, so callers need to be able
+/// to tell "never existed" from "exists but is broken".
+///
+/// See <https://github.com/lancedb/lancedb/issues/3127>.
+async fn map_dataset_not_found(
+    uri: &str,
+    name: &str,
+    params: ReadParams,
+    err: lance::Error,
+) -> Error {
+    let name = name.to_string();
+    let source = Box::new(err);
+    if table_dir_exists(uri, params).await.unwrap_or(false) {
+        Error::TableCorrupted { name, source }
+    } else {
+        Error::TableNotFound { name, source }
+    }
+}
+
+/// Whether a table directory is present at `uri`, even though no dataset could be
+/// loaded from it.
+///
+/// This looks for a `<name>.lance` entry in the parent directory, which is exactly what
+/// `ListingDatabase::table_names` lists, so the two APIs agree on whether a table is
+/// present. Probing `uri` itself would not work: object stores have no empty
+/// directories to probe, and on a local filesystem the interesting case is precisely an
+/// empty directory.
+async fn table_dir_exists(uri: &str, params: ReadParams) -> Result<bool> {
+    let (object_store, path, _) = DatasetBuilder::from_uri(uri)
+        .with_read_params(params)
+        .build_object_store()
+        .await?;
+    // Only `*.lance` entries are ever reported as tables, so nothing else can produce
+    // the list-then-open mismatch this guards against.
+    if path.extension() != Some(LANCE_FILE_EXTENSION) {
+        return Ok(false);
+    }
+    let (Some(parent), Some(dir_name)) = (path.parent(), path.filename()) else {
+        return Ok(false);
+    };
+    let entries = object_store.read_dir(parent).await?;
+    Ok(entries.iter().any(|entry| entry.as_str() == dir_name))
+}
+
+/// Defines the type of column
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ColumnKind {
+    /// Columns populated by data from the user (this is the most common case)
+    Physical,
+    /// Columns populated by applying an embedding function to the input
+    Embedding(EmbeddingDefinition),
+}
+
+/// Defines a column in a table
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnDefinition {
+    /// The source of the column data
+    pub kind: ColumnKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableDefinition {
+    pub column_definitions: Vec<ColumnDefinition>,
+    pub schema: SchemaRef,
+}
+
+impl TableDefinition {
+    pub fn new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Self {
+        Self {
+            column_definitions,
+            schema,
+        }
+    }
+
+    pub fn new_from_schema(schema: SchemaRef) -> Self {
+        let column_definitions = schema
+            .fields()
+            .iter()
+            .map(|_| ColumnDefinition {
+                kind: ColumnKind::Physical,
+            })
+            .collect();
+        Self::new(schema, column_definitions)
+    }
+
+    pub fn try_from_rich_schema(schema: SchemaRef) -> Result<Self> {
+        let column_definitions = schema.metadata.get("lancedb::column_definitions");
+        if let Some(column_definitions) = column_definitions {
+            let column_definitions: Vec<ColumnDefinition> =
+                serde_json::from_str(column_definitions).map_err(|e| Error::Runtime {
+                    message: format!("Failed to deserialize column definitions: {}", e),
+                })?;
+            Ok(Self::new(schema, column_definitions))
+        } else {
+            let column_definitions = schema
+                .fields()
+                .iter()
+                .map(|_| ColumnDefinition {
+                    kind: ColumnKind::Physical,
+                })
+                .collect();
+            Ok(Self::new(schema, column_definitions))
+        }
+    }
+
+    pub fn into_rich_schema(self) -> SchemaRef {
+        // We have full control over the structure of column definitions.  This should
+        // not fail, except for a bug
+        let lancedb_metadata = serde_json::to_string(&self.column_definitions).unwrap();
+        let mut schema_with_metadata = (*self.schema).clone();
+        schema_with_metadata
+            .metadata
+            .insert("lancedb::column_definitions".to_string(), lancedb_metadata);
+        Arc::new(schema_with_metadata)
+    }
+}
+
+/// Describes what happens when a vector either contains NaN or
+/// does not have enough values
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)] // https://github.com/lancedb/lancedb/issues/992
+enum BadVectorHandling {
+    /// An error is returned
+    #[default]
+    Error,
+    /// The offending row is droppped
+    Drop,
+    /// The invalid/missing items are replaced by fill_value
+    Fill(f32),
+    /// The invalid items are replaced by NULL
+    None,
+}
+
+/// Options to use when writing data
+#[derive(Clone, Debug, Default)]
+pub struct WriteOptions {
+    // Coming soon: https://github.com/lancedb/lancedb/issues/992
+    // /// What behavior to take if the data contains invalid vectors
+    // pub on_bad_vectors: BadVectorHandling,
+    /// Advanced parameters that can be used to customize table creation
+    ///
+    /// Overlapping `OpenTableBuilder` options (e.g. [AddDataBuilder::mode]) will take
+    /// precedence over their counterparts in `WriteOptions` (e.g. [WriteParams::mode]).
+    pub lance_write_params: Option<WriteParams>,
+}
+
+/// Filters that can be used to limit the rows returned by a query
+pub enum Filter {
+    /// A SQL filter string
+    Sql(String),
+    /// A Datafusion logical expression
+    Datafusion(Expr),
+}
+
+/// A predicate for filtering rows in delete operations.
+///
+/// Accepts either a SQL string or a DataFusion [`Expr`]. Use the [`From`]
+/// implementations to convert from `&str` or `&Expr` automatically.
+/// See [`Table::delete`] for usage examples.
+pub enum Predicate<'a> {
+    /// A SQL predicate string
+    String(&'a str),
+    /// A DataFusion logical expression
+    Expr(&'a Expr),
+}
+
+impl<'a> From<&'a str> for Predicate<'a> {
+    fn from(s: &'a str) -> Self {
+        Predicate::String(s)
+    }
+}
+
+impl<'a> From<&'a String> for Predicate<'a> {
+    fn from(s: &'a String) -> Self {
+        Predicate::String(s.as_str())
+    }
+}
+
+impl<'a> From<&'a Expr> for Predicate<'a> {
+    fn from(e: &'a Expr) -> Self {
+        Predicate::Expr(e)
+    }
+}
+
+#[async_trait]
+pub trait Tags: Send + Sync {
+    /// List the tags of the table.
+    async fn list(&self) -> Result<HashMap<String, TagContents>>;
+
+    /// Get the version of the table referenced by a tag.
+    async fn get_version(&self, tag: &str) -> Result<u64>;
+
+    /// Create a new tag for the given version of the table.
+    async fn create(&mut self, tag: &str, version: u64) -> Result<()>;
+
+    /// Delete a tag from the table.
+    async fn delete(&mut self, tag: &str) -> Result<()>;
+
+    /// Update an existing tag to point to a new version of the table.
+    async fn update(&mut self, tag: &str, version: u64) -> Result<()>;
+}
+
+pub use self::merge::MergeResult;
+
+/// Specification selecting Lance's MemWAL LSM-style write path for
+/// `merge_insert`.
+///
+/// Construct via [`LsmWriteSpec::bucket`], [`LsmWriteSpec::identity`], or
+/// [`LsmWriteSpec::unsharded`], then optionally chain
+/// [`LsmWriteSpec::with_maintained_indexes`] (indexes the MemWAL keeps up to
+/// date) and [`LsmWriteSpec::with_writer_config_defaults`] (default
+/// `ShardWriter` configuration recorded in the MemWAL index).
+///
+/// Install a spec with [`Table::set_lsm_write_spec`] and remove it with
+/// [`Table::unset_lsm_write_spec`]. The actual `merge_insert` dispatch
+/// onto the MemWAL writer is a follow-up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LsmWriteSpec {
+    /// Hash-bucket sharding by a scalar column.
+    ///
+    /// `column` must be a non-nested column with a supported scalar type.
+    /// `num_buckets` must be in `[1, 1024]`.
+    /// Iceberg-compatible Murmur3-x86-32 (seed 0) is used so each row's
+    /// `bucket(column, num_buckets)` value is stable across processes.
+    Bucket {
+        column: String,
+        num_buckets: u32,
+        /// Names of indexes (already created on the table) that the
+        /// MemWAL should maintain in-memory as rows are appended.
+        maintained_indexes: Vec<String>,
+        /// Default `ShardWriter` configuration recorded in the MemWAL index.
+        writer_config_defaults: HashMap<String, String>,
+    },
+    /// Identity sharding — shard by the raw value of `column`.
+    ///
+    /// Use this when the data is already partitioned by `column`; each
+    /// distinct value of `column` becomes its own shard.
+    Identity {
+        column: String,
+        /// Names of indexes (already created on the table) that the
+        /// MemWAL should maintain in-memory as rows are appended.
+        maintained_indexes: Vec<String>,
+        /// Default `ShardWriter` configuration recorded in the MemWAL index.
+        writer_config_defaults: HashMap<String, String>,
+    },
+    /// No sharding — every `merge_insert` call writes to a single MemWAL shard.
+    Unsharded {
+        /// Names of indexes (already created on the table) that the
+        /// MemWAL should maintain in-memory as rows are appended.
+        maintained_indexes: Vec<String>,
+        /// Default `ShardWriter` configuration recorded in the MemWAL index.
+        writer_config_defaults: HashMap<String, String>,
+    },
+}
+
+impl LsmWriteSpec {
+    /// Construct a hash-bucket sharding spec with no maintained indexes.
+    pub fn bucket(column: impl Into<String>, num_buckets: u32) -> Self {
+        Self::Bucket {
+            column: column.into(),
+            num_buckets,
+            maintained_indexes: Vec::new(),
+            writer_config_defaults: HashMap::new(),
+        }
+    }
+
+    /// Construct an identity-sharding spec (shard by the raw value of
+    /// `column`) with no maintained indexes.
+    ///
+    /// `column` must be a deterministic function of the unenforced primary
+    /// key: every row with a given primary key must always produce the same
+    /// `column` value. MemWAL dedups upserts by primary key but tracks
+    /// generations per shard, so if the same key is written with two
+    /// different `column` values its versions land in different shards and a
+    /// stale value can win. Typically `column` is the primary key itself, or
+    /// a stable attribute of it (e.g. a tenant id).
+    pub fn identity(column: impl Into<String>) -> Self {
+        Self::Identity {
+            column: column.into(),
+            maintained_indexes: Vec::new(),
+            writer_config_defaults: HashMap::new(),
+        }
+    }
+
+    /// Construct an unsharded spec with no maintained indexes.
+    pub fn unsharded() -> Self {
+        Self::Unsharded {
+            maintained_indexes: Vec::new(),
+            writer_config_defaults: HashMap::new(),
+        }
+    }
+
+    /// Replace the list of indexes the MemWAL should keep up to date as
+    /// rows are appended. Each name must reference an index that already
+    /// exists on the table at the time `set_lsm_write_spec` is called.
+    pub fn with_maintained_indexes<I, S>(mut self, indexes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let v: Vec<String> = indexes.into_iter().map(Into::into).collect();
+        match &mut self {
+            Self::Bucket {
+                maintained_indexes, ..
+            }
+            | Self::Identity {
+                maintained_indexes, ..
+            }
+            | Self::Unsharded {
+                maintained_indexes, ..
+            } => *maintained_indexes = v,
+        }
+        self
+    }
+
+    /// Replace the default `ShardWriter` configuration recorded in the MemWAL
+    /// index, so every writer starts from the same defaults. Keys are
+    /// `ShardWriter` config field names (`Duration` knobs use a `_ms` suffix);
+    /// values are their string encodings.
+    pub fn with_writer_config_defaults<I, K, V>(mut self, defaults: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let m: HashMap<String, String> = defaults
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        match &mut self {
+            Self::Bucket {
+                writer_config_defaults,
+                ..
+            }
+            | Self::Identity {
+                writer_config_defaults,
+                ..
+            }
+            | Self::Unsharded {
+                writer_config_defaults,
+                ..
+            } => *writer_config_defaults = m,
+        }
+        self
+    }
+
+    /// Borrow the list of index names this spec asks MemWAL to maintain.
+    pub fn maintained_indexes(&self) -> &[String] {
+        match self {
+            Self::Bucket {
+                maintained_indexes, ..
+            }
+            | Self::Identity {
+                maintained_indexes, ..
+            }
+            | Self::Unsharded {
+                maintained_indexes, ..
+            } => maintained_indexes,
+        }
+    }
+
+    /// Borrow the default `ShardWriter` configuration recorded by this spec.
+    pub fn writer_config_defaults(&self) -> &HashMap<String, String> {
+        match self {
+            Self::Bucket {
+                writer_config_defaults,
+                ..
+            }
+            | Self::Identity {
+                writer_config_defaults,
+                ..
+            }
+            | Self::Unsharded {
+                writer_config_defaults,
+                ..
+            } => writer_config_defaults,
+        }
+    }
+}
+
+/// A token produced by the tokenizer configured on a full-text search index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsToken {
+    /// The token text after the index tokenizer has applied its filters.
+    pub text: String,
+    /// The token position used by full-text query matching.
+    pub position: u32,
+}
+
+/// Tokenize a full-text search query using an explicit FTS tokenizer configuration.
+///
+/// This does not require a table or FTS index. Use
+/// [`crate::index::scalar::FtsIndexBuilder`] to supply the same tokenizer
+/// options used when creating an FTS index.
+pub fn tokenize(query: &str, params: &InvertedIndexParams) -> Result<Vec<FtsToken>> {
+    let mut tokenizer = params.build().map_err(|err| Error::InvalidInput {
+        message: format!("Failed to build tokenizer: {}", err),
+    })?;
+    let tokens = collect_query_tokens(query, &mut tokenizer);
+    Ok((0..tokens.len())
+        .map(|idx| FtsToken {
+            text: tokens.get_token(idx).to_string(),
+            position: tokens.position(idx),
+        })
+        .collect())
+}
+
+/// A trait for anything "table-like".  This is used for both native tables (which target
+/// Lance datasets) and remote tables (which target LanceDB cloud)
+///
+/// This trait is still EXPERIMENTAL and subject to change in the future
+#[async_trait]
+pub trait BaseTable: std::fmt::Display + std::fmt::Debug + Send + Sync {
+    /// Get a reference to std::any::Any
+    fn as_any(&self) -> &dyn std::any::Any;
+    /// Get the name of the table.
+    fn name(&self) -> &str;
+    /// Get the namespace of the table.
+    fn namespace(&self) -> &[String];
+    /// Get the id of the table
+    ///
+    /// This is the namespace of the table concatenated with the name
+    /// separated by $
+    fn id(&self) -> &str;
+    /// Get the arrow [Schema] of the table.
+    async fn schema(&self) -> Result<SchemaRef>;
+    /// Count the number of rows in this table.
+    async fn count_rows(&self, filter: Option<Filter>) -> Result<usize>;
+    /// Create a physical plan for the query.
+    async fn create_plan(
+        &self,
+        query: &AnyQuery,
+        options: QueryExecutionOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>>;
+    /// Execute a query and return the results as a stream of RecordBatches.
+    async fn query(
+        &self,
+        query: &AnyQuery,
+        options: QueryExecutionOptions,
+    ) -> Result<DatasetRecordBatchStream>;
+    /// Explain the plan for a query.
+    async fn explain_plan(&self, query: &AnyQuery, verbose: bool) -> Result<String> {
+        let plan = self.create_plan(query, Default::default()).await?;
+        let display = DisplayableExecutionPlan::new(plan.as_ref());
+
+        Ok(format!("{}", display.indent(verbose)))
+    }
+    async fn analyze_plan(
+        &self,
+        query: &AnyQuery,
+        options: QueryExecutionOptions,
+    ) -> Result<String>;
+
+    /// Add new records to the table.
+    async fn add(&self, add: AddDataBuilder) -> Result<AddResult>;
+    /// Delete rows from the table matching the given [`Predicate`].
+    async fn delete(&self, predicate: Predicate<'_>) -> Result<DeleteResult>;
+    /// Update rows in the table.
+    async fn update(&self, update: UpdateBuilder) -> Result<UpdateResult>;
+    /// Create an index on the provided column(s).
+    async fn create_index(&self, index: IndexBuilder) -> Result<()>;
+
+    /// Starts index creation, returning a handle to the resulting job.
+    async fn create_index_async(&self, index: IndexBuilder) -> Result<Job>;
+    /// List the indices on the table.
+    async fn list_indices(&self) -> Result<Vec<IndexConfig>>;
+    /// Drop an index from the table.
+    async fn drop_index(&self, name: &str) -> Result<()>;
+    /// Prewarm an index in the table.
+    async fn prewarm_index(&self, name: &str) -> Result<()>;
+    /// Prewarm data for the table.
+    ///
+    /// Currently only supported on remote tables.
+    /// If `columns` is `None`, all columns are prewarmed.
+    async fn prewarm_data(&self, columns: Option<Vec<String>>) -> Result<()>;
+    /// Get statistics about the index.
+    async fn index_stats(&self, index_name: &str) -> Result<Option<IndexStatistics>>;
+    /// Merge insert new records into the table.
+    async fn merge_insert(
+        &self,
+        params: MergeInsertBuilder,
+        new_data: Box<dyn RecordBatchReader + Send>,
+    ) -> Result<MergeResult>;
+    /// Set the unenforced primary key for the table to a single column.
+    ///
+    /// "Unenforced" means LanceDB does not check uniqueness on writes; the
+    /// column is recorded in the schema as the primary key for use by
+    /// features such as `merge_insert`. Only single-column primary keys are
+    /// supported, and the key cannot be changed once set.
+    ///
+    /// The default implementation returns `NotSupported`; table types
+    /// backed by a Lance dataset override it.
+    async fn set_unenforced_primary_key(&self, _columns: &[&str]) -> Result<()> {
+        Err(Error::NotSupported {
+            message: "set_unenforced_primary_key is not supported on this table type".into(),
+        })
+    }
+    /// Install an [`LsmWriteSpec`] on this table.
+    ///
+    /// The spec selects Lance's MemWAL LSM-style write path for future
+    /// `merge_insert` calls.
+    ///
+    /// The default implementation returns `NotSupported`. Implementations
+    /// that support the MemWAL LSM write path must override this.
+    async fn set_lsm_write_spec(&self, _spec: LsmWriteSpec) -> Result<()> {
+        Err(Error::NotSupported {
+            message: "set_lsm_write_spec is not supported on this table type".into(),
+        })
+    }
+    /// Remove the [`LsmWriteSpec`] from this table.
+    ///
+    /// This is a no-op if no spec is currently set.
+    ///
+    /// The default implementation returns `NotSupported`. Implementations
+    /// that support the MemWAL LSM write path must override this.
+    async fn unset_lsm_write_spec(&self) -> Result<()> {
+        Err(Error::NotSupported {
+            message: "unset_lsm_write_spec is not supported on this table type".into(),
+        })
+    }
+    /// Read the [`LsmWriteSpec`] currently installed on this table, returning
+    /// `None` when the MemWAL LSM write path is not enabled.
+    ///
+    /// The default implementation returns `NotSupported`. Implementations that
+    /// support the MemWAL LSM write path must override this.
+    async fn get_lsm_write_spec(&self) -> Result<Option<LsmWriteSpec>> {
+        Err(Error::NotSupported {
+            message: "get_lsm_write_spec is not supported on this table type".into(),
+        })
+    }
+    /// Seal every bucket's active memtable into L0.
+    ///
+    /// The default implementation returns `NotSupported`.
+    async fn flush_lsm(&self) -> Result<()> {
+        Err(Error::NotSupported {
+            message: "flush_lsm is not supported on this table type".into(),
+        })
+    }
+    /// Trigger a background L0 → base compaction pass per bucket.
+    ///
+    /// The default implementation returns `NotSupported`.
+    async fn compact_lsm(&self) -> Result<()> {
+        Err(Error::NotSupported {
+            message: "compact_lsm is not supported on this table type".into(),
+        })
+    }
+    /// Read live LSM state, or `None` when the LSM write path is not
+    /// enabled for this table.
+    ///
+    /// The default implementation returns `NotSupported`.
+    async fn get_lsm_stats(&self, _include_generation_rows: bool) -> Result<Option<LsmStats>> {
+        Err(Error::NotSupported {
+            message: "get_lsm_stats is not supported on this table type".into(),
+        })
+    }
+    /// Drain and close any cached MemWAL shard writers for this table.
+    ///
+    /// The default implementation is a no-op; table types that maintain
+    /// MemWAL shard writers override it.
+    async fn close_lsm_writers(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Names of the blob v2 columns in this table, in declaration order.
+    async fn blob_columns(&self) -> Result<Vec<String>> {
+        Err(Error::NotSupported {
+            message: "blob_columns is not supported on this table type".into(),
+        })
+    }
+    /// Materialize blob bytes for the given row ids. See [`Table::fetch_blobs`].
+    async fn fetch_blobs(&self, _column: &str, _row_ids: &[u64]) -> Result<LargeBinaryArray> {
+        Err(Error::NotSupported {
+            message: "fetch_blobs is not supported on this table type".into(),
+        })
+    }
+    /// Materialize blob-local ranges. See [`Table::fetch_blob_ranges`].
+    async fn fetch_blob_ranges(
+        &self,
+        _column: &str,
+        _requests: &[BlobRangeRequest],
+    ) -> Result<LargeBinaryArray> {
+        Err(Error::NotSupported {
+            message: "fetch_blob_ranges is not supported on this table type".into(),
+        })
+    }
+    /// Open lazy blob handles for the given row ids. See [`Table::fetch_blob_files`].
+    async fn fetch_blob_files(
+        &self,
+        _column: &str,
+        _row_ids: &[u64],
+    ) -> Result<Vec<Option<BlobFile>>> {
+        Err(Error::NotSupported {
+            message: "fetch_blob_files is not supported on this table type".into(),
+        })
+    }
+    /// Gets the table tag manager.
+    async fn tags(&self) -> Result<Box<dyn Tags + '_>>;
+    /// Optimize the dataset.
+    async fn optimize(&self, action: OptimizeAction) -> Result<OptimizeStats>;
+    /// Add columns to the table.
+    async fn add_columns(
+        &self,
+        transforms: NewColumnTransform,
+        read_columns: Option<Vec<String>>,
+    ) -> Result<AddColumnsResult>;
+    /// Alter columns in the table.
+    async fn alter_columns(&self, alterations: &[ColumnAlteration]) -> Result<AlterColumnsResult>;
+    /// Drop columns from the table.
+    async fn drop_columns(&self, columns: &[&str]) -> Result<DropColumnsResult>;
+    /// Get the version of the table.
+    async fn version(&self) -> Result<u64>;
+    /// Checkout a specific version of the table.
+    async fn checkout(&self, version: u64) -> Result<()>;
+    /// Checkout a table version referenced by a tag.
+    /// Tags provide a human-readable way to reference specific versions of the table.
+    async fn checkout_tag(&self, tag: &str) -> Result<()>;
+    /// Checkout the latest version of the table.
+    async fn checkout_latest(&self) -> Result<()>;
+    /// Restore the table to the currently checked out version.
+    async fn restore(&self) -> Result<()>;
+    /// List the versions of the table.
+    async fn list_versions(&self) -> Result<Vec<Version>>;
+    /// Create a new branch from `from` and return a handle scoped to it.
+    async fn create_branch(
+        &self,
+        name: &str,
+        from: lance::dataset::refs::Ref,
+    ) -> Result<Arc<dyn BaseTable>>;
+    /// Check out an existing branch and return a handle scoped to it.
+    async fn checkout_branch(&self, name: &str) -> Result<Arc<dyn BaseTable>>;
+    /// Check out an existing branch at an optional version, returning a handle.
+    ///
+    /// `None` tracks the branch's latest; `Some(v)` pins it to that version
+    /// (read-only). The default implementation composes [`Self::checkout_branch`]
+    /// and [`Self::checkout`]; implementations may override it to resolve the
+    /// `(branch, version)` coordinate in a single manifest read.
+    async fn checkout_branch_version(
+        &self,
+        name: &str,
+        version: Option<u64>,
+    ) -> Result<Arc<dyn BaseTable>> {
+        let branch = self.checkout_branch(name).await?;
+        if let Some(version) = version {
+            branch.checkout(version).await?;
+        }
+        Ok(branch)
+    }
+    /// List the branches of the table.
+    async fn list_branches(&self) -> Result<HashMap<String, BranchContents>>;
+    /// Delete a branch.
+    async fn delete_branch(&self, name: &str) -> Result<()>;
+    /// Diff a branch against main. Remote only.
+    async fn diff_branch(&self, _from_branch: &str) -> Result<BranchDiff> {
+        Err(Error::NotSupported {
+            message: "diff_branch is only supported on remote tables".into(),
+        })
+    }
+    /// Merge a branch into main, or dry-run. Remote only.
+    /// HTTP 409 still returns [`Ok`] with [`MergeBranchStatus::Rejected`].
+    async fn merge_branch(&self, _from_branch: &str, _dry_run: bool) -> Result<MergeBranchResult> {
+        Err(Error::NotSupported {
+            message: "merge_branch is only supported on remote tables".into(),
+        })
+    }
+    /// The branch this handle is scoped to, or `None` for `main`.
+    fn current_branch(&self) -> Option<String>;
+    /// Get the table definition.
+    async fn table_definition(&self) -> Result<TableDefinition>;
+    /// Get the table URI (storage location)
+    async fn uri(&self) -> Result<String>;
+    /// Get the storage options used when opening this table, if any.
+    #[deprecated(since = "0.25.0", note = "Use initial_storage_options() instead")]
+    async fn storage_options(&self) -> Option<HashMap<String, String>>;
+    /// Get the initial storage options that were passed in when opening this table.
+    ///
+    /// For dynamically refreshed options (e.g., credential vending), use [`Self::latest_storage_options`].
+    async fn initial_storage_options(&self) -> Option<HashMap<String, String>>;
+    /// Get the latest storage options, refreshing from provider if configured.
+    ///
+    /// Returns `Ok(Some(options))` if storage options are available (static or refreshed),
+    /// `Ok(None)` if no storage options were configured, or `Err(...)` if refresh failed.
+    async fn latest_storage_options(&self) -> Result<Option<HashMap<String, String>>>;
+    /// Poll until the columns are fully indexed. Will return Error::Timeout if the columns
+    /// are not fully indexed within the timeout.
+    async fn wait_for_index(
+        &self,
+        index_names: &[&str],
+        timeout: std::time::Duration,
+    ) -> Result<()>;
+    /// Get statistics on the table
+    async fn stats(&self) -> Result<TableStatistics>;
+    /// Create an ExecutionPlan for inserting data into the table.
+    ///
+    /// This is used by the DataFusion TableProvider implementation to support
+    /// INSERT INTO statements.
+    async fn create_insert_exec(
+        &self,
+        _input: Arc<dyn datafusion_physical_plan::ExecutionPlan>,
+        _write_params: WriteParams,
+    ) -> Result<Arc<dyn datafusion_physical_plan::ExecutionPlan>> {
+        Err(Error::NotSupported {
+            message: "create_insert_exec not implemented".to_string(),
+        })
+    }
+    /// Update per-field metadata. Merges into existing metadata by default;
+    /// [`FieldMetadataUpdate::remove`] deletes a key and
+    /// [`FieldMetadataUpdate::replace`] swaps the field's whole map.
+    ///
+    /// The default returns `NotSupported`; Lance-backed and remote tables override it.
+    async fn update_field_metadata(
+        &self,
+        _updates: &[FieldMetadataUpdate],
+    ) -> Result<UpdateFieldMetadataResult> {
+        Err(Error::NotSupported {
+            message: "update_field_metadata is not supported on this table type".into(),
+        })
+    }
+}
+
+/// A Table is a collection of strong typed Rows.
+///
+/// The type of the each row is defined in Apache Arrow [Schema].
+#[derive(Clone, Debug)]
+pub struct Table {
+    inner: Arc<dyn BaseTable>,
+    database: Option<Arc<dyn Database>>,
+    embedding_registry: Arc<dyn EmbeddingRegistry>,
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod test_utils {
+    use super::*;
+
+    impl Table {
+        pub fn new_with_handler<T>(
+            name: impl Into<String>,
+            handler: impl Fn(reqwest::Request) -> http::Response<T> + Clone + Send + Sync + 'static,
+        ) -> Self
+        where
+            T: Into<reqwest::Body>,
+        {
+            let inner = Arc::new(crate::remote::table::RemoteTable::new_mock(
+                name.into(),
+                handler.clone(),
+                None,
+            ));
+            let database = Arc::new(crate::remote::db::RemoteDatabase::new_mock(handler));
+            Self {
+                inner,
+                database: Some(database),
+                // Registry is unused.
+                embedding_registry: Arc::new(MemoryRegistry::new()),
+            }
+        }
+
+        pub fn new_with_handler_and_interval<T>(
+            name: impl Into<String>,
+            handler: impl Fn(reqwest::Request) -> http::Response<T> + Clone + Send + Sync + 'static,
+            read_consistency_interval: Option<std::time::Duration>,
+        ) -> Self
+        where
+            T: Into<reqwest::Body>,
+        {
+            let inner = Arc::new(
+                crate::remote::table::RemoteTable::new_mock_with_consistency_interval(
+                    name.into(),
+                    handler.clone(),
+                    read_consistency_interval,
+                ),
+            );
+            let database = Arc::new(crate::remote::db::RemoteDatabase::new_mock(handler));
+            Self {
+                inner,
+                database: Some(database),
+                // Registry is unused.
+                embedding_registry: Arc::new(MemoryRegistry::new()),
+            }
+        }
+
+        pub fn new_with_handler_version<T>(
+            name: impl Into<String>,
+            version: semver::Version,
+            handler: impl Fn(reqwest::Request) -> http::Response<T> + Clone + Send + Sync + 'static,
+        ) -> Self
+        where
+            T: Into<reqwest::Body>,
+        {
+            let inner = Arc::new(crate::remote::table::RemoteTable::new_mock(
+                name.into(),
+                handler.clone(),
+                Some(version),
+            ));
+            let database = Arc::new(crate::remote::db::RemoteDatabase::new_mock(handler));
+            Self {
+                inner,
+                database: Some(database),
+                // Registry is unused.
+                embedding_registry: Arc::new(MemoryRegistry::new()),
+            }
+        }
+
+        pub fn new_with_handler_and_config<T>(
+            name: impl Into<String>,
+            handler: impl Fn(reqwest::Request) -> http::Response<T> + Clone + Send + Sync + 'static,
+            config: crate::remote::ClientConfig,
+        ) -> Self
+        where
+            T: Into<reqwest::Body>,
+        {
+            let inner = Arc::new(crate::remote::table::RemoteTable::new_mock_with_config(
+                name.into(),
+                handler.clone(),
+                config.clone(),
+            ));
+            let database = Arc::new(crate::remote::db::RemoteDatabase::new_mock_with_config(
+                handler, config,
+            ));
+            Self {
+                inner,
+                database: Some(database),
+                // Registry is unused.
+                embedding_registry: Arc::new(MemoryRegistry::new()),
+            }
+        }
+
+        pub fn new_with_handler_version_and_config<T>(
+            name: impl Into<String>,
+            version: semver::Version,
+            handler: impl Fn(reqwest::Request) -> http::Response<T> + Clone + Send + Sync + 'static,
+            config: crate::remote::ClientConfig,
+        ) -> Self
+        where
+            T: Into<reqwest::Body>,
+        {
+            let inner = Arc::new(
+                crate::remote::table::RemoteTable::new_mock_with_version_and_config(
+                    name.into(),
+                    handler.clone(),
+                    Some(version),
+                    config.clone(),
+                ),
+            );
+            let database = Arc::new(crate::remote::db::RemoteDatabase::new_mock_with_config(
+                handler, config,
+            ));
+            Self {
+                inner,
+                database: Some(database),
+                // Registry is unused.
+                embedding_registry: Arc::new(MemoryRegistry::new()),
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Table {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner)
+    }
+}
+
+impl From<Arc<dyn BaseTable>> for Table {
+    fn from(inner: Arc<dyn BaseTable>) -> Self {
+        Self {
+            inner,
+            database: None,
+            embedding_registry: Arc::new(MemoryRegistry::new()),
+        }
+    }
+}
+
+impl Table {
+    pub fn new(inner: Arc<dyn BaseTable>, database: Arc<dyn Database>) -> Self {
+        Self {
+            inner,
+            database: Some(database),
+            embedding_registry: Arc::new(MemoryRegistry::new()),
+        }
+    }
+
+    pub fn base_table(&self) -> &Arc<dyn BaseTable> {
+        &self.inner
+    }
+
+    pub fn database(&self) -> &Arc<dyn Database> {
+        self.database.as_ref().unwrap()
+    }
+
+    pub fn embedding_registry(&self) -> &Arc<dyn EmbeddingRegistry> {
+        &self.embedding_registry
+    }
+
+    pub(crate) fn new_with_embedding_registry(
+        inner: Arc<dyn BaseTable>,
+        database: Arc<dyn Database>,
+        embedding_registry: Arc<dyn EmbeddingRegistry>,
+    ) -> Self {
+        Self {
+            inner,
+            database: Some(database),
+            embedding_registry,
+        }
+    }
+
+    /// Cast as [`NativeTable`], or return None it if is not a [`NativeTable`].
+    ///
+    /// Warning: This function will be removed soon (features exclusive to NativeTable
+    ///          will be added to Table)
+    pub fn as_native(&self) -> Option<&NativeTable> {
+        self.inner.as_native()
+    }
+
+    /// Get the name of the table.
+    pub fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    /// Get the namespace of the table.
+    pub fn namespace(&self) -> &[String] {
+        self.inner.namespace()
+    }
+
+    /// Get the ID of the table (namespace + name joined by '$').
+    pub fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    /// Get the dataset of the table if it is a native table
+    ///
+    /// Returns None otherwise
+    pub fn dataset(&self) -> Option<&dataset::DatasetConsistencyWrapper> {
+        self.inner.as_native().map(|t| &t.dataset)
+    }
+
+    /// Get the arrow [Schema] of the table.
+    pub async fn schema(&self) -> Result<SchemaRef> {
+        self.inner.schema().await
+    }
+
+    /// Count the number of rows in this dataset.
+    ///
+    /// # Arguments
+    ///
+    /// * `filter` if present, only count rows matching the filter
+    pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        self.inner.count_rows(filter.map(Filter::Sql)).await
+    }
+
+    /// Names of the blob v2 columns in this table, in declaration order.
+    ///
+    /// Nested blobs use dotted paths (e.g. `info.blob`). Returns
+    /// [`Error::NotSupported`] on table types without blob support.
+    pub async fn blob_columns(&self) -> Result<Vec<String>> {
+        self.inner.blob_columns().await
+    }
+
+    /// Materialize blob bytes for the given row ids.
+    ///
+    /// Output matches `row_ids` in length and order. Null blobs are null;
+    /// valid empty blobs contain empty byte strings. Prefer
+    /// [`Self::fetch_blob_files`] for large selections.
+    ///
+    /// ```
+    /// use arrow_array::UInt64Array;
+    /// use futures::TryStreamExt;
+    /// use lancedb::query::{ExecutableQuery, QueryBase};
+    ///
+    /// # use lancedb::Table;
+    /// # async fn materialize(table: &Table) -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut stream = table.query().with_row_id().limit(10).execute().await?;
+    /// while let Some(batch) = stream.try_next().await? {
+    ///     let row_ids = batch
+    ///         .column_by_name("_rowid")
+    ///         .unwrap()
+    ///         .as_any()
+    ///         .downcast_ref::<UInt64Array>()
+    ///         .unwrap();
+    ///     let images = table.fetch_blobs("image", row_ids.values()).await?;
+    ///     let _ = images;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Returns [`Error::InvalidInput`] when the column does not exist or is
+    /// not a blob v2 column, and [`Error::NotSupported`] on table types
+    /// without blob support.
+    pub async fn fetch_blobs(
+        &self,
+        column: impl AsRef<str>,
+        row_ids: &[u64],
+    ) -> Result<LargeBinaryArray> {
+        self.inner.fetch_blobs(column.as_ref(), row_ids).await
+    }
+
+    /// Materialize row-specific ranges from a blob v2 column.
+    ///
+    /// Each request contains a row id and a blob-local offset and length.
+    /// Requests may be duplicated or reordered, including multiple
+    /// ranges for the same blob. The output has the same length and order as
+    /// the requests. Null blobs produce null output slots; empty ranges on
+    /// non-null blobs produce empty byte strings.
+    ///
+    /// ```
+    /// use lancedb::blob::BlobRangeRequest;
+    ///
+    /// # use lancedb::Table;
+    /// # async fn read_ranges(table: &Table, row_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+    /// let ranges = table
+    ///     .fetch_blob_ranges(
+    ///         "image",
+    ///         [
+    ///             BlobRangeRequest::new(row_id, 0, 1024),
+    ///             BlobRangeRequest::new(row_id, 4096, 1024),
+    ///         ],
+    ///     )
+    ///     .await?;
+    /// # let _ = ranges;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Returns an error when a range is invalid, a requested row id does not
+    /// exist, or the column is not a blob v2 column. Returns
+    /// [`Error::NotSupported`] on table types without blob support.
+    pub async fn fetch_blob_ranges(
+        &self,
+        column: impl AsRef<str>,
+        requests: impl IntoIterator<Item = BlobRangeRequest>,
+    ) -> Result<LargeBinaryArray> {
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        self.inner
+            .fetch_blob_ranges(column.as_ref(), &requests)
+            .await
+    }
+
+    /// Open lazy [`BlobFile`] handles for the given row ids.
+    ///
+    /// Same length and order as `row_ids`. Null rows are `None`. Bytes are not
+    /// read from disk until a call to [`BlobFile::read`].
+    ///
+    /// ```
+    /// # use lancedb::Table;
+    /// # async fn lazy_read(table: &Table, row_ids: &[u64]) -> Result<(), Box<dyn std::error::Error>> {
+    /// let handles = table.fetch_blob_files("image", row_ids).await?;
+    /// if let Some(Some(first)) = handles.first() {
+    ///     let bytes = first.read().await?;
+    ///     println!("first blob is {} bytes", bytes.len());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn fetch_blob_files(
+        &self,
+        column: impl AsRef<str>,
+        row_ids: &[u64],
+    ) -> Result<Vec<Option<BlobFile>>> {
+        self.inner.fetch_blob_files(column.as_ref(), row_ids).await
+    }
+
+    /// Insert new records into this Table
+    ///
+    /// # Arguments
+    ///
+    /// * `data` data to be added to the Table
+    /// * `options` options to control how data is added
+    pub fn add<T: Scannable + 'static>(&self, data: T) -> AddDataBuilder {
+        AddDataBuilder::new(
+            self.inner.clone(),
+            Box::new(data),
+            Some(self.embedding_registry.clone()),
+        )
+    }
+
+    /// Update existing records in the Table
+    ///
+    /// An update operation can be used to adjust existing values.  Use the
+    /// returned builder to specify which columns to update.  The new value
+    /// can be a literal value (e.g. replacing nulls with some default value)
+    /// or an expression applied to the old value (e.g. incrementing a value)
+    ///
+    /// An optional condition can be specified (e.g. "only update if the old
+    /// value is 0")
+    ///
+    /// Note: if your condition is something like "some_id_column == 7" and
+    /// you are updating many rows (with different ids) then you will get
+    /// better performance with a single [`merge_insert`] call instead of
+    /// repeatedly calilng this method.
+    pub fn update(&self) -> UpdateBuilder {
+        UpdateBuilder::new(self.inner.clone())
+    }
+
+    /// Delete the rows from table that match the predicate.
+    ///
+    /// # Arguments
+    /// - `predicate` - A SQL string (`&str`) or DataFusion expression (`&Expr`)
+    ///   that selects the rows to delete.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{FixedSizeListArray, types::Float32Type, RecordBatch,
+    /// #   RecordBatchIterator, Int32Array};
+    /// # use arrow_schema::{Schema, Field, DataType};
+    /// use datafusion_expr::{col, lit};
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let tmpdir = tempfile::tempdir().unwrap();
+    /// let db = lancedb::connect(tmpdir.path().to_str().unwrap())
+    ///     .execute()
+    ///     .await
+    ///     .unwrap();
+    /// let schema = Arc::new(Schema::new(vec![
+    ///     Field::new("id", DataType::Int32, false),
+    ///     Field::new("vector", DataType::FixedSizeList(
+    ///         Arc::new(Field::new("item", DataType::Float32, true)), 128), true),
+    /// ]));
+    /// let data = RecordBatch::try_new(
+    ///     schema.clone(),
+    ///     vec![
+    ///         Arc::new(Int32Array::from_iter_values(0..10)),
+    ///         Arc::new(
+    ///             FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+    ///                 (0..10).map(|_| Some(vec![Some(1.0); 128])),
+    ///                 128,
+    ///             ),
+    ///         ),
+    ///     ],
+    /// )
+    /// .unwrap();
+    /// let tbl = db
+    ///     .create_table("delete_test", data)
+    ///     .execute()
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// // Using a SQL string:
+    /// tbl.delete("id > 5").await.unwrap();
+    ///
+    /// // Using a DataFusion expression:
+    /// let expr = col("id").lt(lit(4));
+    /// tbl.delete(&expr).await.unwrap();
+    /// # });
+    /// ```
+    pub async fn delete(&self, predicate: impl Into<Predicate<'_>>) -> Result<DeleteResult> {
+        self.inner.delete(predicate.into()).await
+    }
+
+    /// Create an index on the provided column(s).
+    ///
+    /// Indices are used to speed up searches and are often needed when the size of the table
+    /// becomes large (the exact size depends on many factors but somewhere between 100K rows
+    /// and 1M rows is a good rule of thumb)
+    ///
+    /// There are a variety of indices available.  They are described more in
+    /// [`crate::index::Index`].  The simplest thing to do is to use `index::Index::Auto` which
+    /// will attempt to create the most useful index based on the column type and column
+    /// statistics. `BTree` index is created by default for numeric, temporal, and
+    /// string columns.
+    ///
+    /// Once an index is created it will remain until the data is overwritten (e.g. an
+    /// add operation with mode overwrite) or the indexed column is dropped.
+    ///
+    /// Indices are not automatically updated with new data.  If you add new data to the
+    /// table then the index will not include the new rows.  However, a table search will
+    /// still consider the unindexed rows.  Searches will issue both an indexed search (on
+    /// the data covered by the index) and a flat search (on the unindexed data) and the
+    /// results will be combined.
+    ///
+    /// If there is enough unindexed data then the flat search will become slow and the index
+    /// should be optimized.  Optimizing an index will add any unindexed data to the existing
+    /// index without rerunning the full index creation process.  For more details see
+    /// [Table::optimize].
+    ///
+    /// Note: Multi-column (composite) indices are not currently supported.  However, they will
+    /// be supported in the future and the API is designed to be compatible with them.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{FixedSizeListArray, types::Float32Type, RecordBatch,
+    /// #   RecordBatchIterator, Int32Array};
+    /// # use arrow_schema::{Schema, Field, DataType};
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// use lancedb::index::Index;
+    /// let tmpdir = tempfile::tempdir().unwrap();
+    /// let db = lancedb::connect(tmpdir.path().to_str().unwrap())
+    ///     .execute()
+    ///     .await
+    ///     .unwrap();
+    /// # let tbl = db.open_table("idx_test").execute().await.unwrap();
+    /// // Create IVF PQ index on the "vector" column by default.
+    /// tbl.create_index(&["vector"], Index::Auto)
+    ///    .execute()
+    ///    .await
+    ///    .unwrap();
+    /// // Create a BTree index on the "id" column.
+    /// tbl.create_index(&["id"], Index::Auto)
+    ///     .execute()
+    ///     .await
+    ///     .unwrap();
+    /// // Create a LabelList index on the "tags" column.
+    /// tbl.create_index(&["tags"], Index::LabelList(Default::default()))
+    ///     .execute()
+    ///     .await
+    ///     .unwrap();
+    /// # });
+    /// ```
+    pub fn create_index(&self, columns: &[impl AsRef<str>], index: Index) -> IndexBuilder {
+        IndexBuilder::new(
+            self.inner.clone(),
+            columns
+                .iter()
+                .map(|val| val.as_ref().to_string())
+                .collect::<Vec<_>>(),
+            index,
+        )
+    }
+
+    /// See [Table::create_index]
+    /// For remote tables, this allows an optional wait_timeout to poll until asynchronous indexing is complete
+    pub fn create_index_with_timeout(
+        &self,
+        columns: &[impl AsRef<str>],
+        index: Index,
+        wait_timeout: Option<std::time::Duration>,
+    ) -> IndexBuilder {
+        let mut builder = IndexBuilder::new(
+            self.inner.clone(),
+            columns
+                .iter()
+                .map(|val| val.as_ref().to_string())
+                .collect::<Vec<_>>(),
+            index,
+        );
+        if let Some(timeout) = wait_timeout {
+            builder = builder.wait_timeout(timeout);
+        }
+        builder
+    }
+
+    /// Create a builder for a merge insert operation
+    ///
+    /// This operation can add rows, update rows, and remove rows all in a single
+    /// transaction. It is a very generic tool that can be used to create
+    /// behaviors like "insert if not exists", "update or insert (i.e. upsert)",
+    /// or even replace a portion of existing data with new data (e.g. replace
+    /// all data where month="january")
+    ///
+    /// The merge insert operation works by combining new data from a
+    /// **source table** with existing data in a **target table** by using a
+    /// join.  There are three categories of records.
+    ///
+    /// "Matched" records are records that exist in both the source table and
+    /// the target table. "Not matched" records exist only in the source table
+    /// (e.g. these are new data) "Not matched by source" records exist only
+    /// in the target table (this is old data)
+    ///
+    /// The builder returned by this method can be used to customize what
+    /// should happen for each category of data.
+    ///
+    /// Please note that the data may appear to be reordered as part of this
+    /// operation.  This is because updated rows will be deleted from the
+    /// dataset and then reinserted at the end with the new values.
+    ///
+    /// # Arguments
+    ///
+    /// * `on` One or more columns to join on.  This is how records from the
+    ///   source table and target table are matched.  Typically this is some
+    ///   kind of key or id column.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{FixedSizeListArray, types::Float32Type, RecordBatch,
+    /// #   RecordBatchIterator, Int32Array};
+    /// # use arrow_schema::{Schema, Field, DataType};
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let tmpdir = tempfile::tempdir().unwrap();
+    /// let db = lancedb::connect(tmpdir.path().to_str().unwrap())
+    ///     .execute()
+    ///     .await
+    ///     .unwrap();
+    /// # let tbl = db.open_table("idx_test").execute().await.unwrap();
+    /// # let schema = Arc::new(Schema::new(vec![
+    /// #  Field::new("id", DataType::Int32, false),
+    /// #  Field::new("vector", DataType::FixedSizeList(
+    /// #    Arc::new(Field::new("item", DataType::Float32, true)), 128), true),
+    /// # ]));
+    /// let new_data = RecordBatchIterator::new(
+    ///     vec![RecordBatch::try_new(
+    ///         schema.clone(),
+    ///         vec![
+    ///             Arc::new(Int32Array::from_iter_values(0..10)),
+    ///             Arc::new(
+    ///                 FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+    ///                     (0..10).map(|_| Some(vec![Some(1.0); 128])),
+    ///                     128,
+    ///                 ),
+    ///             ),
+    ///         ],
+    ///     )
+    ///     .unwrap()]
+    ///     .into_iter()
+    ///     .map(Ok),
+    ///     schema.clone(),
+    /// );
+    /// // Perform an upsert operation
+    /// let mut merge_insert = tbl.merge_insert(&["id"]);
+    /// merge_insert
+    ///     .when_matched_update_all(None)
+    ///     .when_not_matched_insert_all();
+    /// merge_insert.execute(Box::new(new_data)).await.unwrap();
+    /// # });
+    /// ```
+    pub fn merge_insert(&self, on: &[&str]) -> MergeInsertBuilder {
+        MergeInsertBuilder::new(
+            self.inner.clone(),
+            on.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    /// Create a [`Query`] Builder.
+    ///
+    /// Queries allow you to search your existing data.  By default the query will
+    /// return all the data in the table in no particular order.  The builder
+    /// returned by this method can be used to control the query using filtering,
+    /// vector similarity, sorting, and more.
+    ///
+    /// Note: By default, all columns are returned.  For best performance, you should
+    /// only fetch the columns you need.  See [`Query::select_with_projection`] for
+    /// more details.
+    ///
+    /// When appropriate, various indices and statistics will be used to accelerate
+    /// the query.
+    ///
+    /// # Examples
+    ///
+    /// ## Vector search
+    ///
+    /// This example will find the 10 rows whose value in the "vector" column are
+    /// closest to the query vector [1.0, 2.0, 3.0].  If an index has been created
+    /// on the "vector" column then this will perform an ANN search.
+    ///
+    /// The [`Query::refine_factor`] and [`Query::nprobes`] methods are used to
+    /// control the recall / latency tradeoff of the search.
+    ///
+    /// ```no_run
+    /// # use arrow_array::RecordBatch;
+    /// # use futures::TryStreamExt;
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// # let conn = lancedb::connect("/tmp").execute().await.unwrap();
+    /// # let tbl = conn.open_table("tbl").execute().await.unwrap();
+    /// use crate::lancedb::Table;
+    /// use crate::lancedb::query::ExecutableQuery;
+    /// let stream = tbl
+    ///     .query()
+    ///     .nearest_to(&[1.0, 2.0, 3.0])
+    ///     .unwrap()
+    ///     .refine_factor(5)
+    ///     .nprobes(10)
+    ///     .execute()
+    ///     .await
+    ///     .unwrap();
+    /// let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    /// # });
+    /// ```
+    ///
+    /// ## SQL-style filter
+    ///
+    /// This query will return up to 1000 rows whose value in the `id` column
+    /// is greater than 5.  LanceDb supports a broad set of filtering functions.
+    ///
+    /// ```no_run
+    /// # use arrow_array::RecordBatch;
+    /// # use futures::TryStreamExt;
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// # let conn = lancedb::connect("/tmp").execute().await.unwrap();
+    /// # let tbl = conn.open_table("tbl").execute().await.unwrap();
+    /// use crate::lancedb::Table;
+    /// use crate::lancedb::query::{ExecutableQuery, QueryBase};
+    /// let stream = tbl
+    ///     .query()
+    ///     .only_if("id > 5")
+    ///     .limit(1000)
+    ///     .execute()
+    ///     .await
+    ///     .unwrap();
+    /// let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    /// # });
+    /// ```
+    ///
+    /// ## Full scan
+    ///
+    /// This query will return everything in the table in no particular
+    /// order.
+    ///
+    /// ```no_run
+    /// # use arrow_array::RecordBatch;
+    /// # use futures::TryStreamExt;
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// # let conn = lancedb::connect("/tmp").execute().await.unwrap();
+    /// # let tbl = conn.open_table("tbl").execute().await.unwrap();
+    /// use crate::lancedb::Table;
+    /// use crate::lancedb::query::ExecutableQuery;
+    /// let stream = tbl.query().execute().await.unwrap();
+    /// let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    /// # });
+    /// ```
+    pub fn query(&self) -> Query {
+        Query::new(self.inner.clone())
+    }
+
+    /// Extract rows from the dataset using dataset offsets.
+    ///
+    /// Dataset offsets are 0-indexed and relative to the current version of the table.
+    /// They are not stable.  A row with an offset of N may have a different offset in a
+    /// different version of the table (e.g. if an earlier row is deleted).
+    ///
+    /// Offsets are useful for sampling as the set of all valid offsets is easily
+    /// known in advance to be [0, len(table)).
+    ///
+    /// No guarantees are made regarding the order in which results are returned.  If you
+    /// desire an output order that matches the order of the given offsets, you will need
+    /// to add the row offset column to the output and align it yourself.
+    ///
+    /// Parameters
+    /// ----------
+    /// offsets: list[int]
+    ///     The offsets to take.
+    ///
+    /// Returns
+    /// -------
+    /// pa.RecordBatch
+    ///     A record batch containing the rows at the given offsets.
+    pub fn take_offsets(&self, offsets: Vec<u64>) -> TakeQuery {
+        TakeQuery::from_offsets(self.inner.clone(), offsets)
+    }
+
+    /// Extract rows from the dataset using row ids.
+    ///
+    /// Row ids are not stable and are relative to the current version of the table.
+    /// They can change due to compaction and updates.
+    ///
+    /// Even so, row ids are more stable than offsets and can be useful in some situations.
+    ///
+    /// There is an ongoing effort to make row ids stable which is tracked at
+    /// https://github.com/lancedb/lancedb/issues/1120
+    ///
+    /// No guarantees are made regarding the order in which results are returned.  If you
+    /// desire an output order that matches the order of the given ids, you will need
+    /// to add the row id column to the output and align it yourself.
+    /// Parameters
+    /// ----------
+    /// row_ids: list[int]
+    ///     The row ids to take.
+    ///
+    pub fn take_row_ids(&self, row_ids: Vec<u64>) -> TakeQuery {
+        TakeQuery::from_row_ids(self.inner.clone(), row_ids)
+    }
+
+    /// Search the table with a given query vector.
+    ///
+    /// This is a convenience method for preparing a vector query and
+    /// is the same thing as calling `nearest_to` on the builder returned
+    /// by `query`.  See [`Query::nearest_to`] for more details.
+    pub fn vector_search(&self, query: impl IntoQueryVector) -> Result<VectorQuery> {
+        self.query().nearest_to(query)
+    }
+
+    /// Optimize the on-disk data and indices for better performance.
+    ///
+    /// Modeled after ``VACUUM`` in PostgreSQL.
+    ///
+    /// Optimization is discussed in more detail in the [OptimizeAction] documentation
+    /// and covers three operations:
+    ///
+    ///  * Compaction: Merges small files into larger ones
+    ///  * Prune: Removes old versions of the dataset
+    ///  * Index: Optimizes the indices, adding new data to existing indices
+    ///
+    /// The frequency an application should call optimize is based on the frequency of
+    /// data modifications.  If data is frequently added, deleted, or updated then
+    /// optimize should be run frequently.  A good rule of thumb is to run optimize if
+    /// you have added or modified 100,000 or more records or run more than 20 data
+    /// modification operations.
+    pub async fn optimize(&self, action: OptimizeAction) -> Result<OptimizeStats> {
+        self.inner.optimize(action).await
+    }
+
+    /// Add new columns to the table, providing values to fill in.
+    pub fn add_columns(&self) -> AddColumnsBuilder {
+        AddColumnsBuilder::new(self.inner.clone())
+    }
+
+    /// Change a column's name or nullability.
+    pub async fn alter_columns(
+        &self,
+        alterations: &[ColumnAlteration],
+    ) -> Result<AlterColumnsResult> {
+        self.inner.alter_columns(alterations).await
+    }
+
+    /// Update per-field metadata (merges by default).
+    pub async fn update_field_metadata(
+        &self,
+        updates: &[FieldMetadataUpdate],
+    ) -> Result<UpdateFieldMetadataResult> {
+        self.inner.update_field_metadata(updates).await
+    }
+
+    /// Remove columns from the table.
+    pub async fn drop_columns(&self, columns: &[&str]) -> Result<DropColumnsResult> {
+        self.inner.drop_columns(columns).await
+    }
+
+    /// Set the unenforced primary key for this table to a single column.
+    ///
+    /// "Unenforced" means LanceDB does not check uniqueness on writes; the
+    /// column is recorded in the schema as the primary key so that features
+    /// such as `merge_insert` can use it.
+    ///
+    /// Only single-column primary keys are supported, and the key cannot be
+    /// changed once set — calling this on a table that already has an
+    /// unenforced primary key fails. `columns` is an iterable for binding
+    /// ergonomics but must yield exactly one column:
+    ///
+    /// - `table.set_unenforced_primary_key(["id"])`
+    pub async fn set_unenforced_primary_key<I, S>(&self, columns: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let owned: Vec<String> = columns.into_iter().map(Into::into).collect();
+        let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+        self.inner.set_unenforced_primary_key(&borrowed).await
+    }
+
+    /// Install an [`LsmWriteSpec`] on this table, selecting Lance's MemWAL
+    /// LSM-style write path for future `merge_insert` calls.
+    ///
+    /// [`LsmWriteSpec`] chooses one of three sharding strategies:
+    ///
+    /// - [`LsmWriteSpec::bucket`] — hash-bucket writes by a scalar column.
+    /// - [`LsmWriteSpec::identity`] — shard by the raw value of a scalar column.
+    /// - [`LsmWriteSpec::unsharded`] — route every write to a single shard.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lancedb::table::{LsmWriteSpec, Table};
+    /// # async fn example(table: &Table) -> Result<(), Box<dyn std::error::Error>> {
+    /// table
+    ///     .set_lsm_write_spec(
+    ///         LsmWriteSpec::bucket("id", 16).with_maintained_indexes(["id_idx"]),
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_lsm_write_spec(&self, spec: LsmWriteSpec) -> Result<()> {
+        self.inner.set_lsm_write_spec(spec).await
+    }
+
+    /// Remove the [`LsmWriteSpec`] from this table, reverting to the standard
+    /// `merge_insert` write path.
+    ///
+    /// Errors if no spec is currently set.
+    pub async fn unset_lsm_write_spec(&self) -> Result<()> {
+        self.inner.unset_lsm_write_spec().await
+    }
+
+    /// Read the [`LsmWriteSpec`] currently installed on this table.
+    ///
+    /// Returns `Ok(None)` when the MemWAL LSM write path is not enabled (no
+    /// spec has been set, or it was removed with [`Table::unset_lsm_write_spec`]).
+    /// The returned spec — including its [`LsmWriteSpec::maintained_indexes`] and
+    /// [`LsmWriteSpec::writer_config_defaults`] — mirrors what was passed to
+    /// [`Table::set_lsm_write_spec`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lancedb::table::Table;
+    /// # async fn example(table: &Table) -> Result<(), Box<dyn std::error::Error>> {
+    /// if let Some(spec) = table.get_lsm_write_spec().await? {
+    ///     println!("LSM write path enabled: {:?}", spec);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_lsm_write_spec(&self) -> Result<Option<LsmWriteSpec>> {
+        self.inner.get_lsm_write_spec().await
+    }
+
+    /// Converge this table's LSM write path into its base table.
+    ///
+    /// One `flush` to seal every memtable into L0, then compaction triggers
+    /// until every generation that existed at that moment has reached base.
+    /// The loop runs client-side, reading progress from `get_lsm_stats`, so
+    /// there is no held socket and nothing to reconcile if you drop this
+    /// future partway through.
+    ///
+    /// **Best-effort.** Generations created *after* the opening flush are
+    /// deliberately not waited on — that is what lets this terminate on a
+    /// table taking writes. Idempotent and safe on a cadence: an
+    /// already-converged table costs two round trips and triggers nothing.
+    ///
+    /// **No deadline, and the caller owns that.** It returns when the target
+    /// generations are gone, propagates a terminal server fault, and
+    /// otherwise waits however long the server takes. A slow table and a
+    /// stuck one are the same picture from here: the compactor pool is shared
+    /// across every table on the node, so a checkpoint queued behind
+    /// unrelated work is indistinguishable from one that is merging. Wrap
+    /// this in `tokio::time::timeout` for a wall-clock bound; abandoning it
+    /// partway costs nothing.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lancedb::Table;
+    /// # async fn example(table: &Table) -> Result<(), Box<dyn std::error::Error>> {
+    /// let before = table.get_lsm_stats(false).await?;
+    /// table.checkpoint_lsm().await?;
+    /// let after = table.get_lsm_stats(false).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn checkpoint_lsm(&self) -> Result<()> {
+        checkpoint::checkpoint_lsm(self).await
+    }
+
+    /// Seal every bucket's active memtable into L0 without touching the
+    /// base table.
+    ///
+    /// Independently useful: flushing makes memtable rows readable from L0 at
+    /// a lower per-query cost. On a node that has not claimed this table it
+    /// claims it and replays the WAL log first — reporting "nothing to flush"
+    /// without replaying would lie about durable data.
+    pub async fn flush_lsm(&self) -> Result<()> {
+        self.inner.flush_lsm().await
+    }
+
+    /// Run one bounded L0 → base compaction pass per bucket, reporting what
+    /// it merged and what is left.
+    ///
+    /// One pass, not convergence: that bounds each request's cost and gives a
+    /// caller driving its own cadence a progress signal per round trip.
+    pub async fn compact_lsm(&self) -> Result<()> {
+        self.inner.compact_lsm().await
+    }
+
+    /// Read live per-bucket LSM state.
+    ///
+    /// Answers "how far behind is my fresh tier", "which bucket is hot", and
+    /// "why is my fresh-tier vector search brute-force". Mutates no table
+    /// state, though on a node that has not claimed this table it claims it,
+    /// exactly as a read would.
+    ///
+    /// `include_generation_rows` reports a row count per L0 generation. Off by
+    /// default: each count opens an uncached Lance dataset, and
+    /// `checkpoint_lsm` polls this needing only generation numbers.
+    ///
+    /// `Ok(None)` only when the LSM write path is not enabled, matching
+    /// [`Table::get_lsm_write_spec`]. Stats is fresh-tier only, so with the
+    /// WAL off there is no manifest to report and a struct of zeros would
+    /// read as measurements.
+    ///
+    /// Do not build a checkpoint's termination on this: the completion
+    /// predicate lives in the `flush` and `compact` responses.
+    pub async fn get_lsm_stats(&self, include_generation_rows: bool) -> Result<Option<LsmStats>> {
+        self.inner.get_lsm_stats(include_generation_rows).await
+    }
+
+    /// Drain and close any cached MemWAL shard writers held for this table.
+    ///
+    /// When an [`LsmWriteSpec`] is installed, `merge_insert` opens MemWAL shard
+    /// writers and caches them for reuse across calls. This closes them,
+    /// flushing pending data; writers reopen lazily on the next `merge_insert`.
+    /// It is a no-op when no writers are cached.
+    pub async fn close_lsm_writers(&self) -> Result<()> {
+        self.inner.close_lsm_writers().await
+    }
+
+    /// Retrieve the version of the table
+    ///
+    /// LanceDb supports versioning.  Every operation that modifies the table increases
+    /// version.  As long as a version hasn't been deleted you can `[Self::checkout]` that
+    /// version to view the data at that point.  In addition, you can `[Self::restore]` the
+    /// version to replace the current table with a previous version.
+    pub async fn version(&self) -> Result<u64> {
+        self.inner.version().await
+    }
+
+    /// Checks out a specific version of the Table
+    ///
+    /// Any read operation on the table will now access the data at the checked out version.
+    /// As a consequence, calling this method will disable any read consistency interval
+    /// that was previously set.
+    ///
+    /// This is a read-only operation that turns the table into a sort of "view"
+    /// or "detached head".  Other table instances will not be affected.  To make the change
+    /// permanent you can use the `[Self::restore]` method.
+    ///
+    /// Any operation that modifies the table will fail while the table is in a checked
+    /// out state.
+    ///
+    /// To return the table to a normal state use `[Self::checkout_latest]`
+    pub async fn checkout(&self, version: u64) -> Result<()> {
+        self.inner.checkout(version).await
+    }
+
+    /// Checks out a specific version of the Table by tag
+    ///
+    /// Any read operation on the table will now access the data at the version referenced by the tag.
+    /// As a consequence, calling this method will disable any read consistency interval
+    /// that was previously set.
+    ///
+    /// This is a read-only operation that turns the table into a sort of "view"
+    /// or "detached head".  Other table instances will not be affected.  To make the change
+    /// permanent you can use the `[Self::restore]` method.
+    ///
+    /// Any operation that modifies the table will fail while the table is in a checked
+    /// out state.
+    ///
+    /// To return the table to a normal state use `[Self::checkout_latest]`
+    pub async fn checkout_tag(&self, tag: &str) -> Result<()> {
+        self.inner.checkout_tag(tag).await
+    }
+
+    /// Ensures the table is pointing at the latest version
+    ///
+    /// This can be used to manually update a table when the read_consistency_interval is None
+    /// It can also be used to undo a `[Self::checkout]` operation
+    pub async fn checkout_latest(&self) -> Result<()> {
+        self.inner.checkout_latest().await
+    }
+
+    /// Restore the table to the currently checked out version
+    ///
+    /// This operation will fail if checkout has not been called previously
+    ///
+    /// This operation will overwrite the latest version of the table with a
+    /// previous version.  Any changes made since the checked out version will
+    /// no longer be visible.
+    ///
+    /// Once the operation concludes the table will no longer be in a checked
+    /// out state and the read_consistency_interval, if any, will apply.
+    pub async fn restore(&self) -> Result<()> {
+        self.inner.restore().await
+    }
+
+    /// List all the versions of the table
+    pub async fn list_versions(&self) -> Result<Vec<Version>> {
+        self.inner.list_versions().await
+    }
+
+    /// List all indices that have been created with [`Self::create_index`]
+    pub async fn list_indices(&self) -> Result<Vec<IndexConfig>> {
+        self.inner.list_indices().await
+    }
+
+    /// Tokenize a full-text search query using the tokenizer configured on an FTS index.
+    ///
+    /// Model-backed tokenizers such as `jieba/*` and `lindera/*` are rebuilt in
+    /// the client process from index metadata. For remote tables, this means the
+    /// same tokenizer model files must also exist locally.
+    pub async fn tokenize(&self, query: &str, index_name: &str) -> Result<Vec<FtsToken>> {
+        let indices = self.inner.list_indices().await?;
+        let matches = indices
+            .iter()
+            .filter(|idx| idx.name == index_name)
+            .collect::<Vec<_>>();
+        let index = match matches.as_slice() {
+            [index] => *index,
+            [] => {
+                return Err(Error::InvalidInput {
+                    message: format!("No index named '{}'", index_name),
+                });
+            }
+            _ => {
+                return Err(Error::InvalidInput {
+                    message: format!("Index name '{}' is ambiguous", index_name),
+                });
+            }
+        };
+        if index.index_type != IndexType::FTS {
+            return Err(Error::InvalidInput {
+                message: format!("Index '{}' is not a full text search index", index_name),
+            });
+        }
+        self.tokenize_with_index(query, index, index_name)
+    }
+
+    /// Tokenize a full-text search query using the tokenizer configured on the
+    /// FTS index for a column.
+    ///
+    /// The column must have exactly one FTS index. Model-backed tokenizers such
+    /// as `jieba/*` and `lindera/*` are rebuilt in the client process from
+    /// index metadata. For remote tables, this means the same tokenizer model
+    /// files must also exist locally.
+    pub async fn tokenize_with_column(&self, query: &str, column: &str) -> Result<Vec<FtsToken>> {
+        let schema = self.inner.schema().await?;
+        let (column, _) = resolve_arrow_field_path(schema.as_ref(), column)?;
+        let indices = self.inner.list_indices().await?;
+        let matches = indices
+            .iter()
+            .filter(|idx| {
+                idx.index_type == IndexType::FTS
+                    && idx.columns.len() == 1
+                    && idx.columns[0] == column
+            })
+            .collect::<Vec<_>>();
+        let index = match matches.as_slice() {
+            [index] => *index,
+            [] => {
+                return Err(Error::InvalidInput {
+                    message: format!("Column '{}' does not have a full text search index", column),
+                });
+            }
+            _ => {
+                return Err(Error::InvalidInput {
+                    message: format!(
+                        "Column '{}' has multiple full text search indexes; tokenization by column is ambiguous",
+                        column
+                    ),
+                });
+            }
+        };
+        self.tokenize(query, &index.name).await
+    }
+
+    fn tokenize_with_index(
+        &self,
+        query: &str,
+        index: &IndexConfig,
+        index_name: &str,
+    ) -> Result<Vec<FtsToken>> {
+        let selector_description = format!("index name '{}'", index_name);
+        let details = index
+            .index_details
+            .as_deref()
+            .ok_or_else(|| Error::InvalidInput {
+                message: format!(
+                    "Full text search index '{}' for {} does not include tokenizer details",
+                    index.name, selector_description
+                ),
+            })?;
+        let params = serde_json::from_str::<InvertedIndexParams>(details).map_err(|err| {
+            Error::InvalidInput {
+                message: format!(
+                    "Failed to parse tokenizer details for full text search index '{}' for {}: {}",
+                    index.name, selector_description, err
+                ),
+            }
+        })?;
+        tokenize(query, &params).map_err(|err| match err {
+            Error::InvalidInput { message } => Error::InvalidInput {
+                message: format!(
+                    "{} for full text search index '{}' for {}",
+                    message, index.name, selector_description
+                ),
+            },
+            err => err,
+        })
+    }
+
+    /// Get the table URI (storage location)
+    ///
+    /// Returns the full storage location of the table (e.g., S3/GCS path).
+    /// For remote tables, this fetches the location from the server via describe.
+    pub async fn uri(&self) -> Result<String> {
+        self.inner.uri().await
+    }
+
+    /// Get the storage options used when opening this table, if any.
+    ///
+    /// Warning: This is an internal API and the return value is subject to change.
+    #[deprecated(since = "0.25.0", note = "Use initial_storage_options() instead")]
+    pub async fn storage_options(&self) -> Option<HashMap<String, String>> {
+        #[allow(deprecated)]
+        self.inner.storage_options().await
+    }
+
+    /// Get the initial storage options that were passed in when opening this table.
+    ///
+    /// For dynamically refreshed options (e.g., credential vending), use [`Self::latest_storage_options`].
+    ///
+    /// Warning: This is an internal API and the return value is subject to change.
+    pub async fn initial_storage_options(&self) -> Option<HashMap<String, String>> {
+        self.inner.initial_storage_options().await
+    }
+
+    /// Get the latest storage options, refreshing from provider if configured.
+    ///
+    /// This method is useful for credential vending scenarios where storage options
+    /// may be refreshed dynamically. If no dynamic provider is configured, this
+    /// returns the initial static options.
+    ///
+    /// Warning: This is an internal API and the return value is subject to change.
+    pub async fn latest_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+        self.inner.latest_storage_options().await
+    }
+
+    /// Get statistics about an index.
+    /// Returns None if the index does not exist.
+    pub async fn index_stats(
+        &self,
+        index_name: impl AsRef<str>,
+    ) -> Result<Option<IndexStatistics>> {
+        self.inner.index_stats(index_name.as_ref()).await
+    }
+
+    /// Drop an index from the table.
+    ///
+    /// Note: This is not yet available in LanceDB cloud.
+    ///
+    /// This does not delete the index from disk, it just removes it from the table.
+    /// To delete the index, run [`Self::optimize()`] after dropping the index.
+    ///
+    /// Use [`Self::list_indices()`] to find the names of the indices.
+    pub async fn drop_index(&self, name: &str) -> Result<()> {
+        self.inner.drop_index(name).await
+    }
+
+    /// Prewarm an index in the table.
+    ///
+    /// This is a hint to the database that the index will be accessed in the
+    /// future and should be loaded into memory if possible.  This can reduce
+    /// cold-start latency for subsequent queries.
+    ///
+    /// This call initiates prewarming and returns once the request is accepted.
+    /// It is idempotent and safe to call from multiple clients concurrently.
+    ///
+    /// It is generally wasteful to call this if the index does not fit into the
+    /// available cache.  Not all index types support prewarming; unsupported
+    /// indices will silently ignore the request.
+    ///
+    /// Use [`Self::list_indices()`] to find the names of the indices.
+    pub async fn prewarm_index(&self, name: &str) -> Result<()> {
+        self.inner.prewarm_index(name).await
+    }
+
+    /// Prewarm data for the table.
+    ///
+    /// This is a hint to the database that the given columns will be accessed in
+    /// the future and the database should prefetch the data if possible.  This
+    /// can reduce cold-start latency for subsequent queries.  Currently only
+    /// supported on remote tables.
+    ///
+    /// This call initiates prewarming and returns once the request is accepted.
+    /// It is idempotent and safe to call from multiple clients concurrently —
+    /// calling it on already-prewarmed columns is a no-op on the server.
+    ///
+    /// This operation has a large upfront cost but can speed up future queries
+    /// that need to fetch the given columns.  Large columns such as embeddings
+    /// or binary data may not be practical to prewarm.  This feature is intended
+    /// for workloads that issue many queries against the same columns.
+    ///
+    /// If `columns` is `None`, all columns are prewarmed.
+    pub async fn prewarm_data(&self, columns: Option<Vec<String>>) -> Result<()> {
+        self.inner.prewarm_data(columns).await
+    }
+
+    /// Poll until the columns are fully indexed. Will return Error::Timeout if the columns
+    /// are not fully indexed within the timeout.
+    pub async fn wait_for_index(
+        &self,
+        index_names: &[&str],
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        self.inner.wait_for_index(index_names, timeout).await
+    }
+
+    /// Get the tags manager.
+    pub async fn tags(&self) -> Result<Box<dyn Tags + '_>> {
+        self.inner.tags().await
+    }
+
+    /// Create a new branch from `from` (a version, tag, or branch)
+    pub async fn create_branch(
+        &self,
+        name: &str,
+        from: impl Into<lance::dataset::refs::Ref>,
+    ) -> Result<Self> {
+        let inner = self.inner.create_branch(name, from.into()).await?;
+        Ok(Self {
+            inner,
+            database: self.database.clone(),
+            embedding_registry: self.embedding_registry.clone(),
+        })
+    }
+
+    /// Check out an existing branch and return a handle scoped to it.
+    ///
+    /// With `version` set, the returned handle is pinned to that version of the
+    /// branch: a read-only, detached view (as with [`Self::checkout`]). With
+    /// `version` as `None` it tracks the branch's latest and stays writable.
+    ///
+    /// ```
+    /// # use lancedb::Table;
+    /// # async fn f(table: &Table) -> Result<(), Box<dyn std::error::Error>> {
+    /// let exp_at_v3 = table.checkout_branch("exp", Some(3)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn checkout_branch(&self, name: &str, version: Option<u64>) -> Result<Self> {
+        let inner = self.inner.checkout_branch_version(name, version).await?;
+        Ok(Self {
+            inner,
+            database: self.database.clone(),
+            embedding_registry: self.embedding_registry.clone(),
+        })
+    }
+
+    /// List the branches of the table.
+    pub async fn list_branches(&self) -> Result<HashMap<String, BranchContents>> {
+        self.inner.list_branches().await
+    }
+
+    /// Delete a branch.
+    pub async fn delete_branch(&self, name: &str) -> Result<()> {
+        self.inner.delete_branch(name).await
+    }
+
+    /// Diff a branch against main. Remote only.
+    pub async fn diff_branch(&self, from_branch: &str) -> Result<BranchDiff> {
+        self.inner.diff_branch(from_branch).await
+    }
+
+    /// Merge a branch into main, or dry-run. Remote only.
+    /// HTTP 409 still returns [`Ok`] with [`MergeBranchStatus::Rejected`].
+    pub async fn merge_branch(
+        &self,
+        from_branch: &str,
+        dry_run: bool,
+    ) -> Result<MergeBranchResult> {
+        self.inner.merge_branch(from_branch, dry_run).await
+    }
+
+    /// The branch this handle is scoped to, or `None` for `main`.
+    pub fn current_branch(&self) -> Option<String> {
+        self.inner.current_branch()
+    }
+
+    /// Retrieve statistics on the table
+    pub async fn stats(&self) -> Result<TableStatistics> {
+        self.inner.stats().await
+    }
+}
+
+pub struct NativeTags {
+    dataset: dataset::DatasetConsistencyWrapper,
+}
+#[async_trait]
+impl Tags for NativeTags {
+    async fn list(&self) -> Result<HashMap<String, TagContents>> {
+        let dataset = self.dataset.get().await?;
+        Ok(dataset.tags().list().await?)
+    }
+
+    async fn get_version(&self, tag: &str) -> Result<u64> {
+        let dataset = self.dataset.get().await?;
+        Ok(dataset.tags().get_version(tag).await?)
+    }
+
+    async fn create(&mut self, tag: &str, version: u64) -> Result<()> {
+        let dataset = self.dataset.get().await?;
+        dataset.tags().create(tag, version).await?;
+        Ok(())
+    }
+
+    async fn delete(&mut self, tag: &str) -> Result<()> {
+        let dataset = self.dataset.get().await?;
+        dataset.tags().delete(tag).await?;
+        Ok(())
+    }
+
+    async fn update(&mut self, tag: &str, version: u64) -> Result<()> {
+        let dataset = self.dataset.get().await?;
+        dataset.tags().update(tag, version).await?;
+        Ok(())
+    }
+}
+
+pub trait NativeTableExt {
+    /// Cast as [`NativeTable`], or return None it if is not a [`NativeTable`].
+    fn as_native(&self) -> Option<&NativeTable>;
+}
+
+impl NativeTableExt for Arc<dyn BaseTable> {
+    fn as_native(&self) -> Option<&NativeTable> {
+        self.as_any().downcast_ref::<NativeTable>()
+    }
+}
+
+/// A table in a LanceDB database.
+#[derive(Clone)]
+pub struct NativeTable {
+    name: String,
+    namespace: Vec<String>,
+    id: String,
+    uri: String,
+    pub(crate) dataset: dataset::DatasetConsistencyWrapper,
+    // This comes from the connection options. We store here so we can pass down
+    // to the dataset when we recreate it (for example, in checkout_latest).
+    read_consistency_interval: Option<std::time::Duration>,
+    // Optional namespace client for namespace operations (e.g., managed versioning).
+    // pub(crate) so query.rs can access the field for server-side query execution.
+    pub(crate) namespace_client: Option<Arc<dyn LanceNamespace>>,
+    // Operations to push down to the namespace server.
+    // pub(crate) so query.rs can access the field for server-side query execution.
+    pub(crate) pushdown_operations: HashSet<NamespaceClientPushdownOperation>,
+    // Read-freshness baseline; `Some` only for namespace-backed tables.
+    freshness: Option<TableFreshness>,
+}
+
+impl std::fmt::Debug for NativeTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeTable")
+            .field("name", &self.name)
+            .field("namespace", &self.namespace)
+            .field("id", &self.id)
+            .field("uri", &self.uri)
+            .field("read_consistency_interval", &self.read_consistency_interval)
+            .field("namespace_client", &self.namespace_client)
+            .field("pushdown_operations", &self.pushdown_operations)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for NativeTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "NativeTable({}, uri={}, read_consistency_interval={})",
+            self.name,
+            self.uri,
+            match self.read_consistency_interval {
+                None => {
+                    "None".to_string()
+                }
+                Some(duration) => {
+                    format!("{}s", duration.as_secs_f64())
+                }
+            }
+        )
+    }
+}
+
+impl NativeTable {
+    /// Opens an existing Table
+    ///
+    /// # Arguments
+    ///
+    /// * `uri` - The uri to a [NativeTable]
+    /// * `name` - The table name
+    ///
+    /// # Returns
+    ///
+    /// * A [NativeTable] object.
+    pub async fn open(uri: &str) -> Result<Self> {
+        let name = Self::get_table_name(uri)?;
+        Self::open_with_params(
+            uri,
+            &name,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            HashSet::new(),
+            None,
+        )
+        .await
+    }
+
+    /// Opens an existing Table
+    ///
+    /// # Arguments
+    ///
+    /// * `base_path` - The base path where the table is located
+    /// * `name` The Table name
+    /// * `params` The [ReadParams] to use when opening the table
+    /// * `namespace_client` - Optional namespace client for namespace operations
+    /// * `pushdown_operations` - Operations to push down to the namespace server
+    /// * `managed_versioning` - Whether managed versioning is enabled. If None and namespace_client
+    ///   is provided, the value will be fetched via describe_table.
+    ///
+    /// # Returns
+    ///
+    /// * A [NativeTable] object.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_with_params(
+        uri: &str,
+        name: &str,
+        namespace: Vec<String>,
+        write_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        params: Option<ReadParams>,
+        read_consistency_interval: Option<std::time::Duration>,
+        namespace_client: Option<Arc<dyn LanceNamespace>>,
+        pushdown_operations: HashSet<NamespaceClientPushdownOperation>,
+        managed_versioning: Option<bool>,
+    ) -> Result<Self> {
+        let params = params.unwrap_or_default();
+        // patch the params if we have a write store wrapper
+        let params = match write_store_wrapper.clone() {
+            Some(wrapper) => params.patch_with_store_wrapper(wrapper)?,
+            None => params,
+        };
+
+        // Build table_id from namespace + name
+        let mut table_id = namespace.clone();
+        table_id.push(name.to_string());
+
+        // Determine if managed_versioning is enabled
+        // Use the provided value if available, otherwise query the namespace
+        let managed_versioning = match managed_versioning {
+            Some(value) => value,
+            None if namespace_client.is_some() => {
+                let ns_client = namespace_client.as_ref().unwrap();
+                let describe_request = DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                };
+                let response = ns_client
+                    .describe_table(describe_request)
+                    .await
+                    .map_err(|e| Error::Runtime {
+                        message: format!(
+                            "Failed to describe table via namespace client: {}. \
+                             If you don't need managed versioning, don't pass namespace_client.",
+                            e
+                        ),
+                    })?;
+                response.managed_versioning == Some(true)
+            }
+            None => false,
+        };
+
+        // Kept so that a `DatasetNotFound` can be re-checked against storage below.
+        let recovery_params = params.clone();
+        let mut builder = DatasetBuilder::from_uri(uri).with_read_params(params);
+
+        // Set up commit handler when managed_versioning is enabled
+        if managed_versioning && let Some(ref ns_client) = namespace_client {
+            let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                ns_client.clone(),
+                table_id.clone(),
+                uri,
+            )?;
+            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+                external_manifest_store: Arc::new(external_store),
+            });
+            builder = builder.with_commit_handler(commit_handler);
+        }
+
+        let dataset = match builder.load().await {
+            Ok(dataset) => dataset,
+            Err(e @ lance::Error::DatasetNotFound { .. }) => {
+                return Err(map_dataset_not_found(uri, name, recovery_params, e).await);
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let dataset = DatasetConsistencyWrapper::new_latest(dataset, read_consistency_interval);
+        let id = Self::build_id(&namespace, name);
+
+        Ok(Self {
+            name: name.to_string(),
+            namespace,
+            id,
+            uri: uri.to_string(),
+            dataset,
+            read_consistency_interval,
+            namespace_client,
+            pushdown_operations,
+            freshness: None,
+        })
+    }
+
+    /// Set the namespace client for server-side query execution.
+    ///
+    /// When set, queries will be executed on the namespace server instead of locally.
+    pub fn with_namespace_client(mut self, namespace_client: Arc<dyn LanceNamespace>) -> Self {
+        self.namespace_client = Some(namespace_client);
+        self
+    }
+
+    /// Attach the read-freshness baseline handle (namespace connections only).
+    pub(crate) fn with_freshness(mut self, freshness: TableFreshness) -> Self {
+        self.freshness = Some(freshness);
+        self
+    }
+
+    /// Build a sibling `NativeTable` with the same identity but a different
+    /// (independent) dataset wrapper — used to hand out branch-scoped handles.
+    fn with_dataset(&self, dataset: dataset::DatasetConsistencyWrapper) -> Self {
+        Self {
+            name: self.name.clone(),
+            namespace: self.namespace.clone(),
+            id: self.id.clone(),
+            uri: self.uri.clone(),
+            dataset,
+            read_consistency_interval: self.read_consistency_interval,
+            namespace_client: self.namespace_client.clone(),
+            pushdown_operations: self.pushdown_operations.clone(),
+            freshness: self.freshness.clone(),
+        }
+    }
+
+    /// Bump the read-freshness baseline; no-op for non-namespace tables.
+    fn bump_freshness(&self) {
+        if let Some(freshness) = &self.freshness {
+            freshness.bump();
+        }
+    }
+
+    fn validate_branch_name(name: &str, field: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(Error::InvalidInput {
+                message: format!("{field} must be a non-empty string"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Opens an existing Table using a namespace client.
+    ///
+    /// This method uses `DatasetBuilder::from_namespace` to open the table, which
+    /// automatically fetches the table location and storage options from the namespace.
+    /// This eliminates the need to pre-fetch and merge storage options before opening.
+    ///
+    /// # Arguments
+    ///
+    /// * `namespace_client` - The namespace client to use for fetching table metadata
+    /// * `name` - The table name
+    /// * `namespace` - The namespace path (e.g., vec!["parent", "child"])
+    /// * `write_store_wrapper` - Optional wrapper for the object store on write path
+    /// * `params` - Optional read parameters
+    /// * `read_consistency_interval` - Optional interval for read consistency
+    /// * `pushdown_operations` - Operations to push down to the namespace server.
+    ///   When `QueryTable` is included, queries will be executed on the namespace server.
+    /// * `session` - Optional session for object stores and caching
+    ///
+    /// # Returns
+    ///
+    /// * A [NativeTable] object.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_from_namespace(
+        namespace_client: Arc<dyn LanceNamespace>,
+        name: &str,
+        namespace: Vec<String>,
+        write_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        params: Option<ReadParams>,
+        read_consistency_interval: Option<std::time::Duration>,
+        pushdown_operations: HashSet<NamespaceClientPushdownOperation>,
+        session: Option<Arc<lance::session::Session>>,
+    ) -> Result<Self> {
+        let mut params = params.unwrap_or_default();
+
+        // Set the session in read params
+        if let Some(sess) = session {
+            params.session(sess);
+        }
+
+        // patch the params if we have a write store wrapper
+        let params = match write_store_wrapper.clone() {
+            Some(wrapper) => params.patch_with_store_wrapper(wrapper)?,
+            None => params,
+        };
+
+        // Build table_id from namespace + name
+        let mut table_id = namespace.clone();
+        table_id.push(name.to_string());
+
+        // Use DatasetBuilder::from_namespace which automatically fetches location
+        // and storage options from the namespace
+        let builder = DatasetBuilder::from_namespace(namespace_client.clone(), table_id)
+            .await
+            .map_err(|e| map_namespace_lance_error(e, name))?;
+
+        let dataset = builder
+            .with_read_params(params)
+            .load()
+            .await
+            .map_err(|e| match e {
+                lance::Error::DatasetNotFound { .. } => Error::TableNotFound {
+                    name: name.to_string(),
+                    source: Box::new(e),
+                },
+                e => e.into(),
+            })?;
+
+        let uri = dataset.uri().to_string();
+        let dataset = DatasetConsistencyWrapper::new_latest(dataset, read_consistency_interval);
+        let id = Self::build_id(&namespace, name);
+
+        let stored_namespace_client =
+            if pushdown_operations.contains(&NamespaceClientPushdownOperation::QueryTable) {
+                Some(namespace_client)
+            } else {
+                None
+            };
+
+        Ok(Self {
+            name: name.to_string(),
+            namespace,
+            id,
+            uri,
+            dataset,
+            read_consistency_interval,
+            namespace_client: stored_namespace_client,
+            pushdown_operations,
+            freshness: None,
+        })
+    }
+
+    fn get_table_name(uri: &str) -> Result<String> {
+        let path = Path::new(uri);
+        let name = path
+            .file_stem()
+            .ok_or(Error::TableNotFound {
+                name: uri.to_string(),
+                source: format!("Could not extract table name from URI: '{}'", uri).into(),
+            })?
+            .to_str()
+            .ok_or(Error::InvalidTableName {
+                name: uri.to_string(),
+                reason: "Table name is not valid URL".to_string(),
+            })?;
+        Ok(name.to_string())
+    }
+
+    fn build_id(namespace: &[String], name: &str) -> String {
+        if namespace.is_empty() {
+            name.to_string()
+        } else {
+            let mut parts = namespace.to_vec();
+            parts.push(name.to_string());
+            parts.join("$")
+        }
+    }
+
+    /// Creates a new Table
+    ///
+    /// # Arguments
+    ///
+    /// * `uri` - The URI to the table. When namespace is not empty, the caller must
+    ///   provide an explicit URI (location) rather than deriving it from the table name.
+    /// * `name` The Table name
+    /// * `namespace` - The namespace path. When non-empty, an explicit URI must be provided.
+    /// * `batches` RecordBatch to be saved in the database.
+    /// * `params` - Write parameters.
+    /// * `namespace_client` - Optional namespace client for namespace operations
+    /// * `pushdown_operations` - Operations to push down to the namespace server
+    ///
+    /// # Returns
+    ///
+    /// * A [TableImpl] object.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create(
+        uri: &str,
+        name: &str,
+        namespace: Vec<String>,
+        batches: impl StreamingWriteSource,
+        write_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        params: Option<WriteParams>,
+        read_consistency_interval: Option<std::time::Duration>,
+        namespace_client: Option<Arc<dyn LanceNamespace>>,
+        pushdown_operations: HashSet<NamespaceClientPushdownOperation>,
+    ) -> Result<Self> {
+        // Default params uses format v1.
+        let params = params.unwrap_or(WriteParams {
+            ..Default::default()
+        });
+        // patch the params if we have a write store wrapper
+        let params = match write_store_wrapper.clone() {
+            Some(wrapper) => params.patch_with_store_wrapper(wrapper)?,
+            None => params,
+        };
+
+        let insert_builder = InsertBuilder::new(uri).with_params(&params);
+        let dataset = insert_builder
+            .execute_stream(batches)
+            .await
+            .map_err(|e| match e {
+                lance::Error::DatasetAlreadyExists { .. } => Error::TableAlreadyExists {
+                    name: name.to_string(),
+                },
+                e => e.into(),
+            })?;
+
+        let id = Self::build_id(&namespace, name);
+
+        Ok(Self {
+            name: name.to_string(),
+            namespace,
+            id,
+            uri: uri.to_string(),
+            dataset: DatasetConsistencyWrapper::new_latest(dataset, read_consistency_interval),
+            read_consistency_interval,
+            namespace_client,
+            pushdown_operations,
+            freshness: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_empty(
+        uri: &str,
+        name: &str,
+        namespace: Vec<String>,
+        schema: SchemaRef,
+        write_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        params: Option<WriteParams>,
+        read_consistency_interval: Option<std::time::Duration>,
+        namespace_client: Option<Arc<dyn LanceNamespace>>,
+        pushdown_operations: HashSet<NamespaceClientPushdownOperation>,
+    ) -> Result<Self> {
+        let data: Box<dyn Scannable> = Box::new(RecordBatch::new_empty(schema));
+        Self::create(
+            uri,
+            name,
+            namespace,
+            data,
+            write_store_wrapper,
+            params,
+            read_consistency_interval,
+            namespace_client,
+            pushdown_operations,
+        )
+        .await
+    }
+
+    /// Creates a new Table using a namespace client for storage options.
+    ///
+    /// This method sets up a `StorageOptionsProvider` from the namespace client,
+    /// enabling automatic credential refresh for cloud storage. The namespace
+    /// is used for:
+    /// 1. Setting up storage options provider for credential vending
+    /// 2. Optionally enabling server-side query execution
+    ///
+    /// # Arguments
+    ///
+    /// * `namespace_client` - The namespace client to use for storage options
+    /// * `uri` - The URI to the table (obtained from create_empty_table response)
+    /// * `name` - The table name
+    /// * `namespace` - The namespace path (e.g., vec!["parent", "child"])
+    /// * `batches` - RecordBatch to be saved in the database
+    /// * `write_store_wrapper` - Optional wrapper for the object store on write path
+    /// * `params` - Optional write parameters
+    /// * `read_consistency_interval` - Optional interval for read consistency
+    /// * `pushdown_operations` - Operations to push down to the namespace server
+    ///
+    /// # Returns
+    ///
+    /// * A [NativeTable] object.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_from_namespace(
+        namespace_client: Arc<dyn LanceNamespace>,
+        uri: &str,
+        name: &str,
+        namespace: Vec<String>,
+        batches: impl StreamingWriteSource,
+        write_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        params: Option<WriteParams>,
+        read_consistency_interval: Option<std::time::Duration>,
+        pushdown_operations: HashSet<NamespaceClientPushdownOperation>,
+        session: Option<Arc<lance::session::Session>>,
+    ) -> Result<Self> {
+        // Build table_id from namespace + name for the storage options provider
+        let mut table_id = namespace.clone();
+        table_id.push(name.to_string());
+
+        // Set up storage options provider from namespace
+        let storage_options_provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+            namespace_client.clone(),
+            table_id,
+        ));
+
+        // Start with provided params or defaults
+        let mut params = params.unwrap_or_default();
+
+        // Set the session in write params
+        if let Some(sess) = session {
+            params.session = Some(sess);
+        }
+
+        // Ensure store_params exists and set the storage options provider
+        let store_params = params
+            .store_params
+            .get_or_insert_with(ObjectStoreParams::default);
+        let accessor = match store_params.storage_options().cloned() {
+            Some(options) => {
+                StorageOptionsAccessor::with_initial_and_provider(options, storage_options_provider)
+            }
+            None => StorageOptionsAccessor::with_provider(storage_options_provider),
+        };
+        store_params.storage_options_accessor = Some(Arc::new(accessor));
+
+        // Patch the params if we have a write store wrapper
+        let params = match write_store_wrapper.clone() {
+            Some(wrapper) => params.patch_with_store_wrapper(wrapper)?,
+            None => params,
+        };
+
+        let insert_builder = InsertBuilder::new(uri).with_params(&params);
+        let dataset = insert_builder
+            .execute_stream(batches)
+            .await
+            .map_err(|e| match e {
+                lance::Error::DatasetAlreadyExists { .. } => Error::TableAlreadyExists {
+                    name: name.to_string(),
+                },
+                e => e.into(),
+            })?;
+
+        let id = Self::build_id(&namespace, name);
+
+        let stored_namespace_client =
+            if pushdown_operations.contains(&NamespaceClientPushdownOperation::QueryTable) {
+                Some(namespace_client)
+            } else {
+                None
+            };
+
+        Ok(Self {
+            name: name.to_string(),
+            namespace,
+            id,
+            uri: uri.to_string(),
+            dataset: DatasetConsistencyWrapper::new_latest(dataset, read_consistency_interval),
+            read_consistency_interval,
+            namespace_client: stored_namespace_client,
+            pushdown_operations,
+            freshness: None,
+        })
+    }
+
+    /// Merge new data into this table.
+    pub async fn merge(
+        &mut self,
+        batches: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+    ) -> Result<()> {
+        self.dataset.ensure_mutable()?;
+        let mut dataset = (*self.dataset.get().await?).clone();
+        dataset.merge(batches, left_on, right_on).await?;
+        self.dataset.update(dataset);
+        Ok(())
+    }
+
+    // TODO: why are these individual methods and not some single "get_stats" method?
+    pub async fn count_fragments(&self) -> Result<usize> {
+        Ok(self.dataset.get().await?.count_fragments())
+    }
+
+    pub async fn count_deleted_rows(&self) -> Result<usize> {
+        Ok(self.dataset.get().await?.count_deleted_rows().await?)
+    }
+
+    pub async fn num_small_files(&self, max_rows_per_group: usize) -> Result<usize> {
+        Ok(self
+            .dataset
+            .get()
+            .await?
+            .num_small_files(max_rows_per_group)
+            .await)
+    }
+    /// Check whether the table uses V2 manifest paths.
+    ///
+    /// See [Self::migrate_manifest_paths_v2] and [ManifestNamingScheme] for
+    /// more information.
+    pub async fn uses_v2_manifest_paths(&self) -> Result<bool> {
+        let dataset = self.dataset.get().await?;
+        Ok(dataset.manifest_location().naming_scheme == ManifestNamingScheme::V2)
+    }
+
+    /// Migrate the table to use the new manifest path scheme.
+    ///
+    /// This function will rename all V1 manifests to V2 manifest paths.
+    /// These paths provide more efficient opening of datasets with many versions
+    /// on object stores.
+    ///
+    /// This function is idempotent, and can be run multiple times without
+    /// changing the state of the object store.
+    ///
+    /// However, it should not be run while other concurrent operations are happening.
+    /// And it should also run until completion before resuming other operations.
+    ///
+    /// You can use [Self::uses_v2_manifest_paths] to check if the table is already
+    /// using V2 manifest paths.
+    pub async fn migrate_manifest_paths_v2(&self) -> Result<()> {
+        self.dataset.ensure_mutable()?;
+        let mut dataset = (*self.dataset.get().await?).clone();
+        dataset.migrate_manifest_paths_v2().await?;
+        self.dataset.update(dataset);
+        Ok(())
+    }
+
+    /// Get the table manifest
+    pub async fn manifest(&self) -> Result<Manifest> {
+        let dataset = self.dataset.get().await?;
+        Ok(dataset.manifest().clone())
+    }
+
+    /// Update key-value pairs in config.
+    pub async fn update_config(
+        &self,
+        upsert_values: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<()> {
+        self.dataset.ensure_mutable()?;
+        let mut dataset = (*self.dataset.get().await?).clone();
+        dataset.update_config(upsert_values).await?;
+        self.dataset.update(dataset);
+        Ok(())
+    }
+
+    /// Delete keys from the config
+    pub async fn delete_config_keys(&self, delete_keys: &[&str]) -> Result<()> {
+        self.dataset.ensure_mutable()?;
+        let mut dataset = (*self.dataset.get().await?).clone();
+        // TODO: update this when we implement metadata APIs
+        #[allow(deprecated)]
+        dataset.delete_config_keys(delete_keys).await?;
+        self.dataset.update(dataset);
+        Ok(())
+    }
+
+    /// Update schema metadata
+    pub async fn replace_schema_metadata(
+        &self,
+        upsert_values: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<()> {
+        self.dataset.ensure_mutable()?;
+        let mut dataset = (*self.dataset.get().await?).clone();
+        // TODO: update this when we implement metadata APIs
+        #[allow(deprecated)]
+        dataset.replace_schema_metadata(upsert_values).await?;
+        self.dataset.update(dataset);
+        Ok(())
+    }
+
+    /// Update field metadata
+    ///
+    /// # Arguments:
+    /// * `new_values` - An iterator of tuples where the first element is the
+    ///   field id and the second element is a hashmap of metadata key-value
+    ///   pairs.
+    ///
+    #[deprecated(since = "0.33.1", note = "Use `update_field_metadata` instead")]
+    pub async fn replace_field_metadata(
+        &self,
+        new_values: impl IntoIterator<Item = (u32, HashMap<String, String>)>,
+    ) -> Result<()> {
+        self.dataset.ensure_mutable()?;
+        let mut dataset = (*self.dataset.get().await?).clone();
+        dataset.replace_field_metadata(new_values).await?;
+        self.dataset.update(dataset);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl BaseTable for NativeTable {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    fn namespace(&self) -> &[String] {
+        &self.namespace
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn version(&self) -> Result<u64> {
+        Ok(self.dataset.get().await?.version().version)
+    }
+
+    async fn checkout(&self, version: u64) -> Result<()> {
+        self.dataset.as_time_travel(version).await
+    }
+
+    async fn checkout_tag(&self, tag: &str) -> Result<()> {
+        self.dataset.as_time_travel(tag).await
+    }
+
+    async fn checkout_latest(&self) -> Result<()> {
+        // Bump before resolving "latest" so that request carries the floor.
+        self.bump_freshness();
+        self.dataset.as_latest().await?;
+        self.dataset.reload().await
+    }
+
+    async fn create_branch(
+        &self,
+        name: &str,
+        from: lance::dataset::refs::Ref,
+    ) -> Result<Arc<dyn BaseTable>> {
+        Self::validate_branch_name(name, "branch name")?;
+        if let lance::dataset::refs::Ref::Version(Some(from_branch), _) = &from {
+            Self::validate_branch_name(from_branch, "from_ref")?;
+        }
+        let mut ds = (*self.dataset.get().await?).clone();
+        let branch_ds = ds.create_branch(name, from, None).await?;
+        let dataset = dataset::DatasetConsistencyWrapper::new_latest(
+            branch_ds,
+            self.read_consistency_interval,
+        );
+        Ok(Arc::new(self.with_dataset(dataset)))
+    }
+
+    async fn checkout_branch(&self, name: &str) -> Result<Arc<dyn BaseTable>> {
+        Self::validate_branch_name(name, "branch name")?;
+        let branch_ds = self.dataset.get().await?.checkout_branch(name).await?;
+        let dataset = dataset::DatasetConsistencyWrapper::new_latest(
+            branch_ds,
+            self.read_consistency_interval,
+        );
+        Ok(Arc::new(self.with_dataset(dataset)))
+    }
+
+    async fn checkout_branch_version(
+        &self,
+        name: &str,
+        version: Option<u64>,
+    ) -> Result<Arc<dyn BaseTable>> {
+        let Some(version) = version else {
+            return self.checkout_branch(name).await;
+        };
+        Self::validate_branch_name(name, "branch name")?;
+        // Resolve (branch, version) in a single manifest read.
+        let branch_ds = self
+            .dataset
+            .get()
+            .await?
+            .checkout_version((name, version))
+            .await?;
+        let dataset = dataset::DatasetConsistencyWrapper::new_time_travel(
+            branch_ds,
+            self.read_consistency_interval,
+        );
+        Ok(Arc::new(self.with_dataset(dataset)))
+    }
+
+    async fn list_branches(&self) -> Result<HashMap<String, BranchContents>> {
+        Ok(self.dataset.get().await?.list_branches().await?)
+    }
+
+    async fn delete_branch(&self, name: &str) -> Result<()> {
+        Self::validate_branch_name(name, "branch name")?;
+        let mut ds = (*self.dataset.get().await?).clone();
+        ds.delete_branch(name).await?;
+        Ok(())
+    }
+
+    fn current_branch(&self) -> Option<String> {
+        self.dataset.current_branch()
+    }
+
+    async fn list_versions(&self) -> Result<Vec<Version>> {
+        Ok(self.dataset.get().await?.versions().await?)
+    }
+
+    async fn restore(&self) -> Result<()> {
+        let version = self
+            .dataset
+            .time_travel_version()
+            .ok_or_else(|| Error::InvalidInput {
+                message: "you must run checkout before running restore".to_string(),
+            })?;
+        {
+            // restore is the only "write" operation allowed in time travel mode
+            let mut dataset = (*self.dataset.get().await?).clone();
+            debug_assert_eq!(dataset.version().version, version);
+            dataset.restore().await?;
+        }
+        // Restore moves "latest", so bump before resolving it (as RemoteTable does).
+        self.bump_freshness();
+        self.dataset.as_latest().await?;
+        Ok(())
+    }
+
+    async fn schema(&self) -> Result<SchemaRef> {
+        let lance_schema = self.dataset.get().await?.schema().clone();
+        Ok(Arc::new(Schema::from(&lance_schema)))
+    }
+
+    async fn table_definition(&self) -> Result<TableDefinition> {
+        let schema = self.schema().await?;
+        TableDefinition::try_from_rich_schema(schema)
+    }
+
+    async fn count_rows(&self, filter: Option<Filter>) -> Result<usize> {
+        let dataset = self.dataset.get().await?;
+        match filter {
+            None => Ok(dataset.count_rows(None).await?),
+            Some(Filter::Sql(sql)) => Ok(dataset.count_rows(Some(sql)).await?),
+            Some(Filter::Datafusion(_)) => Err(Error::NotSupported {
+                message: "Datafusion filters are not yet supported".to_string(),
+            }),
+        }
+    }
+
+    async fn add(&self, mut add: AddDataBuilder) -> Result<AddResult> {
+        let table_def = self.table_definition().await?;
+
+        self.dataset.ensure_mutable()?;
+        let ds_wrapper = self.dataset.clone();
+        let ds = self.dataset.get().await?;
+
+        let table_schema = Schema::from(&ds.schema().clone());
+
+        let num_partitions = if let Some(parallelism) = add.write_parallelism {
+            parallelism
+        } else {
+            // Peek at the first batch to estimate a good partition count for
+            // write parallelism.
+            let mut peeked = PeekedScannable::new(add.data);
+            let n = if let Some(first_batch) = peeked.peek().await {
+                let max_partitions = lance_core::utils::tokio::get_num_compute_intensive_cpus();
+                estimate_write_partitions(
+                    first_batch.get_array_memory_size(),
+                    first_batch.num_rows(),
+                    peeked.num_rows(),
+                    max_partitions,
+                )
+            } else {
+                1
+            };
+            add.data = Box::new(peeked);
+            n
+        };
+
+        let output = add.into_plan(&table_schema, &table_def)?;
+
+        let lance_params = output
+            .write_options
+            .lance_write_params
+            .unwrap_or(WriteParams {
+                mode: match output.mode {
+                    AddDataMode::Append => WriteMode::Append,
+                    AddDataMode::Overwrite => WriteMode::Overwrite,
+                },
+                ..Default::default()
+            });
+
+        // Repartition for write parallelism if beneficial.
+        let plan = if num_partitions > 1 {
+            Arc::new(
+                datafusion_physical_plan::repartition::RepartitionExec::try_new(
+                    output.plan,
+                    datafusion_physical_plan::Partitioning::RoundRobinBatch(num_partitions),
+                )?,
+            ) as Arc<dyn ExecutionPlan>
+        } else {
+            output.plan
+        };
+
+        let insert_exec = Arc::new(InsertExec::new_with_tracker(
+            ds_wrapper.clone(),
+            ds,
+            plan,
+            lance_params,
+            output.tracker.clone(),
+        ));
+
+        let tracker_for_tasks = output.tracker.clone();
+        if let Some(ref t) = tracker_for_tasks {
+            t.set_total_tasks(num_partitions);
+        }
+        let _finish = write_progress::FinishOnDrop(output.tracker);
+
+        // Execute all partitions in parallel.
+        let task_ctx = Arc::new(TaskContext::default());
+        let handles = FuturesUnordered::new();
+        for partition in 0..num_partitions {
+            let exec = insert_exec.clone();
+            let ctx = task_ctx.clone();
+            let tracker = tracker_for_tasks.clone();
+            handles.push(tokio::spawn(async move {
+                let _guard = tracker.as_ref().map(|t| t.track_task());
+                let mut stream = exec
+                    .execute(partition, ctx)
+                    .map_err(|e| -> Error { e.into() })?;
+                while let Some(batch) = stream.next().await {
+                    batch.map_err(|e| -> Error { e.into() })?;
+                }
+                Ok::<_, Error>(())
+            }));
+        }
+        for handle in handles {
+            handle.await.map_err(|e| Error::Runtime {
+                message: format!("Insert task panicked: {}", e),
+            })??;
+        }
+
+        let version = ds_wrapper.get().await?.manifest().version;
+        self.bump_freshness();
+        Ok(AddResult { version })
+    }
+
+    async fn create_index(&self, opts: IndexBuilder) -> Result<()> {
+        let prepared = self.prepare_index(&opts).await?;
+        self.build_index(opts, prepared).await
+    }
+
+    async fn create_index_async(&self, opts: IndexBuilder) -> Result<Job> {
+        // Prepare before spawning so bad input is reported by this call rather
+        // than only by the job.
+        let prepared = self.prepare_index(&opts).await?;
+        let table = self.clone();
+        Ok(Job::spawned(tokio::spawn(async move {
+            table.build_index(opts, prepared).await
+        })))
+    }
+
+    async fn drop_index(&self, index_name: &str) -> Result<()> {
+        self.dataset.ensure_mutable()?;
+        let mut dataset = (*self.dataset.get().await?).clone();
+        dataset.drop_index(index_name).await?;
+        self.dataset.update(dataset);
+        Ok(())
+    }
+
+    async fn prewarm_index(&self, index_name: &str) -> Result<()> {
+        let dataset = self.dataset.get().await?;
+        Ok(dataset.prewarm_index(index_name).await?)
+    }
+
+    async fn prewarm_data(&self, _columns: Option<Vec<String>>) -> Result<()> {
+        Err(Error::NotSupported {
+            message: "prewarm_data is currently only supported on remote tables.".into(),
+        })
+    }
+
+    async fn update(&self, update: UpdateBuilder) -> Result<UpdateResult> {
+        // Delegate to the submodule implementation
+        let result = update::execute_update(self, update).await?;
+        self.bump_freshness();
+        Ok(result)
+    }
+
+    async fn create_plan(
+        &self,
+        query: &AnyQuery,
+        options: QueryExecutionOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        query::create_plan(self, query, options).await
+    }
+
+    async fn query(
+        &self,
+        query: &AnyQuery,
+        options: QueryExecutionOptions,
+    ) -> Result<DatasetRecordBatchStream> {
+        query::execute_query(self, query, options).await
+    }
+
+    async fn analyze_plan(
+        &self,
+        query: &AnyQuery,
+        options: QueryExecutionOptions,
+    ) -> Result<String> {
+        query::analyze_query_plan(self, query, options).await
+    }
+
+    async fn merge_insert(
+        &self,
+        params: MergeInsertBuilder,
+        new_data: Box<dyn RecordBatchReader + Send>,
+    ) -> Result<MergeResult> {
+        let result = merge::execute_merge_insert(self, params, new_data).await?;
+        self.bump_freshness();
+        Ok(result)
+    }
+
+    async fn set_unenforced_primary_key(&self, columns: &[&str]) -> Result<()> {
+        primary_key::set_unenforced_primary_key(self, columns).await
+    }
+
+    async fn set_lsm_write_spec(&self, spec: LsmWriteSpec) -> Result<()> {
+        merge::lsm::set_lsm_write_spec(self, spec).await
+    }
+
+    async fn unset_lsm_write_spec(&self) -> Result<()> {
+        merge::lsm::unset_lsm_write_spec(self).await
+    }
+
+    async fn get_lsm_write_spec(&self) -> Result<Option<LsmWriteSpec>> {
+        merge::lsm::get_lsm_write_spec(self).await
+    }
+
+    async fn close_lsm_writers(&self) -> Result<()> {
+        merge::lsm::close_lsm_writers(self).await
+    }
+
+    async fn blob_columns(&self) -> Result<Vec<String>> {
+        let schema = self.schema().await?;
+        Ok(crate::blob::blob_column_names(schema.as_ref()))
+    }
+
+    async fn fetch_blobs(&self, column: &str, row_ids: &[u64]) -> Result<LargeBinaryArray> {
+        let dataset = self.dataset.get().await?;
+        crate::blob::take_blobs_aligned(&dataset, column, row_ids).await
+    }
+
+    async fn fetch_blob_ranges(
+        &self,
+        column: &str,
+        requests: &[BlobRangeRequest],
+    ) -> Result<LargeBinaryArray> {
+        let dataset = self.dataset.get().await?;
+        crate::blob::take_blob_ranges_aligned(&dataset, column, requests).await
+    }
+
+    async fn fetch_blob_files(
+        &self,
+        column: &str,
+        row_ids: &[u64],
+    ) -> Result<Vec<Option<BlobFile>>> {
+        let dataset = self.dataset.get().await?;
+        crate::blob::take_blob_files_aligned(&dataset, column, row_ids).await
+    }
+
+    /// Delete rows from the table
+    async fn delete(&self, predicate: Predicate<'_>) -> Result<DeleteResult> {
+        let result = delete::execute_delete(self, predicate).await?;
+        self.bump_freshness();
+        Ok(result)
+    }
+
+    async fn tags(&self) -> Result<Box<dyn Tags + '_>> {
+        Ok(Box::new(NativeTags {
+            dataset: self.dataset.clone(),
+        }))
+    }
+
+    async fn optimize(&self, action: OptimizeAction) -> Result<OptimizeStats> {
+        // Delegate to the submodule implementation
+        optimize::execute_optimize(self, action).await
+    }
+
+    async fn add_columns(
+        &self,
+        transforms: NewColumnTransform,
+        read_columns: Option<Vec<String>>,
+    ) -> Result<AddColumnsResult> {
+        let result = schema_evolution::execute_add_columns(self, transforms, read_columns).await?;
+        self.bump_freshness();
+        Ok(result)
+    }
+
+    async fn alter_columns(&self, alterations: &[ColumnAlteration]) -> Result<AlterColumnsResult> {
+        let result = schema_evolution::execute_alter_columns(self, alterations).await?;
+        self.bump_freshness();
+        Ok(result)
+    }
+
+    async fn update_field_metadata(
+        &self,
+        updates: &[FieldMetadataUpdate],
+    ) -> Result<UpdateFieldMetadataResult> {
+        let result = schema_evolution::execute_update_field_metadata(self, updates).await?;
+        self.bump_freshness();
+        Ok(result)
+    }
+
+    async fn drop_columns(&self, columns: &[&str]) -> Result<DropColumnsResult> {
+        let result = schema_evolution::execute_drop_columns(self, columns).await?;
+        self.bump_freshness();
+        Ok(result)
+    }
+
+    async fn list_indices(&self) -> Result<Vec<IndexConfig>> {
+        let dataset = self.dataset.get().await?;
+        let total_rows = dataset.count_rows(None).await? as u64;
+        let descriptions = dataset.describe_indices(None).await?;
+        let mut indices: Vec<IndexConfig> = descriptions
+            .iter()
+            .filter_map(|idx_desc| {
+                let index_type: crate::index::IndexType = idx_desc
+                    .index_type()
+                    .parse()
+                    .unwrap_or(crate::index::IndexType::Unknown);
+                if index_type == crate::index::IndexType::Unknown {
+                    // Internal or future index types that this version doesn't recognize
+                    // (e.g. Lance's internal FragReuseIndex) are silently excluded from
+                    // the user-visible index listing.
+                    log::debug!(
+                        "Skipping unrecognized index '{}' (type '{}') in list_indices",
+                        idx_desc.name(),
+                        idx_desc.index_type(),
+                    );
+                    return None;
+                }
+
+                let field_ids = idx_desc.field_ids();
+                let mut columns = Vec::with_capacity(field_ids.len());
+                for field_id in field_ids {
+                    let field_path = match dataset.schema().field_path(*field_id as i32) {
+                        Ok(field_path) => field_path,
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to resolve field path for index {} field id {}: {}",
+                                idx_desc.name(),
+                                field_id,
+                                e
+                            );
+                            return None;
+                        }
+                    };
+                    columns.push(field_path);
+                }
+
+                let segments = idx_desc.segments();
+                let index_uuid = segments.first().map(|seg| seg.uuid.to_string());
+                let created_at = segments.iter().filter_map(|seg| seg.created_at).min();
+                let index_version = segments.first().map(|seg| seg.index_version);
+                let num_indexed_rows = idx_desc.rows_indexed();
+
+                Some(IndexConfig {
+                    name: idx_desc.name().to_string(),
+                    index_type,
+                    columns,
+                    index_uuid,
+                    type_url: Some(idx_desc.type_url().to_string()),
+                    created_at,
+                    num_indexed_rows: Some(num_indexed_rows),
+                    num_unindexed_rows: Some(total_rows.saturating_sub(num_indexed_rows)),
+                    size_bytes: idx_desc.total_size_bytes(),
+                    num_segments: Some(segments.len() as u32),
+                    index_version,
+                    index_details: idx_desc.details().ok(),
+                })
+            })
+            .collect();
+
+        for index in indices
+            .iter_mut()
+            .filter(|index| index.index_type == crate::index::IndexType::FTS)
+        {
+            let Some(description) = descriptions
+                .iter()
+                .find(|description| description.name() == index.name)
+            else {
+                continue;
+            };
+            let segments = description.segments();
+            let Some(segment) = segments.first() else {
+                continue;
+            };
+            let params = load_segment_params(&dataset, segment).await?;
+            let details = serde_json::to_string(&params).map_err(|source| Error::Other {
+                message: format!(
+                    "Failed to serialize full text search configuration for index '{}'",
+                    index.name
+                ),
+                source: Some(Box::new(source)),
+            })?;
+            index.index_details = Some(details);
+        }
+        Ok(indices)
+    }
+
+    async fn uri(&self) -> Result<String> {
+        Ok(self.uri.clone())
+    }
+
+    async fn storage_options(&self) -> Option<HashMap<String, String>> {
+        self.initial_storage_options().await
+    }
+
+    async fn initial_storage_options(&self) -> Option<HashMap<String, String>> {
+        self.dataset
+            .get()
+            .await
+            .ok()
+            .and_then(|dataset| dataset.initial_storage_options().cloned())
+    }
+
+    async fn latest_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+        let dataset = self.dataset.get().await?;
+        Ok(dataset.latest_storage_options().await?.map(|o| o.0))
+    }
+
+    async fn index_stats(&self, index_name: &str) -> Result<Option<IndexStatistics>> {
+        // describe_indices() reads only manifest-level metadata (no index file I/O).
+        // VectorIndexDetails in the manifest carries distance_type for indices written
+        // by recent Lance versions. For older datasets that didn't write those details
+        // we fall back to index_statistics() for vector index types.
+        let dataset = self.dataset.get().await?;
+
+        let mut descriptions = dataset
+            .describe_indices(Some(IndexCriteria::default().with_name(index_name)))
+            .await?;
+        let Some(description) = descriptions.pop() else {
+            return Ok(None);
+        };
+
+        let index_type: crate::index::IndexType = description
+            .index_type()
+            .parse()
+            .unwrap_or(crate::index::IndexType::Unknown);
+
+        let is_vector = matches!(
+            index_type,
+            crate::index::IndexType::IvfFlat
+                | crate::index::IndexType::IvfSq
+                | crate::index::IndexType::IvfPq
+                | crate::index::IndexType::IvfRq
+                | crate::index::IndexType::IvfHnswPq
+                | crate::index::IndexType::IvfHnswSq
+                | crate::index::IndexType::IvfHnswFlat
+        );
+
+        // details() serializes VectorIndexDetails to JSON with an uppercase "metric_type"
+        // field (e.g. "L2", "COSINE"). Parse it with a case-insensitive match.
+        let distance_type = description.details().ok().and_then(|json| {
+            #[derive(serde::Deserialize)]
+            struct Details {
+                metric_type: Option<String>,
+            }
+            serde_json::from_str::<Details>(&json)
+                .ok()
+                .and_then(|d| d.metric_type)
+                .and_then(|m| match m.to_uppercase().as_str() {
+                    "L2" => Some(DistanceType::L2),
+                    "COSINE" => Some(DistanceType::Cosine),
+                    "DOT" => Some(DistanceType::Dot),
+                    "HAMMING" => Some(DistanceType::Hamming),
+                    _ => None,
+                })
+        });
+
+        // Older Lance datasets didn't write VectorIndexDetails, so distance_type won't
+        // be in the manifest. Fall back to index_statistics() only in that case.
+        if is_vector && distance_type.is_none() {
+            let stats = dataset.index_statistics(index_name).await?;
+            let mut stats: IndexStatisticsImpl =
+                serde_json::from_str(&stats).map_err(|e| Error::InvalidInput {
+                    message: format!("error deserializing index statistics: {}", e),
+                })?;
+            let first_index = stats.indices.pop().ok_or_else(|| Error::InvalidInput {
+                message: "index statistics is empty".to_string(),
+            })?;
+            return Ok(Some(IndexStatistics {
+                num_indexed_rows: stats.num_indexed_rows,
+                num_unindexed_rows: stats.num_unindexed_rows,
+                index_type,
+                distance_type: first_index.metric_type,
+                num_indices: stats.num_indices,
+            }));
+        }
+
+        let num_indexed_rows = description.rows_indexed() as usize;
+        let total_rows = dataset.count_rows(None).await?;
+        let num_unindexed_rows = total_rows.saturating_sub(num_indexed_rows);
+        Ok(Some(IndexStatistics {
+            num_indexed_rows,
+            num_unindexed_rows,
+            index_type,
+            distance_type,
+            num_indices: Some(description.metadata().len() as u32),
+        }))
+    }
+
+    /// Poll until the columns are fully indexed. Will return Error::Timeout if the columns
+    /// are not fully indexed within the timeout.
+    async fn wait_for_index(
+        &self,
+        index_names: &[&str],
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        wait_for_index(self, index_names, timeout).await
+    }
+
+    async fn stats(&self) -> Result<TableStatistics> {
+        let num_rows = self.count_rows(None).await?;
+        let num_indices = self.list_indices().await?.len();
+        let ds = self.dataset.get().await?;
+        // Sizes come from the manifest. Summing per-field `bytes_on_disk` instead
+        // would open every data file to read its column metadata, which costs one
+        // IO per fragment and reports 0 for legacy v1 storage.
+        //
+        // The manifest summary covers only the fragments' base data files, so
+        // overlay files (recorded on each fragment) and index files (recorded in
+        // the manifest's index section) are added separately.
+        let mut total_bytes = ds.manifest().summary().total_files_size as usize;
+        for frag in ds.manifest().fragments.iter() {
+            for overlay in &frag.overlays {
+                if let Some(size) = overlay.data_file.file_size_bytes.get() {
+                    total_bytes += size.get() as usize;
+                }
+            }
+        }
+        for index in ds.load_indices().await?.iter() {
+            total_bytes += index.total_size_bytes().unwrap_or(0) as usize;
+        }
+
+        let frags = ds.get_fragments();
+        let mut sorted_sizes = join_all(
+            frags
+                .iter()
+                .map(|frag| async move { frag.physical_rows().await.unwrap_or(0) }),
+        )
+        .await;
+        sorted_sizes.sort();
+
+        let small_frag_threshold = 100000;
+        let num_fragments = sorted_sizes.len();
+        let num_small_fragments = sorted_sizes
+            .iter()
+            .filter(|&&size| size < small_frag_threshold)
+            .count();
+
+        let p25 = *sorted_sizes.get(num_fragments / 4).unwrap_or(&0);
+        let p50 = *sorted_sizes.get(num_fragments / 2).unwrap_or(&0);
+        let p75 = *sorted_sizes.get(num_fragments * 3 / 4).unwrap_or(&0);
+        let p99 = *sorted_sizes.get(num_fragments * 99 / 100).unwrap_or(&0);
+        let min = sorted_sizes.first().copied().unwrap_or(0);
+        let max = sorted_sizes.last().copied().unwrap_or(0);
+        let mean = sorted_sizes
+            .iter()
+            .copied()
+            .sum::<usize>()
+            .checked_div(num_fragments)
+            .unwrap_or(0);
+
+        let frag_stats = FragmentStatistics {
+            num_fragments,
+            num_small_fragments,
+            lengths: FragmentSummaryStats {
+                min,
+                max,
+                mean,
+                p25,
+                p50,
+                p75,
+                p99,
+            },
+        };
+        let stats = TableStatistics {
+            total_bytes,
+            num_rows,
+            num_indices,
+            fragment_stats: frag_stats,
+        };
+        Ok(stats)
+    }
+
+    async fn create_insert_exec(
+        &self,
+        input: Arc<dyn datafusion_physical_plan::ExecutionPlan>,
+        write_params: WriteParams,
+    ) -> Result<Arc<dyn datafusion_physical_plan::ExecutionPlan>> {
+        let ds = self.dataset.get().await?;
+        let dataset = Arc::new((*ds).clone());
+        Ok(Arc::new(datafusion::insert::InsertExec::new(
+            self.dataset.clone(),
+            dataset,
+            input,
+            write_params,
+        )))
+    }
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct TableStatistics {
+    /// The total size, in bytes, of the table's data files, index files, and
+    /// overlay files
+    ///
+    /// Read from the manifest, so this excludes deletion files and manifests,
+    /// and it excludes any file whose size the manifest does not record
+    /// (tables and indices written before writers persisted file sizes).
+    pub total_bytes: usize,
+
+    /// The number of rows in the table
+    pub num_rows: usize,
+
+    /// The number of indices in the table
+    pub num_indices: usize,
+
+    /// Statistics on table fragments
+    pub fragment_stats: FragmentStatistics,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct FragmentStatistics {
+    /// The number of fragments in the table
+    pub num_fragments: usize,
+
+    /// The number of uncompacted fragments in the table
+    pub num_small_fragments: usize,
+
+    /// Statistics on the number of rows in the table fragments
+    pub lengths: FragmentSummaryStats,
+    // todo: add size statistics
+    // /// Statistics on the number of bytes in the table fragments
+    // sizes: FragmentStats,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct FragmentSummaryStats {
+    pub min: usize,
+    pub max: usize,
+    pub mean: usize,
+    pub p25: usize,
+    pub p50: usize,
+    pub p75: usize,
+    pub p99: usize,
+}
+
+#[cfg(test)]
+#[allow(deprecated)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use arrow_array::{
+        Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
+    };
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::TryStreamExt;
+    use lance::Dataset;
+    use lance::io::{ObjectStoreParams, WrappingObjectStore};
+    use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::connect;
+    use crate::connection::ConnectBuilder;
+    use crate::io::object_store::io_tracking::IoTrackingStore;
+    use crate::query::Select;
+    use crate::query::{ExecutableQuery, QueryBase};
+    use crate::test_utils::connection::new_test_connection;
+
+    #[test]
+    fn test_tokenize_uses_explicit_simple_tokenizer() {
+        let params =
+            crate::index::scalar::FtsIndexBuilder::default().base_tokenizer("simple".to_string());
+        let tokens = crate::tokenize("Running in cafés", &params).unwrap();
+
+        assert_eq!(
+            tokens,
+            vec![
+                FtsToken {
+                    text: "run".to_string(),
+                    position: 0,
+                },
+                FtsToken {
+                    text: "cafe".to_string(),
+                    position: 2,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open() {
+        let tmp_dir = tempdir().unwrap();
+        let dataset_path = tmp_dir.path().join("test.lance");
+
+        let batch = make_test_batches();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        Dataset::write(reader, dataset_path.to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let table = NativeTable::open(dataset_path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(table.name, "test")
+    }
+
+    #[tokio::test]
+    async fn test_open_not_found() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let table = NativeTable::open(uri).await;
+        assert!(matches!(table.unwrap_err(), Error::TableNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_open_not_found_missing_lance_dir() {
+        let tmp_dir = tempdir().unwrap();
+        let dataset_path = tmp_dir.path().join("test.lance");
+
+        let err = NativeTable::open(dataset_path.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::TableNotFound { name, .. } if name == "test"),
+            "got {err:?}"
+        );
+    }
+
+    /// Write a table and then break it, leaving the `<name>.lance` directory in place.
+    ///
+    /// `remove_all` reproduces an interrupted drop + re-create (the directory is left
+    /// empty); otherwise only the manifests are removed, leaving the data files behind.
+    async fn write_then_corrupt_table(dir: &std::path::Path, remove_all: bool) -> String {
+        let dataset_path = dir.join("test.lance");
+        let uri = dataset_path.to_str().unwrap().to_string();
+
+        let batch = make_test_batches();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        Dataset::write(reader, &uri, None).await.unwrap();
+
+        if remove_all {
+            for entry in std::fs::read_dir(&dataset_path).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    std::fs::remove_dir_all(entry.path()).unwrap();
+                } else {
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
+            assert_eq!(std::fs::read_dir(&dataset_path).unwrap().count(), 0);
+        } else {
+            let versions = dataset_path.join("_versions");
+            assert!(versions.is_dir(), "expected manifests under {versions:?}");
+            std::fs::remove_dir_all(&versions).unwrap();
+            assert!(std::fs::read_dir(&dataset_path).unwrap().count() > 0);
+        }
+
+        uri
+    }
+
+    #[tokio::test]
+    async fn test_open_corrupt_empty_dir() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = write_then_corrupt_table(tmp_dir.path(), true).await;
+
+        let err = NativeTable::open(&uri).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::TableCorrupted { name, .. } if name == "test"),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_corrupt_missing_manifest() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = write_then_corrupt_table(tmp_dir.path(), false).await;
+
+        let err = NativeTable::open(&uri).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::TableCorrupted { name, .. } if name == "test"),
+            "got {err:?}"
+        );
+    }
+
+    /// A table listed by `table_names()` must not be reported as missing by
+    /// `open_table()`. See <https://github.com/lancedb/lancedb/issues/3127>.
+    #[tokio::test]
+    async fn test_open_table_corrupt_is_still_listed() {
+        let tmp_dir = tempdir().unwrap();
+        let db = connect(tmp_dir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+
+        write_then_corrupt_table(tmp_dir.path(), true).await;
+
+        assert_eq!(
+            db.table_names().execute().await.unwrap(),
+            vec!["test".to_string()]
+        );
+        let err = db.open_table("test").execute().await.unwrap_err();
+        assert!(
+            matches!(&err, Error::TableCorrupted { name, .. } if name == "test"),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("exists but could not be loaded"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_object_store_path() {
+        use std::path::Path as StdPath;
+        let p = StdPath::new("s3://bucket/path/to/file");
+        let c = p.join("subfile");
+        assert_eq!(c.to_str().unwrap(), "s3://bucket/path/to/file/subfile");
+    }
+
+    #[tokio::test]
+    async fn test_count_rows() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let batch = make_test_batches();
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(batch.clone())],
+            batch.schema(),
+        ));
+        let table = NativeTable::create(
+            uri,
+            "test",
+            vec![],
+            reader,
+            None,
+            None,
+            None,
+            None,
+            HashSet::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(table.count_rows(None).await.unwrap(), 10);
+        assert_eq!(
+            table
+                .count_rows(Some(Filter::Sql("i >= 5".to_string())))
+                .await
+                .unwrap(),
+            5
+        );
+    }
+
+    #[derive(Default, Debug)]
+    struct NoOpCacheWrapper {
+        called: AtomicBool,
+    }
+
+    impl NoOpCacheWrapper {
+        fn called(&self) -> bool {
+            self.called.load(Ordering::Relaxed)
+        }
+    }
+
+    impl WrappingObjectStore for NoOpCacheWrapper {
+        fn wrap(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn object_store::ObjectStore>,
+        ) -> Arc<dyn object_store::ObjectStore> {
+            self.called.store(true, Ordering::Relaxed);
+            original
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_table_options() {
+        let tmp_dir = tempdir().unwrap();
+        let dataset_path = tmp_dir.path().join("test.lance");
+        let uri = dataset_path.to_str().unwrap();
+        let conn = connect(uri).execute().await.unwrap();
+
+        let batches = make_test_batches();
+
+        conn.create_table("my_table", batches)
+            .execute()
+            .await
+            .unwrap();
+
+        let wrapper = Arc::new(NoOpCacheWrapper::default());
+
+        let object_store_params = ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
+            ..Default::default()
+        };
+        let param = ReadParams {
+            store_options: Some(object_store_params),
+            ..Default::default()
+        };
+        assert!(!wrapper.called());
+        conn.open_table("my_table")
+            .lance_read_params(param)
+            .execute()
+            .await
+            .unwrap();
+        assert!(wrapper.called());
+    }
+
+    fn make_test_batches() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(0..10))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_tags() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+        let table = conn
+            .create_table("my_table", some_sample_data())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(table.version().await.unwrap(), 1);
+        table.add(some_sample_data()).execute().await.unwrap();
+        assert_eq!(table.version().await.unwrap(), 2);
+        let mut tags_manager = table.tags().await.unwrap();
+        let tags = tags_manager.list().await.unwrap();
+        assert!(tags.is_empty(), "Tags should be empty initially");
+        let tag1 = "tag1";
+        tags_manager.create(tag1, 1).await.unwrap();
+        assert_eq!(tags_manager.get_version(tag1).await.unwrap(), 1);
+        let tags = tags_manager.list().await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert!(tags.contains_key(tag1));
+        assert_eq!(tags.get(tag1).unwrap().version, 1);
+        tags_manager.create("tag2", 2).await.unwrap();
+        assert_eq!(tags_manager.get_version("tag2").await.unwrap(), 2);
+        let tags = tags_manager.list().await.unwrap();
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains_key(tag1));
+        assert_eq!(tags.get(tag1).unwrap().version, 1);
+        assert!(tags.contains_key("tag2"));
+        assert_eq!(tags.get("tag2").unwrap().version, 2);
+        // Test update and delete
+        table.add(some_sample_data()).execute().await.unwrap();
+        tags_manager.update(tag1, 3).await.unwrap();
+        assert_eq!(tags_manager.get_version(tag1).await.unwrap(), 3);
+        tags_manager.delete("tag2").await.unwrap();
+        let tags = tags_manager.list().await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert!(tags.contains_key(tag1));
+        assert_eq!(tags.get(tag1).unwrap().version, 3);
+        // Test checkout tag
+        table.add(some_sample_data()).execute().await.unwrap();
+        assert_eq!(table.version().await.unwrap(), 4);
+        table.checkout_tag(tag1).await.unwrap();
+        assert_eq!(table.version().await.unwrap(), 3);
+        table.checkout_latest().await.unwrap();
+        assert_eq!(table.version().await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_branches() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+
+        // main: one row at v1
+        let table = conn
+            .create_table("my_table", some_sample_data())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+        assert_eq!(table.current_branch(), None);
+        let main_version = table.version().await.unwrap();
+
+        // branch off main's current version; it starts with main's data
+        let branch = table.create_branch("exp", main_version).await.unwrap();
+        assert_eq!(branch.current_branch().as_deref(), Some("exp"));
+        assert_eq!(branch.count_rows(None).await.unwrap(), 1);
+
+        // writes on the branch are isolated from main
+        branch.add(some_sample_data()).execute().await.unwrap();
+        assert_eq!(branch.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            table.count_rows(None).await.unwrap(),
+            1,
+            "main must be untouched by branch writes"
+        );
+
+        // the branch shows up in the listing
+        let branches = table.list_branches().await.unwrap();
+        assert!(branches.contains_key("exp"));
+
+        // checking out the branch from the main handle sees the branch's latest data
+        let checked_out = table.checkout_branch("exp", None).await.unwrap();
+        assert_eq!(checked_out.current_branch().as_deref(), Some("exp"));
+        assert_eq!(checked_out.count_rows(None).await.unwrap(), 2);
+
+        // open_table(...).branch(...) opens directly onto the branch
+        let opened = conn
+            .open_table("my_table")
+            .branch("exp")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(opened.current_branch().as_deref(), Some("exp"));
+        assert_eq!(opened.count_rows(None).await.unwrap(), 2);
+
+        // delete removes it from the listing
+        table.delete_branch("exp").await.unwrap();
+        let branches = table.list_branches().await.unwrap();
+        assert!(!branches.contains_key("exp"));
+    }
+
+    #[tokio::test]
+    async fn test_branch_version_checkout() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+
+        // main: a single fork-point row (i = 0)
+        let table = conn
+            .create_table("my_table", sample_rows(vec![0]))
+            .execute()
+            .await
+            .unwrap();
+        let fork_point = table.version().await.unwrap();
+
+        // Fork "exp", then advance exp AND main independently past the fork so
+        // they diverge while sharing version numbers.
+        let branch = table.create_branch("exp", fork_point).await.unwrap();
+        let exp_fork = branch.version().await.unwrap(); // exp's shallow-clone version
+        branch.add(sample_rows(vec![1])).execute().await.unwrap(); // exp: {0, 1}
+        let exp_v2 = branch.version().await.unwrap();
+        branch.add(sample_rows(vec![2])).execute().await.unwrap(); // exp HEAD: {0, 1, 2}
+
+        // main's own commit reaches the SAME version number with different data
+        table
+            .add(sample_rows(vec![100, 101, 102]))
+            .execute()
+            .await
+            .unwrap(); // main HEAD: {0, 100, 101, 102}
+        let main_v2 = table.version().await.unwrap();
+        assert_eq!(
+            exp_v2, main_v2,
+            "branch and main must share the version number for this test to mean anything"
+        );
+
+        // Open exp at the shared version. The data must be exp's, not main's:
+        // count alone cannot prove this (main@v2 differs), so assert provenance
+        // by content.
+        let pinned = conn
+            .open_table("my_table")
+            .branch("exp")
+            .version(exp_v2)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(pinned.current_branch().as_deref(), Some("exp"));
+        // isolated from exp's HEAD (3 rows) and from main@v2 (4 rows)
+        assert_eq!(pinned.count_rows(None).await.unwrap(), 2);
+        // exp's post-fork row is visible; main's divergent rows are not
+        assert_eq!(
+            pinned.count_rows(Some("i = 1".to_string())).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            pinned
+                .count_rows(Some("i = 100".to_string()))
+                .await
+                .unwrap(),
+            0
+        );
+
+        // the same coordinate is reachable directly via checkout_branch(name, version)
+        let pinned_direct = table.checkout_branch("exp", Some(exp_v2)).await.unwrap();
+        assert_eq!(pinned_direct.current_branch().as_deref(), Some("exp"));
+        assert_eq!(pinned_direct.count_rows(None).await.unwrap(), 2);
+
+        // the HEADs are unaffected
+        let head = conn
+            .open_table("my_table")
+            .branch("exp")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(head.count_rows(None).await.unwrap(), 3);
+        assert_eq!(table.count_rows(None).await.unwrap(), 4);
+
+        // a pinned version is a detached head: writes are rejected
+        assert!(pinned.add(sample_rows(vec![9])).execute().await.is_err());
+
+        // version-only (no branch) time-travels main itself: its fork-point
+        // version holds only main's first row, and the shared version number
+        // resolves to main's data, not the branch's ("opens main at the version")
+        let old_main = conn
+            .open_table("my_table")
+            .version(fork_point)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(old_main.current_branch(), None);
+        assert_eq!(old_main.count_rows(None).await.unwrap(), 1);
+        let shared_on_main = conn
+            .open_table("my_table")
+            .version(exp_v2)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(shared_on_main.current_branch(), None);
+        assert_eq!(shared_on_main.count_rows(None).await.unwrap(), 4);
+
+        // a nonexistent version is rejected
+        assert!(
+            conn.open_table("my_table")
+                .version(9999)
+                .execute()
+                .await
+                .is_err()
+        );
+
+        // a nonexistent version on a branch is rejected too: this resolves on
+        // the branch's path, a distinct miss from the main lookup above
+        assert!(
+            conn.open_table("my_table")
+                .branch("exp")
+                .version(9999)
+                .execute()
+                .await
+                .is_err()
+        );
+
+        // opening the branch at its fork point (the shallow-clone manifest)
+        // shows just the cloned state: main's fork-point row
+        let exp_at_fork = conn
+            .open_table("my_table")
+            .branch("exp")
+            .version(exp_fork)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(exp_at_fork.current_branch().as_deref(), Some("exp"));
+        assert_eq!(exp_at_fork.count_rows(None).await.unwrap(), 1);
+
+        // checkout_latest re-attaches the pinned handle to the BRANCH's HEAD
+        // (writable again), not main's HEAD, and not staying pinned
+        pinned.checkout_latest().await.unwrap();
+        assert_eq!(pinned.current_branch().as_deref(), Some("exp"));
+        assert_eq!(pinned.count_rows(None).await.unwrap(), 3); // exp HEAD, not main's 4
+        pinned.add(sample_rows(vec![3])).execute().await.unwrap();
+        assert_eq!(pinned.count_rows(None).await.unwrap(), 4); // writable again
+    }
+
+    #[tokio::test]
+    async fn test_branch_version_two_branches() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+
+        let table = conn
+            .create_table("my_table", sample_rows(vec![0]))
+            .execute()
+            .await
+            .unwrap();
+        let fork_point = table.version().await.unwrap();
+
+        // two branches off the same point, each advanced once so they reach the
+        // SAME version number with divergent data
+        let exp1 = table.create_branch("exp1", fork_point).await.unwrap();
+        let exp2 = table.create_branch("exp2", fork_point).await.unwrap();
+        exp1.add(sample_rows(vec![10])).execute().await.unwrap();
+        exp2.add(sample_rows(vec![20])).execute().await.unwrap();
+        let v1 = exp1.version().await.unwrap();
+        let v2 = exp2.version().await.unwrap();
+        assert_eq!(v1, v2, "both branches must reach the same version number");
+
+        // that shared version number resolves to each branch's own data
+        let at1 = table.checkout_branch("exp1", Some(v1)).await.unwrap();
+        assert_eq!(at1.count_rows(Some("i = 10".to_string())).await.unwrap(), 1);
+        assert_eq!(at1.count_rows(Some("i = 20".to_string())).await.unwrap(), 0);
+        let at2 = table.checkout_branch("exp2", Some(v2)).await.unwrap();
+        assert_eq!(at2.count_rows(Some("i = 20".to_string())).await.unwrap(), 1);
+        assert_eq!(at2.count_rows(Some("i = 10".to_string())).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_branch_name_validation() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let conn = ConnectBuilder::new(uri).execute().await.unwrap();
+        let table = conn
+            .create_table("my_table", some_sample_data())
+            .execute()
+            .await
+            .unwrap();
+
+        // every entry point rejects an empty name instead of passing it down
+        assert!(matches!(
+            table.create_branch("", 1u64).await,
+            Err(Error::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            table.checkout_branch("", None).await,
+            Err(Error::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            table.delete_branch("").await,
+            Err(Error::InvalidInput { .. })
+        ));
+        // an empty source branch is rejected too
+        assert!(matches!(
+            table
+                .create_branch(
+                    "ok",
+                    lance::dataset::refs::Ref::Version(Some(String::new()), None)
+                )
+                .await,
+            Err(Error::InvalidInput { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_branch_handle_tracks_concurrent_writes() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        // interval = 0 so every read checks storage for new commits
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+        let table = conn
+            .create_table("my_table", some_sample_data())
+            .execute()
+            .await
+            .unwrap();
+        let v1 = table.version().await.unwrap();
+
+        // two independent handles on the same branch
+        let writer = table.create_branch("exp", v1).await.unwrap();
+        let reader = conn
+            .open_table("my_table")
+            .branch("exp")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(reader.count_rows(None).await.unwrap(), 1);
+
+        // a concurrent write on the branch is visible to the other handle, which
+        // tracks the branch's HEAD (not main's)
+        writer.add(some_sample_data()).execute().await.unwrap();
+        assert_eq!(reader.count_rows(None).await.unwrap(), 2);
+        // main is untouched
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_branch_handle_without_consistency_interval_is_pinned() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        // default interval (None): handles do not auto-refresh
+        let conn = ConnectBuilder::new(uri).execute().await.unwrap();
+        let table = conn
+            .create_table("my_table", some_sample_data())
+            .execute()
+            .await
+            .unwrap();
+        let v1 = table.version().await.unwrap();
+
+        let writer = table.create_branch("exp", v1).await.unwrap();
+        let reader = conn
+            .open_table("my_table")
+            .branch("exp")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(reader.count_rows(None).await.unwrap(), 1);
+
+        // without a consistency interval the reader stays on the version it
+        // opened, exactly like a main-branch handle...
+        writer.add(some_sample_data()).execute().await.unwrap();
+        assert_eq!(reader.count_rows(None).await.unwrap(), 1);
+
+        // ...until it explicitly refreshes
+        reader.checkout_latest().await.unwrap();
+        assert_eq!(reader.count_rows(None).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_select() {
+        let tc = new_test_connection().await.unwrap();
+        let db = tc.connection;
+
+        let table = db
+            .create_table("test", some_sample_data())
+            .execute()
+            .await
+            .unwrap();
+
+        let query = table.query().select(Select::dynamic(&[("i_alias", "i")]));
+
+        let result = query.execute().await;
+        let batches = result
+            .expect("should have result")
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        for batch in batches {
+            assert!(batch.column_by_name("i_alias").is_some());
+        }
+    }
+
+    fn some_sample_data() -> Box<dyn arrow_array::RecordBatchReader + Send> {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        let schema = batch.schema().clone();
+        let batch = Ok(batch);
+
+        Box::new(RecordBatchIterator::new(vec![batch], schema))
+    }
+
+    /// A single-batch reader holding the given `i` (Int32) values. Lets a test
+    /// write distinguishable rows so it can assert data provenance, not row count.
+    fn sample_rows(values: Vec<i32>) -> Box<dyn arrow_array::RecordBatchReader + Send> {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(values))],
+        )
+        .unwrap();
+        let schema = batch.schema().clone();
+
+        Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))
+    }
+
+    #[tokio::test]
+    async fn test_read_consistency_interval() {
+        use crate::utils::background_cache::clock;
+
+        let intervals = vec![
+            None,
+            Some(0),
+            Some(100), // 100 ms
+        ];
+
+        for interval in intervals {
+            let data = some_sample_data();
+
+            let tmp_dir = tempdir().unwrap();
+            let uri = tmp_dir.path().to_str().unwrap();
+
+            let conn1 = ConnectBuilder::new(uri).execute().await.unwrap();
+            let table1 = conn1
+                .create_empty_table("my_table", RecordBatchReader::schema(&data))
+                .execute()
+                .await
+                .unwrap();
+
+            let mut conn2 = ConnectBuilder::new(uri);
+            if let Some(interval) = interval {
+                conn2 = conn2.read_consistency_interval(std::time::Duration::from_millis(interval));
+            }
+            let conn2 = conn2.execute().await.unwrap();
+            let table2 = conn2.open_table("my_table").execute().await.unwrap();
+
+            // Freeze the consistency clock now that `table2` has seeded its cache, so the
+            // interval only elapses when this test advances it. Otherwise the write and
+            // count_rows calls below race the real 100ms interval, which a loaded CI
+            // runner loses. Must come after open_table: creating the cache clears the mock.
+            clock::pin();
+
+            assert_eq!(table1.count_rows(None).await.unwrap(), 0);
+            assert_eq!(table2.count_rows(None).await.unwrap(), 0);
+
+            table1.add(data).execute().await.unwrap();
+            assert_eq!(table1.count_rows(None).await.unwrap(), 1);
+
+            match interval {
+                None => {
+                    assert_eq!(table2.count_rows(None).await.unwrap(), 0);
+                    table2.checkout_latest().await.unwrap();
+                    assert_eq!(table2.count_rows(None).await.unwrap(), 1);
+                }
+                Some(0) => {
+                    assert_eq!(table2.count_rows(None).await.unwrap(), 1);
+                }
+                Some(100) => {
+                    assert_eq!(table2.count_rows(None).await.unwrap(), 0);
+                    clock::advance_by(Duration::from_millis(100));
+                    assert_eq!(table2.count_rows(None).await.unwrap(), 1);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_time_travel_write() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+        let table = conn
+            .create_table("my_table", some_sample_data())
+            .execute()
+            .await
+            .unwrap();
+        let version = table.version().await.unwrap();
+        table.add(some_sample_data()).execute().await.unwrap();
+        table.checkout(version).await.unwrap();
+        assert!(table.add(some_sample_data()).execute().await.is_err())
+    }
+
+    #[tokio::test]
+    async fn test_update_dataset_config() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+
+        let table = conn
+            .create_table("my_table", some_sample_data())
+            .execute()
+            .await
+            .unwrap();
+        let native_tbl = table.as_native().unwrap();
+
+        let manifest = native_tbl.manifest().await.unwrap();
+        let base_config_len = manifest.config.len();
+
+        native_tbl
+            .update_config(vec![("test_key1".to_string(), "test_val1".to_string())])
+            .await
+            .unwrap();
+
+        let manifest = native_tbl.manifest().await.unwrap();
+        assert_eq!(manifest.config.len(), 1 + base_config_len);
+        assert_eq!(
+            manifest.config.get("test_key1"),
+            Some(&"test_val1".to_string())
+        );
+
+        native_tbl
+            .update_config(vec![("test_key2".to_string(), "test_val2".to_string())])
+            .await
+            .unwrap();
+        let manifest = native_tbl.manifest().await.unwrap();
+        assert_eq!(manifest.config.len(), 2 + base_config_len);
+        assert_eq!(
+            manifest.config.get("test_key1"),
+            Some(&"test_val1".to_string())
+        );
+        assert_eq!(
+            manifest.config.get("test_key2"),
+            Some(&"test_val2".to_string())
+        );
+
+        native_tbl
+            .update_config(vec![(
+                "test_key2".to_string(),
+                "test_val2_update".to_string(),
+            )])
+            .await
+            .unwrap();
+        let manifest = native_tbl.manifest().await.unwrap();
+        assert_eq!(manifest.config.len(), 2 + base_config_len);
+        assert_eq!(
+            manifest.config.get("test_key1"),
+            Some(&"test_val1".to_string())
+        );
+        assert_eq!(
+            manifest.config.get("test_key2"),
+            Some(&"test_val2_update".to_string())
+        );
+
+        native_tbl.delete_config_keys(&["test_key1"]).await.unwrap();
+        let manifest = native_tbl.manifest().await.unwrap();
+        assert_eq!(manifest.config.len(), 1 + base_config_len);
+        assert_eq!(
+            manifest.config.get("test_key2"),
+            Some(&"test_val2_update".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_schema_metadata_config() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+        let table = conn
+            .create_table("my_table", some_sample_data())
+            .execute()
+            .await
+            .unwrap();
+
+        let native_tbl = table.as_native().unwrap();
+        let schema = native_tbl.schema().await.unwrap();
+        let metadata = schema.metadata();
+        assert_eq!(metadata.len(), 0);
+
+        native_tbl
+            .replace_schema_metadata(vec![("test_key1".to_string(), "test_val1".to_string())])
+            .await
+            .unwrap();
+
+        let schema = native_tbl.schema().await.unwrap();
+        let metadata = schema.metadata();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata.get("test_key1"), Some(&"test_val1".to_string()));
+
+        native_tbl
+            .replace_schema_metadata(vec![
+                ("test_key1".to_string(), "test_val1_update".to_string()),
+                ("test_key2".to_string(), "test_val2".to_string()),
+            ])
+            .await
+            .unwrap();
+        let schema = native_tbl.schema().await.unwrap();
+        let metadata = schema.metadata();
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(
+            metadata.get("test_key1"),
+            Some(&"test_val1_update".to_string())
+        );
+        assert_eq!(metadata.get("test_key2"), Some(&"test_val2".to_string()));
+
+        native_tbl
+            .replace_schema_metadata(vec![(
+                "test_key2".to_string(),
+                "test_val2_update".to_string(),
+            )])
+            .await
+            .unwrap();
+        let schema = native_tbl.schema().await.unwrap();
+        let metadata = schema.metadata();
+        assert_eq!(
+            metadata.get("test_key2"),
+            Some(&"test_val2_update".to_string())
+        );
+    }
+
+    #[tokio::test]
+    pub async fn test_field_metadata_update() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+        let table = conn
+            .create_table("my_table", some_sample_data())
+            .execute()
+            .await
+            .unwrap();
+
+        let native_tbl = table.as_native().unwrap();
+        let schema = native_tbl.manifest().await.unwrap().schema;
+
+        let field = schema.field("i").unwrap();
+        assert_eq!(field.metadata.len(), 0);
+
+        native_tbl
+            .replace_schema_metadata(vec![(
+                "test_key2".to_string(),
+                "test_val2_update".to_string(),
+            )])
+            .await
+            .unwrap();
+
+        let schema = native_tbl.schema().await.unwrap();
+        let metadata = schema.metadata();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(
+            metadata.get("test_key2"),
+            Some(&"test_val2_update".to_string())
+        );
+
+        native_tbl
+            .update_field_metadata(&[
+                FieldMetadataUpdate::new("i").set("test_field_key1", "test_field_val1")
+            ])
+            .await
+            .unwrap();
+
+        let schema = native_tbl.manifest().await.unwrap().schema;
+        let field = schema.field("i").unwrap();
+        assert_eq!(field.metadata.len(), 1);
+        assert_eq!(
+            field.metadata.get("test_field_key1"),
+            Some(&"test_field_val1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_unenforced_primary_key() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(arrow_array::Float64Array::from(vec![1.0, 2.0, 3.0])),
+            ],
+        )
+        .unwrap();
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()));
+
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+        let table = conn.create_table("t", reader).execute().await.unwrap();
+
+        // Reject empty input.
+        let err = table
+            .set_unenforced_primary_key(Vec::<&str>::new())
+            .await
+            .expect_err("empty input should be rejected");
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+
+        // Reject compound (multi-column) input.
+        let err = table
+            .set_unenforced_primary_key(["id", "name"])
+            .await
+            .expect_err("compound primary key should be rejected");
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+
+        // Reject unknown column.
+        let err = table
+            .set_unenforced_primary_key(["nonexistent"])
+            .await
+            .expect_err("nonexistent column should be rejected");
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+
+        // Reject unsupported dtype (Float64).
+        let err = table
+            .set_unenforced_primary_key(["score"])
+            .await
+            .expect_err("Float64 should be rejected");
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+
+        // None of the rejected calls set a primary key.
+        let lance_schema = table.as_native().unwrap().manifest().await.unwrap().schema;
+        assert!(lance_schema.unenforced_primary_key().is_empty());
+
+        // Happy path: set the primary key to "id".
+        table.set_unenforced_primary_key(["id"]).await.unwrap();
+        let lance_schema = table.as_native().unwrap().manifest().await.unwrap().schema;
+        let pk = lance_schema.unenforced_primary_key();
+        assert_eq!(pk.len(), 1);
+        assert_eq!(pk[0].name, "id");
+        // Position metadata is 1-indexed.
+        assert_eq!(
+            pk[0].metadata.get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION),
+            Some(&"1".to_string())
+        );
+
+        // The primary key is immutable: re-setting it is rejected, whether to
+        // the same column or a different one.
+        let err = table
+            .set_unenforced_primary_key(["id"])
+            .await
+            .expect_err("re-setting the same primary key should be rejected");
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let err = table
+            .set_unenforced_primary_key(["name"])
+            .await
+            .expect_err("changing the primary key should be rejected");
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+
+        // The primary key is unchanged after the rejected calls.
+        let lance_schema = table.as_native().unwrap().manifest().await.unwrap().schema;
+        let pk = lance_schema.unenforced_primary_key();
+        assert_eq!(pk.len(), 1);
+        assert_eq!(pk[0].name, "id");
+    }
+
+    #[tokio::test]
+    async fn test_set_unenforced_primary_key_concurrent() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()));
+
+        // A long read-consistency interval keeps each handle pinned to the
+        // version it opened, so the second handle commits against a stale
+        // base — the same situation as two processes racing.
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(3600))
+            .execute()
+            .await
+            .unwrap();
+        conn.create_table("t", reader).execute().await.unwrap();
+
+        let table_a = conn.open_table("t").execute().await.unwrap();
+        let table_b = conn.open_table("t").execute().await.unwrap();
+
+        // Handle A sets the primary key first.
+        table_a.set_unenforced_primary_key(["id"]).await.unwrap();
+
+        // Handle B committed against a stale base that had no primary key, so
+        // its own up-front check did not see A's key. The commit itself must
+        // still fail rather than silently overriding A's primary key. (The
+        // cross-process race on a *different* column is caught by the Lance
+        // commit layer.)
+        let err = table_b
+            .set_unenforced_primary_key(["id"])
+            .await
+            .expect_err("concurrent primary key commit on a stale base should fail");
+        assert!(
+            !matches!(err, Error::InvalidInput { .. }),
+            "expected a commit-time conflict, not an up-front input error: {:?}",
+            err
+        );
+
+        // The committed primary key is exactly what A set — no corruption.
+        let fresh = conn.open_table("t").execute().await.unwrap();
+        let lance_schema = fresh.as_native().unwrap().manifest().await.unwrap().schema;
+        let pk = lance_schema.unenforced_primary_key();
+        assert_eq!(pk.len(), 1);
+        assert_eq!(pk[0].name, "id");
+    }
+
+    #[tokio::test]
+    async fn test_set_lsm_write_spec() {
+        use arrow_array::StringArray;
+        use lance::dataset::mem_wal::DatasetMemWalExt;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()));
+
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+        let table = conn.create_table("t", reader).execute().await.unwrap();
+
+        // Reject num_buckets out of range.
+        for bad in [0u32, 1025] {
+            let err = table
+                .set_lsm_write_spec(LsmWriteSpec::bucket("id", bad))
+                .await
+                .expect_err("should reject");
+            assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        }
+
+        // Happy path: install spec; verify MemWAL details record it.
+        table
+            .set_lsm_write_spec(LsmWriteSpec::bucket("id", 4))
+            .await
+            .unwrap();
+
+        let native_tbl = table.as_native().unwrap();
+        let dataset = native_tbl.dataset.get().await.unwrap();
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("MemWAL index should be initialized");
+        assert_eq!(details.num_shards, 4);
+        assert_eq!(details.sharding_specs.len(), 1);
+        let installed = &details.sharding_specs[0];
+        assert_eq!(installed.fields.len(), 1);
+        let f = &installed.fields[0];
+        assert_eq!(f.transform.as_deref(), Some("bucket"));
+        assert_eq!(
+            f.parameters.get("num_buckets").map(String::as_str),
+            Some("4")
+        );
+        // Bucket parameters must hold only `num_buckets`.
+        assert_eq!(f.parameters.len(), 1);
+
+        // Mutation rejected.
+        let err = table
+            .set_lsm_write_spec(LsmWriteSpec::bucket("id", 8))
+            .await
+            .expect_err("mutation should be rejected");
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+    }
+
+    #[tokio::test]
+    async fn test_set_lsm_write_spec_unsharded() {
+        use lance::dataset::mem_wal::DatasetMemWalExt;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()));
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+        let table = conn.create_table("t", reader).execute().await.unwrap();
+
+        table
+            .set_lsm_write_spec(LsmWriteSpec::unsharded())
+            .await
+            .unwrap();
+
+        let dataset = table.as_native().unwrap().dataset.get().await.unwrap();
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("MemWAL index should be initialized");
+        assert_eq!(details.num_shards, 1);
+        assert_eq!(details.sharding_specs.len(), 1);
+        let f = &details.sharding_specs[0].fields[0];
+        assert_eq!(f.transform.as_deref(), Some("unsharded"));
+        assert!(f.source_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_set_lsm_write_spec_identity() {
+        use lance::dataset::mem_wal::DatasetMemWalExt;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()));
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+        let table = conn.create_table("t", reader).execute().await.unwrap();
+
+        table
+            .set_lsm_write_spec(
+                LsmWriteSpec::identity("region")
+                    .with_writer_config_defaults([("durable_write", "false")]),
+            )
+            .await
+            .unwrap();
+
+        let dataset = table.as_native().unwrap().dataset.get().await.unwrap();
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("MemWAL index should be initialized");
+        // Identity sharding records an open-ended shard count.
+        assert_eq!(details.num_shards, 0);
+        assert_eq!(details.sharding_specs.len(), 1);
+        let f = &details.sharding_specs[0].fields[0];
+        assert_eq!(f.transform.as_deref(), Some("identity"));
+        // Writer config defaults round-trip into the MemWAL index.
+        assert_eq!(
+            details
+                .writer_config_defaults
+                .get("durable_write")
+                .map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unset_lsm_write_spec() {
+        use lance::dataset::mem_wal::DatasetMemWalExt;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()));
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+        let table = conn.create_table("t", reader).execute().await.unwrap();
+
+        // unset errors when no spec is set.
+        table.unset_lsm_write_spec().await.unwrap_err();
+
+        // Install a spec, then unset it.
+        table
+            .set_lsm_write_spec(LsmWriteSpec::bucket("id", 4))
+            .await
+            .unwrap();
+        {
+            let dataset = table.as_native().unwrap().dataset.get().await.unwrap();
+            assert!(dataset.mem_wal_index_details().await.unwrap().is_some());
+        }
+
+        table.unset_lsm_write_spec().await.unwrap();
+        {
+            let dataset = table.as_native().unwrap().dataset.get().await.unwrap();
+            assert!(dataset.mem_wal_index_details().await.unwrap().is_none());
+        }
+
+        // A second unset errors; a fresh spec can still be installed afterwards.
+        table.unset_lsm_write_spec().await.unwrap_err();
+        table
+            .set_lsm_write_spec(LsmWriteSpec::bucket("id", 8))
+            .await
+            .unwrap();
+        {
+            let dataset = table.as_native().unwrap().dataset.get().await.unwrap();
+            assert!(dataset.mem_wal_index_details().await.unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_lsm_write_spec() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()));
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+        let table = conn.create_table("t", reader).execute().await.unwrap();
+
+        // No spec installed yet.
+        assert_eq!(table.get_lsm_write_spec().await.unwrap(), None);
+
+        // A real scalar index is needed to name it as a maintained index.
+        table
+            .create_index(&["id"], Index::Auto)
+            .execute()
+            .await
+            .unwrap();
+        let idx_name = table.list_indices().await.unwrap()[0].name.clone();
+
+        // Bucket spec round-trips exactly, including the routing column (recovered
+        // from its field id), maintained indexes, and writer config defaults.
+        let spec = LsmWriteSpec::bucket("id", 4)
+            .with_maintained_indexes([idx_name])
+            .with_writer_config_defaults([("durable_write", "false")]);
+        table.set_lsm_write_spec(spec.clone()).await.unwrap();
+        assert_eq!(table.get_lsm_write_spec().await.unwrap(), Some(spec));
+
+        // After unset, no spec is reported.
+        table.unset_lsm_write_spec().await.unwrap();
+        assert_eq!(table.get_lsm_write_spec().await.unwrap(), None);
+
+        // Identity sharding round-trips (column recovered from the schema).
+        let spec = LsmWriteSpec::identity("region");
+        table.set_lsm_write_spec(spec.clone()).await.unwrap();
+        assert_eq!(table.get_lsm_write_spec().await.unwrap(), Some(spec));
+        table.unset_lsm_write_spec().await.unwrap();
+
+        // Unsharded round-trips (no routing column).
+        let spec = LsmWriteSpec::unsharded();
+        table.set_lsm_write_spec(spec.clone()).await.unwrap();
+        assert_eq!(table.get_lsm_write_spec().await.unwrap(), Some(spec));
+    }
+
+    #[tokio::test]
+    pub async fn test_stats() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri).execute().await.unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("foo", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(Int32Array::from_iter_values(0..100)),
+            ],
+        )
+        .unwrap();
+
+        let table = conn
+            .create_table("test_stats", batch.clone())
+            .execute()
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..15)),
+                    Arc::new(Int32Array::from_iter_values(0..15)),
+                ],
+            )
+            .unwrap();
+            table.add(batch.clone()).execute().await.unwrap();
+        }
+
+        let empty_table = conn
+            .create_table("test_stats_empty", RecordBatch::new_empty(batch.schema()))
+            .execute()
+            .await
+            .unwrap();
+
+        let res = table.stats().await.unwrap();
+        println!("{:#?}", res);
+        // `total_bytes` is the full on-disk size of the 11 data files (this table
+        // has no index or overlay files), so it is well above the 2000 bytes of
+        // column data these 250 int32 pairs hold: each file carries its own footer
+        // and metadata.
+        assert_eq!(
+            res,
+            TableStatistics {
+                num_rows: 250,
+                num_indices: 0,
+                total_bytes: 8925,
+                fragment_stats: FragmentStatistics {
+                    num_fragments: 11,
+                    num_small_fragments: 11,
+                    lengths: FragmentSummaryStats {
+                        min: 15,
+                        max: 100,
+                        mean: 22,
+                        p25: 15,
+                        p50: 15,
+                        p75: 15,
+                        p99: 100,
+                    },
+                },
+            }
+        );
+        let res = empty_table.stats().await.unwrap();
+        println!("{:#?}", res);
+        assert_eq!(
+            res,
+            TableStatistics {
+                num_rows: 0,
+                num_indices: 0,
+                total_bytes: 0,
+                fragment_stats: FragmentStatistics {
+                    num_fragments: 0,
+                    num_small_fragments: 0,
+                    lengths: FragmentSummaryStats {
+                        min: 0,
+                        max: 0,
+                        mean: 0,
+                        p25: 0,
+                        p50: 0,
+                        p75: 0,
+                        p99: 0,
+                    },
+                },
+            }
+        )
+    }
+
+    /// `total_bytes` counts more than the base data files: index files and
+    /// overlay files recorded in the manifest are included too.
+    #[tokio::test]
+    pub async fn test_stats_includes_index_and_overlay_files() {
+        use lance::dataset::WriteDestination;
+        use lance::dataset::transaction::{DataOverlayGroup, Operation};
+        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+        use lance_file::writer::{FileWriter, FileWriterOptions};
+        use lance_io::utils::CachedFileSize;
+        use lance_table::format::DataFile;
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let conn = ConnectBuilder::new(uri)
+            .read_consistency_interval(Duration::from_secs(0))
+            .execute()
+            .await
+            .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("foo", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(Int32Array::from_iter_values(0..100)),
+            ],
+        )
+        .unwrap();
+        let table = conn
+            .create_table("test_stats_extra_files", batch)
+            .execute()
+            .await
+            .unwrap();
+
+        let data_only = table.stats().await.unwrap().total_bytes;
+        assert!(data_only > 0);
+
+        // A scalar index adds index files whose sizes are recorded in the
+        // manifest's index section.
+        table
+            .create_index(&["id"], Index::Auto)
+            .execute()
+            .await
+            .unwrap();
+        let with_index = table.stats().await.unwrap().total_bytes;
+        let dataset = {
+            let native = table.as_native().unwrap();
+            (*native.dataset.get().await.unwrap()).clone()
+        };
+        let index_bytes: usize = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|idx| idx.total_size_bytes().unwrap_or(0) as usize)
+            .sum();
+        assert!(index_bytes > 0);
+        assert_eq!(with_index, data_only + index_bytes);
+
+        // Commit an overlay file supplying new `foo` values for the first three
+        // rows of fragment 0. There is no high-level API that writes overlays
+        // yet, so write the overlay's data file and commit the `DataOverlay`
+        // operation by hand.
+        let read_version = dataset.version().version;
+        let fragment_id = dataset.get_fragments()[0].id() as u64;
+        let foo_field_id = dataset.schema().field("foo").unwrap().id;
+        let overlay_schema = dataset.schema().project_by_ids(&[foo_field_id], true);
+        let file_version = ConcreteFileVersion::from(LanceFileVersion::Stable);
+
+        let filename = "overlay.lance".to_string();
+        let store = dataset.object_store(None).await.unwrap();
+        let path = dataset.data_dir().child(filename.clone());
+        let obj_writer = store.create(&path).await.unwrap();
+        let mut writer = FileWriter::try_new(
+            obj_writer,
+            overlay_schema,
+            FileWriterOptions {
+                format_version: Some(file_version.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer
+            .write_column(0, Arc::new(Int32Array::from(vec![1000, 1001, 1002])) as _)
+            .await
+            .unwrap();
+        let summary = writer.finish().await.unwrap();
+        let overlay_bytes = summary.size_bytes as usize;
+        assert!(overlay_bytes > 0);
+
+        let mut data_file = DataFile::new_unstarted(filename, file_version);
+        data_file.fields = writer
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(field_id, _)| *field_id as i32)
+            .collect::<Vec<_>>()
+            .into();
+        data_file.column_indices = writer
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(_, column_index)| *column_index as i32)
+            .collect::<Vec<_>>()
+            .into();
+        data_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+
+        let overlay = DataOverlayFile {
+            data_file,
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..3)),
+            committed_version: 0,
+        };
+        Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataOverlay {
+                groups: vec![DataOverlayGroup {
+                    fragment_id,
+                    overlays: vec![overlay],
+                }],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        table.checkout_latest().await.unwrap();
+        let with_overlay = table.stats().await.unwrap().total_bytes;
+        assert_eq!(with_overlay, with_index + overlay_bytes);
+    }
+
+    /// `stats()` must stay manifest-only. Summing per-field `bytes_on_disk`
+    /// instead opens every data file, so cost would grow with fragment count.
+    #[tokio::test]
+    pub async fn test_stats_does_not_read_data_files() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri).execute().await.unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+
+        conn.create_table("test_stats_io", batch.clone())
+            .execute()
+            .await
+            .unwrap();
+        let table = conn.open_table("test_stats_io").execute().await.unwrap();
+        const NUM_APPENDS: usize = 20;
+        for _ in 0..NUM_APPENDS {
+            table.add(batch.clone()).execute().await.unwrap();
+        }
+
+        // Reopen through a tracking store so the counters cover `stats()` alone and
+        // not the writes above.
+        let (wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let table = conn
+            .open_table("test_stats_io")
+            .lance_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(wrapper),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        io_stats.lock().unwrap().read_iops = 0;
+
+        let stats = table.stats().await.unwrap();
+        let read_iops = io_stats.lock().unwrap().read_iops;
+
+        assert_eq!(stats.fragment_stats.num_fragments, NUM_APPENDS + 1);
+        assert!(stats.total_bytes > 0);
+        // Reading the fragments' data files would take at least one IOP each.
+        assert!(
+            read_iops < stats.fragment_stats.num_fragments as u64,
+            "stats() issued {} read IOPs across {} fragments",
+            read_iops,
+            stats.fragment_stats.num_fragments
+        );
+    }
+}

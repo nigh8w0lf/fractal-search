@@ -1,0 +1,806 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The LanceDB Authors
+
+pub(crate) mod background_cache;
+
+use std::sync::Arc;
+
+use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion_common::{DataFusionError, Result as DataFusionResult};
+use datafusion_execution::RecordBatchStream;
+use futures::{FutureExt, Stream};
+use lance::arrow::json::JsonDataType;
+use lance::dataset::{ReadParams, WriteParams};
+use lance::index::vector::utils::infer_vector_dim;
+use lance::io::{ObjectStoreParams, WrappingObjectStore};
+use std::pin::Pin;
+
+use crate::error::{Error, Result};
+use datafusion_physical_plan::SendableRecordBatchStream;
+
+static TABLE_NAME_REGEX: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^[a-zA-Z0-9_\-\.]+$").unwrap());
+static NAMESPACE_NAME_REGEX: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^[a-zA-Z0-9_\-\.]+$").unwrap());
+
+pub trait PatchStoreParam {
+    fn patch_with_store_wrapper(
+        self,
+        wrapper: Arc<dyn WrappingObjectStore>,
+    ) -> Result<Option<ObjectStoreParams>>;
+}
+
+impl PatchStoreParam for Option<ObjectStoreParams> {
+    fn patch_with_store_wrapper(
+        self,
+        wrapper: Arc<dyn WrappingObjectStore>,
+    ) -> Result<Option<ObjectStoreParams>> {
+        let mut params = self.unwrap_or_default();
+        if params.object_store_wrapper.is_some() {
+            return Err(Error::Other {
+                message: "can not patch param because object store is already set".into(),
+                source: None,
+            });
+        }
+        params.object_store_wrapper = Some(wrapper);
+
+        Ok(Some(params))
+    }
+}
+
+pub trait PatchWriteParam {
+    fn patch_with_store_wrapper(self, wrapper: Arc<dyn WrappingObjectStore>)
+    -> Result<WriteParams>;
+}
+
+impl PatchWriteParam for WriteParams {
+    fn patch_with_store_wrapper(
+        mut self,
+        wrapper: Arc<dyn WrappingObjectStore>,
+    ) -> Result<WriteParams> {
+        self.store_params = self.store_params.patch_with_store_wrapper(wrapper)?;
+        Ok(self)
+    }
+}
+
+// NOTE: we have some API inconsistency here.
+// WriteParam is found in the form of Option<WriteParam> and ReadParam is found in the form of ReadParam
+
+pub trait PatchReadParam {
+    fn patch_with_store_wrapper(self, wrapper: Arc<dyn WrappingObjectStore>) -> Result<ReadParams>;
+}
+
+impl PatchReadParam for ReadParams {
+    fn patch_with_store_wrapper(
+        mut self,
+        wrapper: Arc<dyn WrappingObjectStore>,
+    ) -> Result<ReadParams> {
+        self.store_options = self.store_options.patch_with_store_wrapper(wrapper)?;
+        Ok(self)
+    }
+}
+
+/// Validate table name.
+pub fn validate_table_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidTableName {
+            name: name.to_string(),
+            reason: "Table names cannot be empty strings".to_string(),
+        });
+    }
+    if !TABLE_NAME_REGEX.is_match(name) {
+        return Err(Error::InvalidTableName {
+            name: name.to_string(),
+            reason:
+                "Table names can only contain alphanumeric characters, underscores, hyphens, and periods"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a namespace name component
+///
+/// Namespace names must:
+/// - Not be empty
+/// - Only contain alphanumeric characters, underscores, hyphens, and periods
+///
+/// # Arguments
+/// * `name` - A single namespace component (not the full path)
+///
+/// # Returns
+/// * `Ok(())` if the namespace name is valid
+/// * `Err(Error)` if the namespace name is invalid
+pub fn validate_namespace_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidInput {
+            message: "Namespace names cannot be empty strings".to_string(),
+        });
+    }
+    if !NAMESPACE_NAME_REGEX.is_match(name) {
+        return Err(Error::InvalidInput {
+            message: format!(
+                "Invalid namespace name '{}': Namespace names can only contain alphanumeric characters, underscores, hyphens, and periods",
+                name
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate all components of a namespace
+///
+/// Iterates through all namespace components and validates each one.
+/// Returns an error if any component is invalid.
+///
+/// # Arguments
+/// * `namespace` - The namespace components to validate
+///
+/// # Returns
+/// * `Ok(())` if all namespace components are valid
+/// * `Err(Error)` if any component is invalid
+pub fn validate_namespace(namespace: &[String]) -> Result<()> {
+    for component in namespace {
+        validate_namespace_name(component)?;
+    }
+    Ok(())
+}
+
+/// Find one default column to create index or perform vector query.
+pub(crate) fn default_vector_column(schema: &Schema, dim: Option<i32>) -> Result<String> {
+    // Try to find a vector column.
+    let mut candidates = Vec::new();
+    for field in schema.fields() {
+        collect_vector_columns(field, &mut Vec::new(), dim, &mut candidates);
+    }
+    if candidates.is_empty() {
+        Err(Error::InvalidInput {
+            message: format!(
+                "No vector column found to match with the query vector dimension: {}",
+                dim.unwrap_or_default()
+            ),
+        })
+    } else if candidates.len() != 1 {
+        Err(Error::Schema {
+            message: format!(
+                "More than one vector columns found, \
+                    please specify which column to create index or query: {:?}",
+                candidates
+            ),
+        })
+    } else {
+        Ok(candidates[0].clone())
+    }
+}
+
+fn collect_vector_columns(
+    field: &Field,
+    path: &mut Vec<String>,
+    dim: Option<i32>,
+    candidates: &mut Vec<String>,
+) {
+    path.push(field.name().clone());
+    match infer_vector_dim(field.data_type()) {
+        Ok(d) if dim.is_none() || dim == Some(d as i32) => {
+            let path_segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+            candidates.push(lance_core::datatypes::format_field_path(&path_segments));
+        }
+        _ => {
+            if let DataType::Struct(fields) = field.data_type() {
+                for child in fields {
+                    collect_vector_columns(child, path, dim, candidates);
+                }
+            }
+        }
+    }
+    path.pop();
+}
+
+pub(crate) fn resolve_arrow_field_path(schema: &Schema, column: &str) -> Result<(String, Field)> {
+    lance_core::datatypes::parse_field_path(column).map_err(|e| Error::InvalidInput {
+        message: format!("Invalid field path `{}`: {}", column, e),
+    })?;
+
+    let lance_schema =
+        lance_core::datatypes::Schema::try_from(schema).map_err(|e| Error::Schema {
+            message: format!("Invalid schema: {}", e),
+        })?;
+    let field_path = lance_schema
+        .resolve_case_insensitive(column)
+        .ok_or_else(|| Error::Schema {
+            message: format!(
+                "Field path `{}` not found in schema. Available field paths: {}",
+                column,
+                lance_schema.field_paths().join(", ")
+            ),
+        })?;
+    let field = field_path.last().expect("field path should be non-empty");
+    let path_segments = field_path
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<Vec<_>>();
+    let canonical_path = lance_core::datatypes::format_field_path(&path_segments);
+
+    Ok((canonical_path, Field::from(*field)))
+}
+
+pub fn supported_btree_data_type(dtype: &DataType) -> bool {
+    dtype.is_integer()
+        || dtype.is_floating()
+        || matches!(
+            dtype,
+            DataType::Boolean
+                | DataType::Utf8
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Timestamp(_, _)
+                | DataType::FixedSizeBinary(_)
+        )
+}
+
+pub fn supported_bitmap_data_type(dtype: &DataType) -> bool {
+    dtype.is_integer()
+        || matches!(
+            dtype,
+            DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::Boolean
+        )
+}
+
+pub fn supported_label_list_data_type(dtype: &DataType) -> bool {
+    match dtype {
+        DataType::List(field) | DataType::LargeList(field) => {
+            supported_bitmap_data_type(field.data_type())
+        }
+        DataType::FixedSizeList(field, _) => supported_bitmap_data_type(field.data_type()),
+        _ => false,
+    }
+}
+
+pub fn supported_fts_data_type(dtype: &DataType) -> bool {
+    supported_fts_data_type_impl(dtype, false)
+}
+
+fn supported_fts_data_type_impl(dtype: &DataType, in_list: bool) -> bool {
+    match (dtype, in_list) {
+        (DataType::Utf8 | DataType::LargeUtf8, _) => true,
+        (DataType::List(field) | DataType::LargeList(field), false) => {
+            supported_fts_data_type_impl(field.data_type(), true)
+        }
+        _ => false,
+    }
+}
+
+/// FM-Index accelerates substring (`contains`) search over raw bytes, so it
+/// applies to string and binary columns.
+pub fn supported_fm_data_type(dtype: &DataType) -> bool {
+    matches!(
+        dtype,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+    )
+}
+
+pub fn supported_vector_data_type(dtype: &DataType) -> bool {
+    match dtype {
+        DataType::FixedSizeList(field, _) => {
+            field.data_type().is_floating() || field.data_type() == &DataType::UInt8
+        }
+        DataType::List(field) => supported_vector_data_type(field.data_type()),
+        _ => false,
+    }
+}
+
+/// Note: this is temporary until we get a proper datatype conversion in Lance.
+pub fn string_to_datatype(s: &str) -> Option<DataType> {
+    let data_type: serde_json::Value = {
+        if let Ok(data_type) = serde_json::from_str(s) {
+            data_type
+        } else {
+            serde_json::json!({ "type": s })
+        }
+    };
+    let json_type: JsonDataType = serde_json::from_value(data_type).ok()?;
+    (&json_type).try_into().ok()
+}
+
+enum TimeoutState {
+    NotStarted {
+        timeout: std::time::Duration,
+    },
+    Started {
+        deadline: Pin<Box<tokio::time::Sleep>>,
+        timeout: std::time::Duration,
+    },
+    Completed,
+}
+
+/// A `Stream` wrapper that implements a timeout.
+///
+/// The timeout starts when the first `poll_next` is called. As soon as the timeout
+/// duration has passed, the stream will return an `Err` indicating a timeout error
+/// for the next poll.
+pub struct TimeoutStream {
+    inner: SendableRecordBatchStream,
+    state: TimeoutState,
+}
+
+impl TimeoutStream {
+    pub fn new(inner: SendableRecordBatchStream, timeout: std::time::Duration) -> Self {
+        Self {
+            inner,
+            state: TimeoutState::NotStarted { timeout },
+        }
+    }
+
+    pub fn new_boxed(
+        inner: SendableRecordBatchStream,
+        timeout: std::time::Duration,
+    ) -> SendableRecordBatchStream {
+        Box::pin(Self::new(inner, timeout))
+    }
+
+    fn timeout_error(timeout: &std::time::Duration) -> DataFusionError {
+        DataFusionError::Execution(format!("Query timeout after {} ms", timeout.as_millis()))
+    }
+}
+
+impl RecordBatchStream for TimeoutStream {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+}
+
+impl Stream for TimeoutStream {
+    type Item = DataFusionResult<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match &mut self.state {
+            TimeoutState::NotStarted { timeout } => {
+                if timeout.is_zero() {
+                    return std::task::Poll::Ready(Some(Err(Self::timeout_error(timeout))));
+                }
+                let deadline = Box::pin(tokio::time::sleep(*timeout));
+                self.state = TimeoutState::Started {
+                    deadline,
+                    timeout: *timeout,
+                };
+                self.poll_next(cx)
+            }
+            TimeoutState::Started { deadline, timeout } => match deadline.poll_unpin(cx) {
+                std::task::Poll::Ready(_) => {
+                    let err = Self::timeout_error(timeout);
+                    self.state = TimeoutState::Completed;
+                    std::task::Poll::Ready(Some(Err(err)))
+                }
+                std::task::Poll::Pending => {
+                    let inner = Pin::new(&mut self.inner);
+                    inner.poll_next(cx)
+                }
+            },
+            TimeoutState::Completed => std::task::Poll::Ready(None),
+        }
+    }
+}
+
+/// A `Stream` wrapper that slices oversized batches to enforce a maximum batch length.
+pub struct MaxBatchLengthStream {
+    inner: SendableRecordBatchStream,
+    max_batch_length: Option<usize>,
+    buffered_batch: Option<RecordBatch>,
+    buffered_offset: usize,
+}
+
+impl MaxBatchLengthStream {
+    pub fn new(inner: SendableRecordBatchStream, max_batch_length: usize) -> Self {
+        Self {
+            inner,
+            max_batch_length: (max_batch_length > 0).then_some(max_batch_length),
+            buffered_batch: None,
+            buffered_offset: 0,
+        }
+    }
+
+    pub fn new_boxed(
+        inner: SendableRecordBatchStream,
+        max_batch_length: usize,
+    ) -> SendableRecordBatchStream {
+        if max_batch_length == 0 {
+            inner
+        } else {
+            Box::pin(Self::new(inner, max_batch_length))
+        }
+    }
+}
+
+impl RecordBatchStream for MaxBatchLengthStream {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+}
+
+impl Stream for MaxBatchLengthStream {
+    type Item = DataFusionResult<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            let Some(max_batch_length) = self.max_batch_length else {
+                return Pin::new(&mut self.inner).poll_next(cx);
+            };
+
+            if let Some(batch) = self.buffered_batch.clone() {
+                if self.buffered_offset < batch.num_rows() {
+                    let remaining = batch.num_rows() - self.buffered_offset;
+                    let length = remaining.min(max_batch_length);
+                    let sliced = batch.slice(self.buffered_offset, length);
+                    self.buffered_offset += length;
+                    if self.buffered_offset >= batch.num_rows() {
+                        self.buffered_batch = None;
+                        self.buffered_offset = 0;
+                    }
+                    return std::task::Poll::Ready(Some(Ok(sliced)));
+                }
+
+                self.buffered_batch = None;
+                self.buffered_offset = 0;
+            }
+
+            match Pin::new(&mut self.inner).poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(batch))) => {
+                    if batch.num_rows() <= max_batch_length {
+                        return std::task::Poll::Ready(Some(Ok(batch)));
+                    }
+                    self.buffered_batch = Some(batch);
+                    self.buffered_offset = 0;
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::Int32Array;
+    use arrow_schema::Field;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::{StreamExt, stream};
+    use tokio::time::sleep;
+
+    use super::*;
+
+    #[test]
+    fn test_guess_default_column() {
+        let schema_no_vector = Schema::new(vec![
+            Field::new("id", DataType::Int16, true),
+            Field::new("tag", DataType::Utf8, false),
+        ]);
+        assert!(
+            default_vector_column(&schema_no_vector, None)
+                .unwrap_err()
+                .to_string()
+                .contains("No vector column")
+        );
+
+        let schema_with_vec_col = Schema::new(vec![
+            Field::new("id", DataType::Int16, true),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, false)), 10),
+                false,
+            ),
+        ]);
+        assert_eq!(
+            default_vector_column(&schema_with_vec_col, None).unwrap(),
+            "vec"
+        );
+
+        let schema_with_nested_vec_col = Schema::new(vec![
+            Field::new("id", DataType::Int16, true),
+            Field::new(
+                "image",
+                DataType::Struct(
+                    vec![Field::new(
+                        "embedding",
+                        DataType::FixedSizeList(
+                            Arc::new(Field::new("item", DataType::Float32, false)),
+                            10,
+                        ),
+                        false,
+                    )]
+                    .into(),
+                ),
+                false,
+            ),
+        ]);
+        assert_eq!(
+            default_vector_column(&schema_with_nested_vec_col, None).unwrap(),
+            "image.embedding"
+        );
+
+        let schema_with_escaped_nested_vec_col = Schema::new(vec![Field::new(
+            "image-meta",
+            DataType::Struct(
+                vec![Field::new(
+                    "embedding.v1",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, false)),
+                        10,
+                    ),
+                    false,
+                )]
+                .into(),
+            ),
+            false,
+        )]);
+        assert_eq!(
+            default_vector_column(&schema_with_escaped_nested_vec_col, None).unwrap(),
+            "`image-meta`.`embedding.v1`"
+        );
+
+        let multi_vec_col = Schema::new(vec![
+            Field::new("id", DataType::Int16, true),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, false)), 10),
+                false,
+            ),
+            Field::new(
+                "vec2",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, false)), 50),
+                false,
+            ),
+        ]);
+        assert!(
+            default_vector_column(&multi_vec_col, None)
+                .unwrap_err()
+                .to_string()
+                .contains("More than one")
+        );
+
+        let multi_nested_vec_col = Schema::new(vec![
+            Field::new(
+                "image",
+                DataType::Struct(
+                    vec![Field::new(
+                        "embedding",
+                        DataType::FixedSizeList(
+                            Arc::new(Field::new("item", DataType::Float32, false)),
+                            10,
+                        ),
+                        false,
+                    )]
+                    .into(),
+                ),
+                false,
+            ),
+            Field::new(
+                "text",
+                DataType::Struct(
+                    vec![Field::new(
+                        "embedding",
+                        DataType::FixedSizeList(
+                            Arc::new(Field::new("item", DataType::Float32, false)),
+                            50,
+                        ),
+                        false,
+                    )]
+                    .into(),
+                ),
+                false,
+            ),
+        ]);
+        assert_eq!(
+            default_vector_column(&multi_nested_vec_col, Some(50)).unwrap(),
+            "text.embedding"
+        );
+        let err = default_vector_column(&multi_nested_vec_col, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("image.embedding"));
+        assert!(err.contains("text.embedding"));
+    }
+
+    #[test]
+    fn test_validate_table_name() {
+        assert!(validate_table_name("my_table").is_ok());
+        assert!(validate_table_name("my_table_1").is_ok());
+        assert!(validate_table_name("123mytable").is_ok());
+        assert!(validate_table_name("_12345table").is_ok());
+        assert!(validate_table_name("table.12345").is_ok());
+        assert!(validate_table_name("table.._dot_..12345").is_ok());
+
+        assert!(validate_table_name("").is_err());
+        assert!(validate_table_name("my_table!").is_err());
+        assert!(validate_table_name("my/table").is_err());
+        assert!(validate_table_name("my@table").is_err());
+        assert!(validate_table_name("name with space").is_err());
+    }
+
+    #[test]
+    fn test_validate_namespace_name() {
+        // Valid namespace names
+        assert!(validate_namespace_name("ns1").is_ok());
+        assert!(validate_namespace_name("namespace_123").is_ok());
+        assert!(validate_namespace_name("my-namespace").is_ok());
+        assert!(validate_namespace_name("my.namespace").is_ok());
+        assert!(validate_namespace_name("NS_1.2.3").is_ok());
+        assert!(validate_namespace_name("a").is_ok());
+        assert!(validate_namespace_name("123").is_ok());
+        assert!(validate_namespace_name("_underscore").is_ok());
+        assert!(validate_namespace_name("-hyphen").is_ok());
+        assert!(validate_namespace_name(".period").is_ok());
+
+        // Invalid namespace names
+        assert!(validate_namespace_name("").is_err());
+        assert!(validate_namespace_name("namespace with spaces").is_err());
+        assert!(validate_namespace_name("namespace/with/slashes").is_err());
+        assert!(validate_namespace_name("namespace\\with\\backslashes").is_err());
+        assert!(validate_namespace_name("namespace$with$delimiter").is_err());
+        assert!(validate_namespace_name("namespace@special").is_err());
+        assert!(validate_namespace_name("namespace#hash").is_err());
+    }
+
+    #[test]
+    fn test_validate_namespace() {
+        // Valid namespace with single component
+        assert!(validate_namespace(&["ns1".to_string()]).is_ok());
+
+        // Valid namespace with multiple components
+        assert!(
+            validate_namespace(&["ns1".to_string(), "ns2".to_string(), "ns3".to_string()]).is_ok()
+        );
+
+        // Empty namespace (root) is valid
+        assert!(validate_namespace(&[]).is_ok());
+
+        // Invalid: contains empty component
+        assert!(validate_namespace(&["ns1".to_string(), "".to_string()]).is_err());
+
+        // Invalid: contains component with spaces
+        assert!(validate_namespace(&["ns1".to_string(), "ns 2".to_string()]).is_err());
+
+        // Invalid: contains component with special characters
+        assert!(validate_namespace(&["ns1".to_string(), "ns@2".to_string()]).is_err());
+        assert!(validate_namespace(&["ns1".to_string(), "ns/2".to_string()]).is_err());
+        assert!(validate_namespace(&["ns1".to_string(), "ns$2".to_string()]).is_err());
+
+        // Valid: underscores, hyphens, and periods are allowed
+        assert!(
+            validate_namespace(&["ns_1".to_string(), "ns-2".to_string(), "ns.3".to_string()])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_string_to_datatype() {
+        let string = "int32";
+        let expected = DataType::Int32;
+        assert_eq!(string_to_datatype(string), Some(expected));
+    }
+
+    fn sample_batch(num_rows: i32) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col1",
+            DataType::Int32,
+            false,
+        )]));
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_timeout_stream() {
+        let batch = sample_batch(3);
+        let schema = batch.schema();
+        let mock_stream = stream::iter(vec![Ok(batch.clone()), Ok(batch.clone())]);
+
+        let sendable_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), mock_stream));
+        let timeout_duration = std::time::Duration::from_millis(10);
+        let mut timeout_stream = TimeoutStream::new(sendable_stream, timeout_duration);
+
+        // Poll the stream to get the first batch
+        let first_result = timeout_stream.next().await;
+        assert!(first_result.is_some());
+        assert!(first_result.unwrap().is_ok());
+
+        // Sleep for the timeout duration
+        sleep(timeout_duration).await;
+
+        // Poll the stream again and ensure it returns a timeout error
+        let second_result = timeout_stream.next().await.unwrap();
+        assert!(second_result.is_err());
+        assert!(
+            second_result
+                .unwrap_err()
+                .to_string()
+                .contains("Query timeout")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_stream_zero_duration() {
+        let batch = sample_batch(3);
+        let schema = batch.schema();
+        let mock_stream = stream::iter(vec![Ok(batch.clone()), Ok(batch.clone())]);
+
+        let sendable_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), mock_stream));
+
+        // Setup similar to test_timeout_stream
+        let timeout_duration = std::time::Duration::from_secs(0);
+        let mut timeout_stream = TimeoutStream::new(sendable_stream, timeout_duration);
+
+        // First poll should immediately return a timeout error
+        let result = timeout_stream.next().await.unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Query timeout"));
+    }
+
+    #[tokio::test]
+    async fn test_timeout_stream_completes_normally() {
+        let batch = sample_batch(3);
+        let schema = batch.schema();
+        let mock_stream = stream::iter(vec![Ok(batch.clone()), Ok(batch.clone())]);
+
+        let sendable_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), mock_stream));
+
+        // Setup a stream with 2 batches
+        // Use a longer timeout that won't trigger
+        let timeout_duration = std::time::Duration::from_secs(1);
+        let mut timeout_stream = TimeoutStream::new(sendable_stream, timeout_duration);
+
+        // Both polls should return data normally
+        assert!(timeout_stream.next().await.unwrap().is_ok());
+        assert!(timeout_stream.next().await.unwrap().is_ok());
+        // Stream should be empty now
+        assert!(timeout_stream.next().await.is_none());
+    }
+
+    async fn collect_batch_sizes(
+        stream: SendableRecordBatchStream,
+        max_batch_length: usize,
+    ) -> Vec<usize> {
+        let mut sliced_stream = MaxBatchLengthStream::new(stream, max_batch_length);
+        sliced_stream
+            .by_ref()
+            .map(|batch| batch.unwrap().num_rows())
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_max_batch_length_stream_behaviors() {
+        let schema = sample_batch(7).schema();
+        let mock_stream = stream::iter(vec![Ok(sample_batch(2)), Ok(sample_batch(7))]);
+
+        let sendable_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), mock_stream));
+        assert_eq!(
+            collect_batch_sizes(sendable_stream, 3).await,
+            vec![2, 3, 3, 1]
+        );
+
+        let sendable_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(sample_batch(2)), Ok(sample_batch(7))]),
+        ));
+        assert_eq!(collect_batch_sizes(sendable_stream, 0).await, vec![2, 7]);
+    }
+}

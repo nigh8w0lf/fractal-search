@@ -2,7 +2,7 @@
 
 A local multimodal-search app for Omarchy Shell. Add folders containing images, text, audio and video, describe what you need, and open a matching file in its default desktop app or file manager. The Quickshell panel uses native Rust EmbeddingGemma 2 inference and a LanceDB catalog. CPU and explicitly selected NVIDIA CUDA inference are supported. A separate read-only MCP server makes the indexed library available to agent clients.
 
-This repository is the complete standalone project: both Cargo workspace members, UI, installer and validation tools live here. The production runtime has no Python dependency. New contributors should read this file and [AGENTS.md](AGENTS.md); together they cover the product, architecture, workflow and constraints. Scoped instructions in [quickshell-app/AGENTS.md](quickshell-app/AGENTS.md) also apply when editing that directory.
+This repository is the complete standalone project: all four Cargo workspace members, UI, installer and validation tools live here. The production runtime has no Python dependency. New contributors should read this file and [AGENTS.md](AGENTS.md); together they cover the product, architecture, workflow and constraints. Scoped instructions in [quickshell-app/AGENTS.md](quickshell-app/AGENTS.md) also apply when editing that directory.
 
 ## Current interface
 
@@ -31,6 +31,12 @@ Audio/video files are limited to 2 GiB and two hours. Video decoding rejects fra
 
 Rows show media kind, passage number or time range, and cached text excerpts (at most 2,048 UTF-8 bytes). Images have bounded previews; videos show an existing cached frame thumbnail. Text/audio do not request image previews. **Open file** opens the whole original with its default desktop app; it does not request seeking to the matched segment. **Show in folder** reveals the original. Files stay in place.
 
+Opening uses GLib's `gio open`, which resolves the local file's MIME association
+and honors terminal-based desktop entries. Fractal Search does not override
+desktop defaults. Missing opener/application errors and launch timeouts stay
+visible; the panel hides or releases focus only after GIO accepts the launch.
+An application can still fail after accepting the request.
+
 ## Build, install and open
 
 From this repository's root:
@@ -46,7 +52,22 @@ From this repository's root:
 
 Omit `--dev` for a release build. First-run **Set up model**, also available under Settings → Performance, downloads and verifies the pinned assets (about 2.96 GB). **Choose folder** selects an existing verified model cache. Do not download models just to run metadata checks.
 
-Development builds optimize the native core's image/preprocessing loops at level 3 while retaining the app's development profile and level-2 dependency optimization. CPU/CUDA inference fetches only the sentence embedding; CUDA's CPU worker pools sleep while waiting for work instead of spinning. These changes retain the pinned FP32 vectors and catalog contract. The [synthetic indexing benchmark](quickshell-app/README.md#synthetic-indexing-benchmark) records scan timings, CPU usage and search-score parity between binaries.
+Development builds optimize the native core's image/preprocessing loops at level 3 while retaining the app's development profile and level-2 dependency optimization. Workspace code keeps level-1 debug information, dependencies omit debug information, and incremental compilation remains enabled for faster rebuilds. Shared dependency versions are centralized in the root manifest; see the [dependency review](docs/DEPENDENCIES.md) for the graph and tradeoffs. CPU/CUDA inference fetches only the sentence embedding; CUDA's CPU worker pools sleep while waiting for work instead of spinning. These changes retain the pinned FP32 vectors and catalog contract. The [synthetic indexing benchmark](quickshell-app/README.md#synthetic-indexing-benchmark) records scan timings, CPU usage and search-score parity between binaries.
+
+For a targeted development build, select the package you changed:
+
+```bash
+cargo build -p fractal-folder-picker --locked
+cargo build -p fractal-search --locked
+cargo build -p fractal-search-mcp --locked
+# Build all three CUDA-bundle binaries together:
+cargo build -p fractal-search -p fractal-folder-picker -p fractal-search-mcp --bins --locked --features fractal-search/cuda,fractal-search-mcp/cuda
+```
+
+The picker does not compile the inference/catalog or MCP stacks. Daemon and MCP
+CUDA features are forwarded independently; the bundle script selects both and
+checks their capabilities. The local LanceDB manifest patch keeps ICU tokenization
+and the existing catalog format; it introduces no migration or reindexing.
 
 Open an existing installation without building or touching the checkout:
 
@@ -58,7 +79,7 @@ omarchy-shell shell summon fractal.search '{}'
 
 Use the installed summon command for a desktop shortcut. Installation preserves existing shortcuts; optional `--bind-close` explicitly installs managed Super+W close routing. Do not restart the desktop shell to update this plugin.
 
-Development needs Rust, a C/C++ toolchain, pkg-config and native image libraries. The runtime needs Omarchy Shell/Quickshell, curl, jq, libheif, libjpeg-turbo, gcc-libs, ffmpeg and ffprobe and a desktop portal providing FileChooser. Show in folder uses `gdbus` and a file manager implementing FileManager1.ShowItems. The Rust build selects system libjpeg-turbo on Linux. Python is used only by development/validation tools.
+Development needs Rust, a C/C++ toolchain, pkg-config and native image libraries. The runtime needs Omarchy Shell/Quickshell, curl, jq, libheif, libjpeg-turbo, gcc-libs, GLib's `gio`, ffmpeg and ffprobe and a desktop portal providing FileChooser. Show in folder uses `gdbus` and a file manager implementing FileManager1.ShowItems. The Rust build selects system libjpeg-turbo on Linux. Python is used only by development/validation tools.
 
 CUDA bundles include the ONNX Runtime provider libraries; NVIDIA driver, CUDA 12 runtime and cuDNN 9 libraries are installed separately. Use `--cuda` when updating a CUDA installation; a CPU bundle refuses to replace a CUDA configuration unless you explicitly switch to `--provider cpu`. Startup/inference failures remain visible and never retry the model on CPU. See [CUDA.md](quickshell-app/CUDA.md) for exact dependencies and validation.
 
@@ -94,12 +115,15 @@ The desktop socket is trusted same-user access: it may index folders and open or
 | `quickshell-app/ui/Controller.qml` | Socket protocol, application state, search/index operations and previews. |
 | `quickshell-app/ui/SettingsPage.qml` | Folders, Preferences and Performance tabs. |
 | `quickshell-app/ui/ResultActions.qml` | Shared Open file / Show in folder controls for preview and narrow/list layouts. |
+| `quickshell-app/ui/DesktopFileOpener.qml` | GIO desktop launch, bounded diagnostics and visible opener failures. |
 | `quickshell-app/ui/SearchConfirmationDialog.qml` | Shared folder-removal and stop-service confirmation. |
 | `quickshell-app/ui/AcceleratorSection.qml` | Compact CPU/GPU activity and capability status with expandable, copyable diagnostics. |
 | `quickshell-app/ui/RuntimeConfig.qml`, `RuntimeDiagnostics.qml`, `ServiceAutostart.qml` | Runtime paths, dependency diagnostics and login registration. The installer generates the installed RuntimeConfig. |
 | `quickshell-app/backend/src/main.rs`, `daemon.rs` | Worker commands/settings and resident socket service/lifecycle. |
 | `quickshell-app/backend/src/models.rs`, `watch.rs`, `diagnostics.rs` | Verified downloads, folder watching and CUDA preflight. |
-| `quickshell-app/backend/src/bin/` | Native portal folder picker and stdio MCP server/transport. |
+| `quickshell-app/folder-picker/src/main.rs` | Independent native portal folder picker. |
+| `quickshell-app/mcp/src/main.rs`, `transport.rs` | Independent stdio MCP server and bounded transport. |
+| `vendor/lancedb/` | Pinned LanceDB 0.37.1 source with a manifest-only patch disabling unused Jieba/Lindera tokenizers. |
 | `crates/fractal-search-core/src/` | Catalog, agent read API, decoding/preprocessing, tokenization and ONNX runtime. |
 | `quickshell-app/packaging/`, `scripts/package-fractal-search.sh` | Versioned bundles, installation, uninstall and optional close binding. |
 | `quickshell-app/tests/`, `scripts/` | Temporary-catalog smoke checks and optional reference-model tooling. |

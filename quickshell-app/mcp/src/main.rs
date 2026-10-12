@@ -1,5 +1,4 @@
 //! Read-only MCP server for the independent Quickshell search catalog.
-#[path = "fractal_search_mcp/transport.rs"]
 mod transport;
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};

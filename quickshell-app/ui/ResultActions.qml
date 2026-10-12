@@ -13,7 +13,7 @@ RowLayout {
         Accessible.description: "Open the whole original file in its default app. Segment seeking is not requested. Keyboard shortcut: Enter."
         colors: actions.app.colors
         filled: true
-        enabled: actions.app.ready && !actions.app.loading && !actions.app.closing && !!actions.app.selectedAsset
+        enabled: actions.app.ready && !actions.app.loading && !actions.app.closing && !actions.app.openingFile && !!actions.app.selectedAsset
         onClicked: actions.app.openOriginal()
     }
     SearchButton {

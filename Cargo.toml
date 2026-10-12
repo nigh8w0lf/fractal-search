@@ -1,12 +1,40 @@
 [workspace]
-members = ["crates/fractal-search-core", "quickshell-app/backend"]
+members = [
+    "crates/fractal-search-core",
+    "quickshell-app/backend",
+    "quickshell-app/folder-picker",
+    "quickshell-app/mcp",
+]
+exclude = ["vendor/lancedb"]
 resolver = "2"
+
+# Shared versions stay aligned while each member selects its required features.
+[workspace.dependencies]
+fractal-search-core = { path = "crates/fractal-search-core", default-features = false }
+clap = { version = "4.5", features = ["derive", "env"] }
+dirs = "6"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+tokio = { version = "1", default-features = false }
+libc = "0.2"
+url = "2.5"
+tempfile = "3.23"
+
+[patch.crates-io]
+lancedb = { path = "vendor/lancedb" }
 
 [profile.dev]
 opt-level = 1
+# Keep application debug information and fast incremental rebuilds without
+# emitting full debug symbols for the large third-party dependency graph.
+debug = 1
+incremental = true
 
 [profile.dev.package."*"]
 opt-level = 2
+debug = 0
 
 # Keep native resize/patch/thumbnail loops optimized in desktop development
 # builds without rebuilding the database dependencies as a release profile.

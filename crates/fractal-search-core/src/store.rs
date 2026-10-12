@@ -1457,6 +1457,17 @@ mod tests {
         assert!(fuse_candidates(vec![], vec![(a.clone(), 1.0), (a, 1.0)], &query, 10).is_err());
     }
     #[test]
+    fn disabled_dictionary_tokenizers_error_instead_of_substituting_icu() {
+        for name in ["jieba/default", "lindera/ipadic"] {
+            let config = text_index_config().base_tokenizer(name.into());
+            assert!(
+                lancedb::tokenize("北京 東京", &config).is_err(),
+                "Disabled tokenizer {name} must fail instead of changing tokenization"
+            );
+        }
+    }
+
+    #[test]
     fn lexical_queries_use_literal_multilingual_terms_and_keep_long_identifiers() {
         let root = tempfile::tempdir().unwrap();
         let store = Store::open(root.path(), false).unwrap();
@@ -1464,6 +1475,7 @@ mod tests {
         let cases = [
             ("accent", "Café résumé", "cafe".to_owned()),
             ("cjk", "北京欢迎你", "北京".to_owned()),
+            ("japanese", "東京大学", "東京".to_owned()),
             ("long", long.as_str(), long.clone()),
             ("stop", "the AND OR", "AND".to_owned()),
             ("apostrophe", "O'Reilly", "\"O'Reilly\"".to_owned()),

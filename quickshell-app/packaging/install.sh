@@ -41,6 +41,7 @@ done
 for SEARCH_TOOL in ffmpeg ffprobe; do
   command -v "$SEARCH_TOOL" >/dev/null || { echo "Missing $SEARCH_TOOL for audio/video indexing. Install with: omarchy pkg add ffmpeg" >&2; exit 1; }
 done
+command -v gio >/dev/null || { echo "Missing gio for opening files in their default desktop applications. Install with: omarchy pkg add glib2" >&2; exit 1; }
 [[ $(jq -r .architecture "$SEARCH_BUNDLE/bundle.json") == "$(uname -m)" ]] || { echo 'The bundle architecture does not match this computer' >&2; exit 1; }
 [[ $(jq -r .protocolVersion "$SEARCH_BUNDLE/bundle.json") == 1 ]] || { echo 'Unsupported bundle protocol' >&2; exit 1; }
 (cd -- "$SEARCH_BUNDLE"; sha256sum --check --quiet SHA256SUMS)
@@ -229,7 +230,7 @@ WantedBy=graphical-session.target
 UNIT
 if [[ ! -e $SEARCH_DEST ]]; then
   mkdir -- "$SEARCH_DEST"
-  cp -a -- "$SEARCH_BUNDLE/bin" "$SEARCH_BUNDLE/uninstall.sh" "$SEARCH_BUNDLE/README.md" "$SEARCH_BUNDLE/MCP.md" "$SEARCH_BUNDLE/CUDA.md" "$SEARCH_BUNDLE/NOTICE" "$SEARCH_BUNDLE/bundle.json" "$SEARCH_DEST/"
+  cp -a -- "$SEARCH_BUNDLE/bin" "$SEARCH_BUNDLE/uninstall.sh" "$SEARCH_BUNDLE/README.md" "$SEARCH_BUNDLE/MCP.md" "$SEARCH_BUNDLE/CUDA.md" "$SEARCH_BUNDLE/NOTICE" "$SEARCH_BUNDLE/LANCEDB-LICENSE" "$SEARCH_BUNDLE/bundle.json" "$SEARCH_DEST/"
 fi
 systemd-analyze --user verify "$SEARCH_STAGE/fractal-search.service" 2> "$SEARCH_STAGE/unit-errors" || { cat "$SEARCH_STAGE/unit-errors" >&2; exit 1; }
 if ((!SEARCH_SKIP_SHELL)); then

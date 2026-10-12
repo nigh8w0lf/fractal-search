@@ -28,7 +28,7 @@ Use an absolute path in the client's configuration; MCP clients need not expand 
 The installed wrapper selects the installation's catalog directory. To run the developer binary directly:
 
 ```bash
-cargo build -p fractal-search --bin fractal-search-mcp --locked
+cargo build -p fractal-search-mcp --locked
 target/debug/fractal-search-mcp --data-dir /absolute/path/to/fractal-search
 ```
 
@@ -72,7 +72,7 @@ Run the workspace checks plus the temporary-catalog integration test:
 cargo fmt --all --check
 cargo check --workspace --locked
 cargo test --workspace --locked
-cargo build -p fractal-search --bins --locked
+cargo build -p fractal-search -p fractal-folder-picker -p fractal-search-mcp --bins --locked
 python3 quickshell-app/tests/smoke_mcp.py \
   target/debug/fractal-search target/debug/fractal-search-mcp \
   /absolute/path/to/pinned/models

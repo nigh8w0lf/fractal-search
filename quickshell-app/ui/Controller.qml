@@ -45,6 +45,8 @@ Item {
     property int resultRequestSerial: 0
     property int previewGeneration: 0
     property bool previewRequestPending: false
+    property bool originalRequestPending: false
+    readonly property bool openingFile: originalRequestPending || fileOpener.opening
     property int previewRequestSerial: 0
     property int queryGeneration: 0
     property bool deferredSearch: false
@@ -118,6 +120,16 @@ Item {
     signal externalAppOpened
     signal restartRequired
 
+    DesktopFileOpener {
+        id: fileOpener
+        onFailed: message => app.fail(message)
+        onOpened: {
+            if (app.settings.closeAfterOpening)
+                app.dismiss();
+            else
+                app.externalAppOpened();
+        }
+    }
     RuntimeDiagnostics {
         id: runtimeDiagnostics
         executable: app.backendExecutable
@@ -413,6 +425,7 @@ Item {
         results.clear();
     }
     function resetConnectionRequests() {
+        originalRequestPending = false;
         // Old socket callbacks cannot clear or overwrite a newer connection's work.
         ++queryGeneration;
         ++resultRequestSerial;
@@ -723,22 +736,19 @@ Item {
     function openOriginal() {
         if (!selectedAsset || !ready || closing)
             return;
+        if (openingFile) {
+            fail("A file is already being opened. Wait before trying again.");
+            return;
+        }
+        originalRequestPending = true;
         request({
             type: "originalUrl",
             assetId: selectedAsset.assetId
         }, function (result) {
+            app.originalRequestPending = false;
             if (!result)
                 return;
-            if (!Qt.openUrlExternally(result.url))
-                app.fail("The desktop could not open this file.");
-            else {
-                // Hiding releases focus itself. Lower only a panel that stays
-                // visible, so hide/resummon cannot race a native layer change.
-                if (app.settings.closeAfterOpening)
-                    app.dismiss();
-                else
-                    app.externalAppOpened();
-            }
+            fileOpener.open(result.url);
         });
     }
     function revealOriginal() {

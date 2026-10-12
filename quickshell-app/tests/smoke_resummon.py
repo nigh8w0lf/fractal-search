@@ -166,13 +166,17 @@ while not (root / 'restart.complete').exists():
     FloatingWindow { visible: true; title: "Fractal test backdrop"; color: "#172030"; implicitWidth: 1280; implicitHeight: 900 }
 '''))
         commands = root / 'commands'; commands.mkdir()
-        opener = commands / 'xdg-open'
+        opener = commands / 'gio'
         opener.write_text('''#!/usr/bin/env python3
 import os, subprocess, sys
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 root = Path(os.environ['FRACTAL_RESUMMON_ROOT'])
-url = urlsplit(sys.argv[1]); assert url.scheme == 'file' and not url.netloc
+if (root / 'opener.fail').exists():
+    print('Private default application launch failed', file=sys.stderr)
+    sys.exit(17)
+assert sys.argv[1] == 'open' and len(sys.argv) == 3
+url = urlsplit(sys.argv[2]); assert url.scheme == 'file' and not url.netloc
 path = Path(unquote(url.path)); assert path.is_relative_to(root / 'photos')
 with (root / 'viewer.log').open('a') as log:
     viewer = subprocess.Popen(['imv', str(path)], stdout=log, stderr=log)
@@ -368,6 +372,13 @@ with (root / 'viewer.log').open('a') as log:
         print('Real mixed-media indexing, all media/folder filters, repeated native typing, hybrid labels and narrow results passed', flush=True)
         call('test', 'browse')
         selected = wait(lambda s: not s['loading'] and not s['previewLoading'] and s['previewUrl'] and s['selectedAsset'])['selectedAsset']
+        (root / 'opener.fail').touch()
+        call('test', 'clickOpen')
+        wait(lambda s: 'Private default application launch failed' in s['error'] and s['visible'])
+        assert not (root / 'viewer.pid').exists()
+        subprocess.run(['grim', str(root / 'open-failure.png')], env=env, check=True, timeout=5)
+        (root / 'opener.fail').unlink()
+        call('test', 'acknowledge')
         Path(selected['path']).unlink()
         call('test', 'clickOpen')
         wait(lambda s: 'Original media file is missing' in s['error'] and s['visible'])
@@ -380,7 +391,7 @@ with (root / 'viewer.log').open('a') as log:
         assert panel.wait(timeout=20) == 0
         assert backend.wait(timeout=20) == 0
         print(f'16 viewer cycles passed with both checkbox states; maximum summon time {max(latencies):.3f}s. '
-              'Empty/loading/search/preview, missing-original error and clean stop passed.', flush=True)
+              'Empty/loading/search/preview, opener/missing-original errors and clean stop passed.', flush=True)
     finally:
         close_viewer()
         for process in reversed(children):

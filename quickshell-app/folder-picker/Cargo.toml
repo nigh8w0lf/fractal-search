@@ -1,0 +1,16 @@
+[package]
+name = "fractal-folder-picker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+url = { workspace = true }
+# Keep the native portal on Tokio with the existing blocking interface.
+zbus = { version = "=5.12.0", default-features = false, features = ["tokio", "blocking-api"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

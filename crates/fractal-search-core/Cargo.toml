@@ -11,24 +11,23 @@ media = ["dep:libc"]
 catalog = ["media", "dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures", "dep:tokio", "dep:walkdir", "dep:url"]
 
 [dependencies]
-anyhow = "1"
+anyhow = { workspace = true }
 image = { version = "0.25.8", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
 libheif-rs = { version = "2.6", default-features = false, features = ["image", "v1_20"] }
 tokenizers = { version = "=0.22.2", default-features = false, features = ["fancy-regex"] }
-half = "=2.7.1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10.9"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 ort = { version = "=2.0.0-rc.10", optional = true }
 lancedb = { version = "=0.37.1", default-features = false, optional = true }
 arrow-array = { version = "58", optional = true }
 arrow-schema = { version = "58", optional = true }
 futures = { version = "0.3", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 walkdir = { version = "2.5", optional = true }
-url = { version = "2.5", optional = true }
-libc = { version = "0.2", optional = true }
+url = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Omarchy supplies libjpeg-turbo. Choose it explicitly without a bundled CMake
@@ -39,7 +38,7 @@ turbojpeg = { version = "1.1", default-features = false, features = ["pkg-config
 turbojpeg = "1.1"
 
 [dev-dependencies]
-tempfile = "3.23"
+tempfile = { workspace = true }
 
 [[example]]
 name = "validate_embeddinggemma2"
