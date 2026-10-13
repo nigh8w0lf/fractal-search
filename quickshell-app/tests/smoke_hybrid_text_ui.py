@@ -206,7 +206,7 @@ console.log('PASS: grouped passage bounds/order/location/actions, segment-mode p
     import json
     harness = harness.replace('__METHODS__', json.dumps(script))
     subprocess.run(['node', '-e', harness], check=True, timeout=20)
-    for label in ['All media', 'Images', 'Text', 'Audio', 'Video']:
+    for label in ['All file types', 'Images', 'Text', 'Audio', 'Video']:
         assert f'label: "{label}"' in panel
     assert 'objectName: "mediaKindFilter"' in panel
     assert 'app.setMediaKind(currentValue)' in panel and 'app.setSourceId(currentValue)' in panel

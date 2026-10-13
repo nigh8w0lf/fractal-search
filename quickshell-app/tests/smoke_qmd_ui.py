@@ -21,7 +21,7 @@ def main():
         assert f'{name} 1.0 {name}.qml' in directory
     assert 'objectName: "groupTextByFileToggle"' in settings
     assert 'groupTextByFile: checked' in settings
-    assert 'All media searches and browsing keep segment results.' in settings
+    assert 'Searching all file types and browsing keep segment results.' in settings
     assert 'onClicked: page.app.reindexAll()' in settings, 'Ordinary rescan stays ordinary'
     assert 'onClicked: page.rebuildText()' in settings
     assert 'id: rebuildTextDialog\n                parent: canvas' in panel

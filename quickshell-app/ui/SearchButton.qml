@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Ui as OmarchyUi
 import QtQuick.Controls
 
 Button {
@@ -9,7 +10,7 @@ Button {
     property bool filled: false
     property bool selected: false
     property bool quiet: false
-    implicitHeight: Style.space(32)
+    implicitHeight: Math.max(Style.space(32), implicitContentHeight + topPadding + bottomPadding)
     padding: Style.space(9)
     font.family: SearchTheme.font.family
     font.pixelSize: SearchTheme.font.body
@@ -23,10 +24,17 @@ Button {
         verticalAlignment: Text.AlignVCenter
         opacity: button.enabled ? 1 : 0.4
     }
-    background: Rectangle {
-        color: button.filled ? (button.down ? Qt.darker(button.colors.accent, 1.15) : button.hovered ? Qt.lighter(button.colors.accent, 1.1) : button.colors.accent) : button.selected || button.hovered || button.down ? Qt.alpha(button.colors.accent, 0.14) : button.quiet ? "transparent" : Qt.alpha(button.colors.foreground, 0.035)
-        border.width: button.quiet && !button.activeFocus ? 0 : 1
-        border.color: button.activeFocus && button.filled ? button.colors.foreground : button.activeFocus || button.selected ? button.colors.accent : Qt.alpha(button.colors.foreground, 0.3)
+    background: OmarchyUi.BorderSurface {
+        color: button.filled ? (button.down ? Qt.darker(button.colors.accent, 1.15) : button.hovered ? Qt.lighter(button.colors.accent, 1.1) : button.colors.accent)
+            : button.down ? Style.pressedFillFor(button.colors.foreground, button.colors.accent)
+            : button.activeFocus ? Style.focusFillFor(button.colors.foreground, button.colors.accent)
+            : button.hovered ? Style.hoverFillFor(button.colors.foreground, button.colors.accent)
+            : button.selected ? Style.selectedFillFor(button.colors.foreground, button.colors.accent)
+            : button.quiet ? "transparent" : Style.normalFillFor(button.colors.foreground, button.colors.accent)
+        borderSpec: button.activeFocus ? Border.controlSpec("focus", button.colors.foreground, button.colors.accent)
+            : button.hovered ? Border.controlSpec("hover-cursor", button.colors.foreground, button.colors.accent)
+            : button.selected ? Border.controlSpec("selected", button.colors.foreground, button.colors.accent)
+            : button.quiet ? Border.none() : Border.controlSpec("normal", button.colors.foreground, button.colors.accent)
         opacity: button.enabled ? 1 : 0.5
     }
 }

@@ -11,9 +11,10 @@ def main():
     source = Path(__file__).resolve().parents[1] / 'ui'
     with tempfile.TemporaryDirectory(prefix='fractal-media-ui-') as directory:
         root = Path(directory)
-        for name in ['Controller.qml', 'RuntimeDiagnostics.qml', 'ServiceAutostart.qml', 'ResultActions.qml', 'SearchButton.qml', 'SearchText.qml', 'SearchTheme.qml', 'qmldir']:
+        for name in ['Controller.qml', 'DesktopFileOpener.qml', 'RuntimeDiagnostics.qml', 'ServiceAutostart.qml', 'ResultActions.qml', 'SearchButton.qml', 'SearchText.qml', 'SearchTheme.qml', 'qmldir']:
             shutil.copy(source / name, root / name)
         (root / 'Commons').symlink_to('/usr/share/omarchy/shell/Commons', target_is_directory=True)
+        (root / 'Ui').symlink_to('/usr/share/omarchy/shell/Ui', target_is_directory=True)
         (root / 'shell.qml').write_text('''import QtQuick
 import Quickshell
 ShellRoot {
@@ -92,7 +93,8 @@ ShellRoot {
         }
     }
 }''')
-        env = dict(os.environ, QT_QPA_PLATFORM='offscreen', QT_QUICK_BACKEND='software', QT_QUICK_CONTROLS_STYLE='Basic', QT_QPA_PLATFORMTHEME='generic')
+        runtime = root / 'runtime'; runtime.mkdir(mode=0o700)
+        env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), QT_QPA_PLATFORM='offscreen', QT_QUICK_BACKEND='software', QT_QUICK_CONTROLS_STYLE='Basic', QT_QPA_PLATFORMTHEME='generic')
         env.pop('WAYLAND_DISPLAY', None)
         result = subprocess.run(['quickshell', '--path', str(root), '--no-duplicate', '--no-color'], env=env, capture_output=True, text=True, timeout=15)
         output = result.stdout + result.stderr

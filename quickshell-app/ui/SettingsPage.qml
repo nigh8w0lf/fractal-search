@@ -299,7 +299,7 @@ ColumnLayout {
                     }
                     SearchText {
                         Layout.fillWidth: true
-                        text: "Text searches show each file's strongest passage, with up to five extra matching excerpts. Turn off for individual passages. All media searches and browsing keep segment results."
+                        text: "Text searches show each file's strongest passage, with up to five extra matching excerpts. Turn off for individual passages. Searching all file types and browsing keep segment results."
                         color: page.app.secondaryText
                         wrapMode: Text.WordWrap
                         font.pixelSize: SearchTheme.font.bodySmall

@@ -69,6 +69,7 @@ For QML lint, provide the host's `qs.Commons` import without modifying its insta
 SEARCH_LINT_DIR=$(mktemp -d /tmp/fractal-search-lint.XXXXXX)
 mkdir -p "$SEARCH_LINT_DIR/qs"
 ln -s /usr/share/omarchy/shell/Commons "$SEARCH_LINT_DIR/qs/Commons"
+ln -s /usr/share/omarchy/shell/Ui "$SEARCH_LINT_DIR/qs/Ui"
 /usr/lib/qt6/bin/qmllint -I "$SEARCH_LINT_DIR" quickshell-app/ui/SearchPanel.qml quickshell-app/ui/SettingsPage.qml
 # Include any other changed QML components in the same invocation.
 rm -r -- "$SEARCH_LINT_DIR"

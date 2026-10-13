@@ -14,6 +14,7 @@ def main():
         for name in ['AcceleratorSection.qml', 'SearchText.qml', 'SearchButton.qml', 'SearchTheme.qml', 'qmldir']:
             shutil.copy(source / name, root / name)
         (root / 'Commons').symlink_to('/usr/share/omarchy/shell/Commons', target_is_directory=True)
+        (root / 'Ui').symlink_to('/usr/share/omarchy/shell/Ui', target_is_directory=True)
         (root / 'shell.qml').write_text('''import QtQuick
 import Quickshell
 ShellRoot {

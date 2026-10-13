@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import qs.Commons
+import qs.Ui as OmarchyUi
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Window
@@ -136,7 +137,8 @@ Item {
         readonly property int surfaceWidth: Math.min(Style.space(980), screen ? screen.width - Style.space(32) : Style.space(980))
         readonly property int surfaceHeight: Math.min(Style.space(740), screen ? screen.height - Style.space(32) : Style.space(740))
         property bool exclusiveKeyboard: true
-        readonly property int compactHeight: Math.ceil(Style.space(56) + hotkeysFooter.implicitHeight)
+        readonly property int headerHeight: Style.space(54)
+        readonly property int compactHeight: Math.ceil(headerHeight + hotkeysFooter.implicitHeight + canvas.topInset + canvas.bottomInset)
         readonly property bool hasStatus: app.errorMessage.length > 0 || app.notice.length > 0 || app.showIndexReport || (app.ready && !app.status.modelsPresent) || app.indexing || app.installingModels
         readonly property bool expanded: app.page !== "summon" || hasStatus || errorDialog.visible || skippedFiles.visible || stopDialog.visible || restartDialog.visible || rebuildTextDialog.visible
         readonly property int preferredWidth: Style.space(app.page === "results" ? 980 : app.page === "settings" ? 600 : 680)
@@ -255,16 +257,29 @@ Item {
             width: 0
             height: 0
             clip: true
-            color: Qt.alpha(app.colors.background, 0.97)
+            color: "transparent"
+            readonly property var outlineSpec: Border.surfaceSpec("popups", "border", SearchTheme.popups.border, Math.max(1, Style.space(2)))
+            readonly property real leftInset: Border.left(outlineSpec)
+            readonly property real rightInset: Border.right(outlineSpec)
+            readonly property real topInset: Border.top(outlineSpec)
+            readonly property real bottomInset: Border.bottom(outlineSpec)
             Rectangle {
-                // The compositor's integer region can clip the outermost pixel
-                // at fractional scale. Keep the outline inside the masked edge.
+                // Keep the fill under the inner half of the stroke, so fractional
+                // edge coverage blends with the wallpaper rather than black.
                 anchors.fill: parent
-                anchors.margins: 1
+                anchors.leftMargin: canvas.leftInset / 2
+                anchors.rightMargin: canvas.rightInset / 2
+                anchors.topMargin: canvas.topInset / 2
+                anchors.bottomMargin: canvas.bottomInset / 2
+                color: app.colors.background
+            }
+            OmarchyUi.BorderSurface {
+                // Cover the painted background to its edge; an inset exposes
+                // a dark rim outside the theme border on light wallpapers.
+                anchors.fill: parent
                 z: 1
                 color: "transparent"
-                border.width: 1
-                border.color: app.borderColor
+                borderSpec: canvas.outlineSpec
             }
             // Choose the destination layout once, rather than switching rows
             // and preview visibility as the animated panel crosses breakpoints.
@@ -298,13 +313,16 @@ Item {
 
             ColumnLayout {
                 anchors.fill: parent
-                anchors.margins: 1
+                anchors.leftMargin: canvas.leftInset
+                anchors.rightMargin: canvas.rightInset
+                anchors.topMargin: canvas.topInset
+                anchors.bottomMargin: canvas.bottomInset
                 spacing: 0
                 Item {
                     Layout.fillWidth: true
-                    Layout.minimumHeight: 54
-                    Layout.maximumHeight: 54
-                    Layout.preferredHeight: 54
+                    Layout.minimumHeight: window.headerHeight
+                    Layout.maximumHeight: window.headerHeight
+                    Layout.preferredHeight: window.headerHeight
                     ColumnLayout {
                         anchors.centerIn: parent
                         width: parent.width
@@ -316,7 +334,7 @@ Item {
                             RowLayout {
                                 anchors.fill: parent
                                 anchors.leftMargin: Style.space(16)
-                                anchors.rightMargin: Style.space(12)
+                                anchors.rightMargin: Style.space(16)
                                 spacing: Style.space(12)
                                 SearchButton {
                                     visible: app.page === "settings"
@@ -330,21 +348,21 @@ Item {
                                     implicitWidth: Style.space(18)
                                     implicitHeight: Style.space(20)
                                     Rectangle {
-                                        width: 13
-                                        height: 13
-                                        radius: 7
+                                        width: Style.space(13)
+                                        height: Style.space(13)
+                                        radius: width / 2
                                         color: "transparent"
                                         border.color: app.colors.foreground
                                         border.width: 1
-                                        y: 1
+                                        y: Style.space(1)
                                     }
                                     Rectangle {
-                                        width: 7
+                                        width: Style.space(7)
                                         height: 1
                                         rotation: 45
                                         color: app.colors.foreground
-                                        x: 11
-                                        y: 15
+                                        x: Style.space(11)
+                                        y: Style.space(15)
                                     }
                                 }
                                 SearchText {
@@ -391,7 +409,7 @@ Item {
                                 }
                                 SearchButton {
                                     text: "⚙"
-                                    font.pixelSize: 19
+                                    font.pixelSize: SearchTheme.font.icon
                                     Accessible.name: "Settings"
                                     visible: app.page !== "settings"
                                     colors: app.colors
@@ -422,8 +440,8 @@ Item {
                     ColumnLayout {
                         // Reveal a settled layout through the growing viewport;
                         // resizing its images/text every frame makes expansion uneven.
-                        width: Math.max(0, window.targetWidth - 2)
-                        height: Math.max(0, window.targetHeight - 56 - hotkeysFooter.implicitHeight)
+                        width: Math.max(0, window.targetWidth - canvas.leftInset - canvas.rightInset)
+                        height: Math.max(0, window.targetHeight - window.compactHeight)
                         spacing: 0
                         Rectangle {
                             Layout.fillWidth: true
@@ -602,31 +620,17 @@ Item {
                             spacing: 0
                             RowLayout {
                                 Layout.fillWidth: true
-                                Layout.leftMargin: Style.space(16)
-                                Layout.rightMargin: Style.space(12)
-                                implicitHeight: Style.space(36)
-                                SearchText {
-                                    Layout.fillWidth: true
-                                    text: app.loading ? app.loadingMessage : (app.activeQuery.length ? "Top " + app.results.count + " results" : app.results.count + " / " + app.total + " segments")
-                                    color: app.secondaryText
-                                }
-                            }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                Layout.leftMargin: Style.space(16)
-                                Layout.rightMargin: Style.space(12)
-                                Layout.bottomMargin: Style.space(8)
-                                spacing: Style.space(8)
+                                // Continue the results/preview divider through the filter row.
+                                spacing: 1
                                 SearchChoice {
                                     objectName: "mediaKindFilter"
-                                    Accessible.name: "Media type"
+                                    Accessible.name: "File type"
                                     colors: app.colors
-                                    Layout.fillWidth: true
-                                    Layout.preferredWidth: 140
+                                    Layout.fillWidth: !previewPane.visible
+                                    Layout.preferredWidth: previewPane.visible ? resultsList.width : 1
                                     Layout.minimumWidth: 100
-                                    implicitHeight: Style.space(28)
                                     model: [
-                                        { id: null, label: "All media" },
+                                        { id: null, label: "All file types" },
                                         { id: "image", label: "Images" },
                                         { id: "text", label: "Text" },
                                         { id: "audio", label: "Audio" },
@@ -646,9 +650,8 @@ Item {
                                     Accessible.name: "Folder"
                                     colors: app.colors
                                     Layout.fillWidth: true
-                                    Layout.preferredWidth: 230
+                                    Layout.preferredWidth: 1
                                     Layout.minimumWidth: 100
-                                    implicitHeight: Style.space(28)
                                     model: [
                                         {
                                             id: null,
@@ -666,6 +669,32 @@ Item {
                                         queryTimer.stop();
                                         app.setSourceId(currentValue);
                                     }
+                                }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.leftMargin: Style.space(16)
+                                Layout.rightMargin: Style.space(16)
+                                Layout.topMargin: Style.space(10)
+                                Layout.bottomMargin: Style.space(10)
+                                spacing: Style.space(12)
+                                SearchText {
+                                    id: resultsSummary
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    text: app.loading ? app.loadingMessage
+                                        : app.results.count === 0 ? "No results"
+                                        : !app.activeQuery.length && app.results.count < app.total ? "Showing " + app.results.count + " of " + app.total + " results"
+                                        : app.results.count + (app.results.count === 1 ? " result" : " results")
+                                    color: app.secondaryText
+                                    font.pixelSize: SearchTheme.font.bodySmall
+                                    elide: Text.ElideRight
+                                }
+                                SearchText {
+                                    visible: !app.loading && app.activeQuery.length > 0 && app.results.count > 0
+                                    text: "Best matches first"
+                                    color: app.secondaryText
+                                    font.pixelSize: SearchTheme.font.bodySmall
                                 }
                             }
                             Rectangle {
@@ -815,7 +844,7 @@ Item {
                                         Layout.fillHeight: true
                                         Layout.preferredWidth: window.targetWidth * 0.58
                                         Layout.minimumWidth: 0
-                                        Layout.margins: 16
+                                        Layout.margins: Style.space(16)
                                         spacing: Style.space(10)
                                         Item {
                                             Layout.fillWidth: true
@@ -954,17 +983,18 @@ Item {
                         Layout.fillWidth: true
                         Layout.leftMargin: Style.space(10)
                         Layout.rightMargin: Style.space(10)
-                        Layout.topMargin: Style.space(6)
-                        Layout.bottomMargin: Style.space(6)
-                        implicitHeight: hotkeysFlow.implicitHeight
+                        implicitHeight: hotkeysFlow.implicitHeight + 2 * Style.space(8)
                         Flow {
                             id: hotkeysFlow
-                            width: Math.max(0, window.targetWidth - 22)
+                            y: Style.space(8)
+                            width: Math.max(0, window.targetWidth - canvas.leftInset - canvas.rightInset - 2 * Style.space(10))
                             spacing: Style.space(8)
                             Row {
                                 visible: app.page === "results"
-                                height: 26
-                                spacing: Style.space(6)
+                                height: searchFooterButton.implicitHeight
+                                spacing: Style.space(7)
+                                leftPadding: Style.space(7)
+                                rightPadding: Style.space(7)
                                 ShortcutKey {
                                     anchors.verticalCenter: parent.verticalCenter
                                     text: "↑ ↓"
@@ -974,10 +1004,11 @@ Item {
                                     text: "Navigate"
                                     color: app.secondaryText
                                     font.pixelSize: SearchTheme.font.bodySmall
-                                    height: 26
+                                    height: parent.height
                                 }
                             }
                             FooterButton {
+                                id: searchFooterButton
                                 visible: app.page !== "settings"
                                 text: app.page === "results" ? "Open" : "Search"
                                 shortcut: "Enter"

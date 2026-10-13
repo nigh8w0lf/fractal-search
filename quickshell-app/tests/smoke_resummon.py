@@ -23,6 +23,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('binary', type=Path)
     parser.add_argument('models', type=Path)
+    parser.add_argument('--ui-dir', type=Path, default=Path(__file__).resolve().parents[1] / 'ui',
+                        help='UI source to validate with the matching backend')
+    parser.add_argument('--chrome-only', action='store_true', help='Check panel geometry and actions without inference')
+    parser.add_argument('--display-scale', type=float, choices=[1, 1.25], default=1)
     args = parser.parse_args()
     for command in ['Hyprland', 'hyprctl', 'quickshell', 'imv', 'grim', 'dbus-daemon', 'ffmpeg', 'ffprobe']:
         assert shutil.which(command), f'Missing test dependency: {command}'
@@ -33,7 +37,7 @@ def main():
     config = root / 'hyprland.lua'
     config.write_text('''hl.monitor({output="", mode="1280x900@60", position="auto", scale=1})
 hl.config({input={follow_mouse=0},animations={enabled=false},misc={disable_hyprland_logo=true,disable_splash_rendering=true}})
-''')
+'''.replace('scale=1}', 'scale=' + str(args.display_scale) + '}'))
     env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime),
                QT_QPA_PLATFORM='wayland', QT_QUICK_CONTROLS_STYLE='Basic', QT_QPA_PLATFORMTHEME='gtk3',
                FRACTAL_SEARCH_UI_TEST='1', FRACTAL_RESUMMON_ROOT=str(root))
@@ -84,6 +88,25 @@ hl.config({input={follow_mouse=0},animations={enabled=false},misc={disable_hyprl
                 break
             assert time.monotonic() < deadline, 'Nested compositor has no configured output'
             time.sleep(.05)
+        # A nested Wayland output follows its host window size. Move the private
+        # test session to a fixed headless output before starting Qt, so desktop
+        # tiling cannot crop captures or invalidate click coordinates mid-test.
+        nested_outputs = [monitor['name'] for monitor in monitors]
+        subprocess.run(['hyprctl', 'output', 'create', 'headless', 'fractal-test'],
+                       env=env, check=True, capture_output=True, timeout=5)
+        for output in nested_outputs:
+            subprocess.run(['hyprctl', 'output', 'remove', output],
+                           env=env, check=True, capture_output=True, timeout=5)
+        deadline = time.monotonic() + 10
+        while True:
+            probe = subprocess.run(['hyprctl', '-j', 'monitors'], env=env,
+                                   capture_output=True, text=True, check=True, timeout=3)
+            monitors = json.loads(probe.stdout)
+            if len(monitors) == 1 and monitors[0]['name'] == 'fractal-test' and monitors[0]['width'] == 1280 and monitors[0]['height'] == 900 and abs(monitors[0]['scale'] - args.display_scale) < .001:
+                break
+            assert time.monotonic() < deadline, monitors
+            time.sleep(.05)
+        (root / 'monitors.json').write_text(json.dumps(monitors))
         # Activated desktop services must inherit the private compositor too.
         bus = subprocess.Popen(['dbus-daemon', '--session', '--nofork', '--print-address'],
                                env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -133,8 +156,9 @@ while not (root / 'restart.complete').exists():
         env['FRACTAL_SEARCH_SOCKET'] = str(socket)
         env['FRACTAL_SEARCH_BINARY'] = str(args.binary.resolve())
         ui = root / 'ui'
-        shutil.copytree(Path(__file__).resolve().parents[1] / 'ui', ui)
+        shutil.copytree(args.ui_dir.resolve(), ui)
         (ui / 'Commons').symlink_to('/usr/share/omarchy/shell/Commons', target_is_directory=True)
+        (ui / 'Ui').symlink_to('/usr/share/omarchy/shell/Ui', target_is_directory=True)
         # Test-only controls dispatch input exclusively to this private window.
         settings_source = ui / 'SettingsPage.qml'
         settings_source.write_text(settings_source.read_text().replace('id: page', 'id: page; property alias testScroll: settingsScroll').replace('text: modelData', 'objectName: modelData; text: modelData').replace('text: "Keep folders up to date"', 'objectName: "watchChangesToggle"; text: "Keep folders up to date"'))
@@ -160,10 +184,39 @@ while not (root / 'restart.complete').exists():
             return app.loading;
         }
         function refreshDiagnostics()'''))
+        panel_source.write_text(panel_source.read_text().replace('function refreshDiagnostics()', '''function uiScale(value: real): void { Style.spacingScale = value; }
+        function footerAction(index: int): void { input.mouseClick(hotkeysFlow.children[index]); }
+        function filterGeometry(): string {
+            const kind = input.findChild(canvas, "mediaKindFilter");
+            const folder = input.findChild(canvas, "sourceFilter");
+            return JSON.stringify({
+                typeLabel: kind.displayText, summary: resultsSummary.text,
+                typeY: kind.mapToItem(canvas, 0, 0).y, folderY: folder.mapToItem(canvas, 0, 0).y,
+                typeWidth: kind.width, folderWidth: folder.width,
+                typeX: kind.mapToItem(canvas, 0, 0).x, folderX: folder.mapToItem(canvas, 0, 0).x,
+                previewVisible: previewPane.visible, padding: Style.space(16),
+                listX: resultsList.mapToItem(canvas, 0, 0).x, listWidth: resultsList.width,
+                previewX: previewPane.mapToItem(canvas, 0, 0).x, previewWidth: previewPane.width,
+                typeHeight: kind.height, folderHeight: folder.height,
+                summaryY: resultsSummary.mapToItem(canvas, 0, 0).y
+            });
+        }
+        function chromeGeometry(): string {
+            return JSON.stringify({
+                panelX: canvas.x, panelY: canvas.y, panelWidth: canvas.width,
+                panelHeight: canvas.height, footerY: hotkeysFooter.y,
+                footerHeight: hotkeysFooter.height, bottomInset: canvas.bottomInset,
+                controls: Array.from(hotkeysFlow.children).filter(item => item.visible).map(item => {
+                    const point = item.mapToItem(canvas, 0, 0);
+                    return {x: point.x, y: point.y, width: item.width, height: item.height};
+                })
+            });
+        }
+        function refreshDiagnostics()'''))
         # An opaque desktop window exercises remapping above another app.
         shell = ui / 'shell.qml'
         shell.write_text(shell.read_text().replace('ShellRoot {', '''ShellRoot {
-    FloatingWindow { visible: true; title: "Fractal test backdrop"; color: "#172030"; implicitWidth: 1280; implicitHeight: 900 }
+    FloatingWindow { visible: true; title: "Fractal test backdrop"; color: "#f4e9d8"; implicitWidth: 1280; implicitHeight: 900 }
 '''))
         commands = root / 'commands'; commands.mkdir()
         opener = commands / 'gio'
@@ -209,8 +262,57 @@ with (root / 'viewer.log').open('a') as log:
             assert time.monotonic() < deadline, (root / 'ui.log').read_text()
             time.sleep(.05)
         wait(lambda s: s['ready'] and not s['loading'] and s['panelVisible'])
-        call('test', 'browse')
+        for scale in [1, 1.5]:
+            call('test', 'uiScale', str(scale))
+            time.sleep(.4)
+            state = wait(lambda s: not s['animating'] and s['panelHeight'] == s['compactHeight'])
+            chrome = json.loads(call('test', 'chromeGeometry'))
+            for control in chrome['controls']:
+                assert control['y'] >= chrome['footerY'], chrome
+                assert control['y'] + control['height'] < chrome['panelHeight'] - chrome['bottomInset'], chrome
+                assert control['x'] >= 0 and control['x'] + control['width'] < state['panelWidth'], chrome
+            (root / f'compact-{scale}.json').write_text(json.dumps(chrome))
+            subprocess.run(['grim', str(root / f'compact-{scale}.png')], env=env, check=True, timeout=5)
+        call('test', 'uiScale', '1')
+        call('test', 'footerAction', '2')  # Click Settings hint.
+        wait(lambda s: s['page'] == 'settings')
+        call('test', 'footerAction', '3')  # Click Back hint.
+        wait(lambda s: s['page'] == 'summon')
+        call('test', 'footerAction', '1')  # Click Search hint on the empty catalog.
         wait(lambda s: s['page'] == 'results' and not s['loading'] and s['count'] == 0)
+        time.sleep(.3)
+        subprocess.run(['grim', str(root / 'empty.png')], env=env, check=True, timeout=5)
+
+        def check_filters(summary, label):
+            geometry = json.loads(call('test', 'filterGeometry'))
+            assert geometry['typeLabel'] == label and geometry['summary'] == summary, geometry
+            assert geometry['typeY'] == geometry['folderY'], geometry
+            assert geometry['typeHeight'] == geometry['folderHeight'], geometry
+            if geometry['previewVisible']:
+                assert abs(geometry['typeX'] - geometry['listX']) <= 1, geometry
+                assert abs(geometry['typeWidth'] - geometry['listWidth']) <= 1, geometry
+                assert abs(geometry['folderX'] - geometry['previewX'] + geometry['padding']) <= 1, geometry
+                assert abs(geometry['folderWidth'] - geometry['previewWidth'] - 2 * geometry['padding']) <= 1, geometry
+            else:
+                assert abs(geometry['typeWidth'] - geometry['folderWidth']) <= 1, geometry
+            assert geometry['summaryY'] > geometry['typeY'] + geometry['typeHeight'], geometry
+
+        check_filters('No results', 'All file types')
+        if args.chrome_only:
+            call('test', 'settings')
+            wait(lambda s: s['page'] == 'settings' and not s['animating'])
+            call('test', 'resize', '480', '440')
+            time.sleep(.4)
+            subprocess.run(['grim', str(root / 'chrome-narrow.png')], env=env, check=True, timeout=5)
+            call('test', 'back')
+            call('search', 'toggle')
+            call('search', 'summon')
+            wait(lambda s: s['visible'] and s['panelVisible'] and s['active'])
+            call('search', 'close')
+            assert panel.wait(timeout=20) == 0
+            assert backend.wait(timeout=20) == 0
+            print(f'Panel chrome passed on a light backdrop at display scale {args.display_scale}: compact/scaled spacing, footer clicks, empty results, narrow settings and resummon.', flush=True)
+            return
         photos = root / 'photos'; photos.mkdir()
         png(photos / 'red.png', color=(200, 40, 20))
         png(photos / 'blue.png', color=(20, 40, 200))
@@ -225,6 +327,7 @@ with (root / 'viewer.log').open('a') as log:
         call('test', 'acknowledge')
         time.sleep(.3)
         subprocess.run(['grim', str(root / 'results.png')], env=env, check=True, timeout=5)
+        check_filters('2 results', 'All file types')
         selected = json.loads(call('test', 'state'))['selectedAsset']
         call('test', 'clickReveal')
         deadline = time.monotonic() + 5
@@ -361,6 +464,7 @@ with (root / 'viewer.log').open('a') as log:
         assert hybrid['selectedAsset']['hasHybridScore'], hybrid
         call('test', 'resize', '480', '440')
         time.sleep(.3)
+        check_filters('1 result', 'Text')
         subprocess.run(['grim', str(root / 'narrow-hybrid-text.png')], env=env, check=True, timeout=5)
         call('test', 'chooseFilter', 'mediaKindFilter', '0')
         call('test', 'chooseFilter', 'sourceFilter', '0')
