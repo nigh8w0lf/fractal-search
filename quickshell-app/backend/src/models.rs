@@ -164,12 +164,12 @@ mod tests {
     #[test]
     fn nested_model_assets_have_distinct_partial_paths() {
         let root = Path::new("/tmp/fractal-model-test");
-        let (model, partial) = asset_paths(root, "onnx/model.onnx").unwrap();
-        let (data, data_partial) = asset_paths(root, "onnx/model.onnx_data").unwrap();
-        assert_eq!(model, root.join("onnx/model.onnx"));
-        assert_eq!(data, root.join("onnx/model.onnx_data"));
+        let (model, partial) = asset_paths(root, "onnx/model_fp16.onnx").unwrap();
+        let (data, data_partial) = asset_paths(root, "onnx/model_fp16.onnx_data").unwrap();
+        assert_eq!(model, root.join("onnx/model_fp16.onnx"));
+        assert_eq!(data, root.join("onnx/model_fp16.onnx_data"));
         assert_ne!(partial, data_partial);
-        assert_eq!(partial, root.join("onnx/model.onnx.part"));
+        assert_eq!(partial, root.join("onnx/model_fp16.onnx.part"));
         for path in ["", "/absolute", "../escape", "onnx/../escape"] {
             assert!(asset_paths(root, path).is_err());
         }
@@ -188,7 +188,7 @@ mod tests {
         assert_eq!(manifest.files.len(), 11);
         assert_eq!(
             manifest.files.iter().map(|file| file.bytes).sum::<u64>(),
-            2_960_874_003
+            1_497_222_022
         );
         let paths: std::collections::BTreeSet<_> = manifest
             .files
@@ -197,12 +197,12 @@ mod tests {
             .collect();
         assert_eq!(paths.len(), manifest.files.len());
         for path in [
-            "onnx/model.onnx",
-            "onnx/model.onnx_data",
-            "onnx/vision_encoder.onnx",
-            "onnx/vision_encoder.onnx_data",
-            "onnx/audio_encoder.onnx",
-            "onnx/audio_encoder.onnx_data",
+            "onnx/model_fp16.onnx",
+            "onnx/model_fp16.onnx_data",
+            "onnx/vision_encoder_fp16.onnx",
+            "onnx/vision_encoder_fp16.onnx_data",
+            "onnx/audio_encoder_fp16.onnx",
+            "onnx/audio_encoder_fp16.onnx_data",
             "tokenizer.json",
             "preprocessor_config.json",
         ] {

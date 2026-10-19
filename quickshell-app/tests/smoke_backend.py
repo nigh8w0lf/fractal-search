@@ -163,7 +163,7 @@ def main():
         try:
             ready = service.until(lambda item: item.get("event") == "ready")["payload"]
             assert ready["catalog"]["assetCount"] == 0 and ready["modelLoaded"] is False
-            assert ready["catalog"]["modelProfile"] == "embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2"
+            assert ready["catalog"]["modelProfile"] == "embeddinggemma2-daa72c51-fp16-multimodal-mrl512-v3"
             assert ready["textModelLoaded"] is False
             preferences = {"topMatches": 6, "resultLayout": "listPreview", "watchChanges": False, "closeAfterOpening": True, "imageBatchSize": 1}
             assert ready["settings"] == preferences
@@ -182,7 +182,7 @@ def main():
                 lambda item: item.get("id") is None and item.get("ok") is False
             )
             assert "unknown field" in rejection["error"]
-            # Model warmup plus several FP32 image embeddings is a long-running
+            # Model warmup plus several image embeddings is a long-running
             # operation on CPU, unlike the metadata calls' 60-second deadline.
             index_id = service.send({"type": "index", "directory": photos.as_uri()})
             service.until(lambda item: item.get("id") == index_id and "ok" in item, timeout=300)

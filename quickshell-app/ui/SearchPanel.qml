@@ -465,7 +465,7 @@ Item {
                                 SearchText {
                                     Layout.fillWidth: true
                                     Layout.minimumWidth: 0
-                                    text: !app.ready ? app.serviceStarting ? app.loadingMessage : "Search service unavailable" : "Set up the search model (~2.96 GB). Existing files are reused."
+                                    text: !app.ready ? app.serviceStarting ? app.loadingMessage : "Search service unavailable" : "Set up the search model (~1.50 GB). Existing files are reused."
                                     color: app.secondaryText
                                     wrapMode: Text.WordWrap
                                 }
@@ -846,7 +846,16 @@ Item {
                                         Layout.minimumWidth: 0
                                         Layout.margins: Style.space(16)
                                         spacing: Style.space(10)
+                                        MediaPreview {
+                                            id: mediaPreview
+                                            Layout.fillWidth: true
+                                            Layout.fillHeight: true
+                                            app: app
+                                            visible: !!app.selectedAsset && (app.selectedAsset.mediaKind === "video" || app.selectedAsset.mediaKind === "audio")
+                                            active: visible && previewPane.visible && window.visible && app.page === "results" && app.ready && !app.closing
+                                        }
                                         Item {
+                                            visible: !mediaPreview.visible
                                             Layout.fillWidth: true
                                             Layout.fillHeight: true
                                             Image {

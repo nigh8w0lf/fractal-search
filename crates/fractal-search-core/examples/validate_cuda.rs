@@ -53,15 +53,30 @@ fn measure(
         .collect();
     let audio = vec![runtime.embed_audio(&samples)?];
     let video = vec![runtime.embed_video(images)?];
+    // Changed shapes/modalities exercise fresh allocations and buffer reuse.
+    // Finiteness alone is insufficient: a corrupted first call can also return
+    // a normalized but different vector. Compare repeats with the first calls.
+    compare(
+        &image_vectors[images.len()..],
+        &runtime.embed_images(images)?,
+    )
+    .context("Image batch changed after audio/video inference")?;
+    compare(&audio, &[runtime.embed_audio(&samples)?])
+        .context("Audio changed after video inference")?;
+    compare(&video, &[runtime.embed_video(images)?]).context("Repeated video inference changed")?;
     let mut image_times = Vec::new();
     let mut text_times = Vec::new();
     for _ in 0..5 {
         let start = Instant::now();
-        runtime.embed_image(&images[0])?;
+        let repeated_image = runtime.embed_image(&images[0])?;
         image_times.push(start.elapsed().as_secs_f64() * 1000.0);
+        compare(&image_vectors[..1], &[repeated_image])
+            .context("Warmed image differs from first inference")?;
         let start = Instant::now();
-        runtime.embed_text(queries[0])?;
+        let repeated_text = runtime.embed_text(queries[0])?;
         text_times.push(start.elapsed().as_secs_f64() * 1000.0);
+        compare(&text[..1], &[repeated_text])
+            .context("Warmed query differs from first inference")?;
     }
     let profiles = runtime.finish_profiling()?;
     Ok(Measurements {
@@ -77,7 +92,7 @@ fn measure(
 }
 
 fn compare(cpu: &[Vec<f32>], cuda: &[Vec<f32>]) -> Result<Value> {
-    ensure!(cpu.len() == cuda.len(), "Provider output counts differ");
+    ensure!(cpu.len() == cuda.len(), "Embedding output counts differ");
     let mut cosines = Vec::new();
     let mut maximum_error = 0.0_f64;
     for (a, b) in cpu.iter().zip(cuda) {
@@ -100,7 +115,10 @@ fn compare(cpu: &[Vec<f32>], cuda: &[Vec<f32>]) -> Result<Value> {
             "Embedding is not normalized"
         );
         let cosine = dot / (norm_a * norm_b);
-        ensure!(cosine >= 0.9999, "CPU/CUDA cosine {cosine} is below 0.9999");
+        ensure!(
+            cosine >= 0.9999,
+            "Embedding cosine {cosine} is below 0.9999"
+        );
         cosines.push(cosine);
         for (a, b) in a.iter().zip(b) {
             maximum_error = maximum_error.max((f64::from(*a) - f64::from(*b)).abs());

@@ -8,34 +8,34 @@
       "sha256": "8d011bfe08b5e345bbe0b81e5c6fd02c381920b345b986047bc2a33ce7b90d1d"
     },
     {
-      "path": "onnx/audio_encoder.onnx",
-      "bytes": 204577,
-      "sha256": "e0a62590c49949fe0b1410f5dc52c92a185abb4c4e69e2c50a4e316103fdbc09"
+      "path": "onnx/audio_encoder_fp16.onnx",
+      "bytes": 211381,
+      "sha256": "06237e04855d57053c3880f70f2575016dec1b1ce22f262fa76c6bd010616799"
     },
     {
-      "path": "onnx/audio_encoder.onnx_data",
-      "bytes": 1172750848,
-      "sha256": "6943b910d1d1e9b5dffd4ccad63f61aa308ad10b70ed128bb61886b119da1e3a"
+      "path": "onnx/audio_encoder_fp16.onnx_data",
+      "bytes": 586694912,
+      "sha256": "3a9417444f3cb7bb868525b66859cc1d4b7a00128ea0b111f7aee2843739cd3b"
     },
     {
-      "path": "onnx/model.onnx",
-      "bytes": 421421,
-      "sha256": "bc47de15f81208a5c99e5ab10f746d5e33b51ea228b7dc0bef9c133a94f1c1c3"
+      "path": "onnx/model_fp16.onnx",
+      "bytes": 425780,
+      "sha256": "a49e227d7e0e5f4ee606d79879d084264366367bc6318f344ab179e35d4fd6a4"
     },
     {
-      "path": "onnx/model.onnx_data",
-      "bytes": 1084170240,
-      "sha256": "9fd452bfc6916e5a92f080f8dada35598ca4512b21c65897d4c5974d5f9630a2"
+      "path": "onnx/model_fp16.onnx_data",
+      "bytes": 542085120,
+      "sha256": "b9dbe09415d77c8686ba6e216a244086f4ada1608238c13f2bfaa587ba627207"
     },
     {
-      "path": "onnx/vision_encoder.onnx",
-      "bytes": 121253,
-      "sha256": "a3fb44f8b5b152cfee6afe16e2cd69e774b7e1d3b822d1db1190ddf7b08b575e"
+      "path": "onnx/vision_encoder_fp16.onnx",
+      "bytes": 112253,
+      "sha256": "3e2b6d5648a3ae61b572cc3ec0a23b13ebfda3b63e3c9c343c593636392a879c"
     },
     {
-      "path": "onnx/vision_encoder.onnx_data",
-      "bytes": 671026176,
-      "sha256": "ca8d28c99feb8129618f141978a27adae25090e0dadb68a30c235e191c01e37e"
+      "path": "onnx/vision_encoder_fp16.onnx_data",
+      "bytes": 335513088,
+      "sha256": "9f374070808b8b96252f7d04c9c4eae34df60283473fde5a3fbf4d9205495e19"
     },
     {
       "path": "preprocessor_config.json",

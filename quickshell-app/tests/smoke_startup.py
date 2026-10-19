@@ -42,7 +42,7 @@ def main():
                     result = client.until(lambda m: events.append(m) is None and m.get('id')==2 and 'ok' in m)
                     assert result['ok'] and result['result']['total']==0, result
                     assert not any(m.get('event')=='searchProgress' and m['payload']['stage']=='starting' for m in events), events
-                    assert 'Loaded onnx/vision_encoder.onnx' not in (case/'daemon.log').read_text()
+                    assert 'Loaded onnx/vision_encoder_fp16.onnx' not in (case/'daemon.log').read_text()
                 elif name == 'missing':
                     assert not result['modelsPresent'] and not result['textModelWarming'] and not result['textModelLoaded'], result
                     assert not cache.exists(), 'Startup created/downloaded models'

@@ -3,12 +3,14 @@
   "id": "fractal.search",
   "name": "Fractal Search",
   "version": "0.1.0",
+  "author": "nigh8w0lf (Ashwin Cheekati)",
+  "license": "MIT",
   "description": "Local semantic image, text, audio and video search with a bundled native EmbeddingGemma 2 backend",
   "kinds": [
     "panel"
   ],
   "keepLoaded": true,
   "entryPoints": {
-    "panel": "ui/SearchPanel.qml"
+    "panel": "quickshell-app/ui/SearchPanel.qml"
   }
 }

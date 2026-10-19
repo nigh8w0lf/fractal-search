@@ -78,12 +78,22 @@ class EmbeddingContractTests(unittest.TestCase):
         validate_fixture_environment(native, native=True)
         with self.assertRaises(ValueError):
             validate_fixture_environment(native)
-        # Pre-mode fixture metadata is accepted only with explicit native mode.
-        validate_fixture_environment({}, native=True)
+        # Unversioned references may contain FP32 outputs, even in native mode.
+        with self.assertRaises(ValueError):
+            validate_fixture_environment({}, native=True)
         with self.assertRaises(ValueError):
             validate_fixture_environment({})
         with self.assertRaises(ValueError):
             validate_fixture_environment({"embedding_dimension": 512}, native=True)
+
+    def test_fp32_references_are_rejected_in_both_modes(self):
+        for native, profile in [(False, "embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2"),
+                                (True, "embeddinggemma2-daa72c51-fp32-multimodal-v1")]:
+            env = {"output_mode": "native" if native else "indexed",
+                   "embedding_dimension": 768 if native else 512,
+                   "native_embedding_dimension": 768, "model_profile": profile}
+            with self.assertRaisesRegex(ValueError, "model_profile"):
+                validate_fixture_environment(env, native=native)
 
 
 if __name__ == "__main__":

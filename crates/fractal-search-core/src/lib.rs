@@ -10,14 +10,14 @@ pub mod preprocess;
 #[cfg(feature = "runtime")]
 pub mod runtime;
 
-/// Native pinned graph output, retained unchanged for upstream parity.
+/// Native pinned FP16 graph output width, retained for upstream parity.
 pub const NATIVE_EMBEDDING_DIM: usize = 768;
 /// Default indexed/query Matryoshka dimension. Not a user-selectable profile.
 pub const EMBEDDING_DIM: usize = 512;
 pub const MAX_IMAGE_BATCH_SIZE: usize = 8;
-pub const NATIVE_MODEL_PROFILE: &str = "embeddinggemma2-daa72c51-fp32-multimodal-v1";
+pub const NATIVE_MODEL_PROFILE: &str = "embeddinggemma2-daa72c51-fp16-multimodal-v2";
 /// Catalog and derived-cache identity includes the leading-dimension projection.
-pub const MODEL_PROFILE: &str = "embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2";
+pub const MODEL_PROFILE: &str = "embeddinggemma2-daa72c51-fp16-multimodal-mrl512-v3";
 pub const EMBEDDING_PROJECTION: &str = "native768-leading512-l2-v1";
 /// A path-free compatibility error that the read-only agent may safely expose.
 #[cfg(feature = "catalog")]
@@ -26,7 +26,7 @@ pub(crate) struct CatalogContractMismatch;
 #[cfg(feature = "catalog")]
 impl std::fmt::Display for CatalogContractMismatch {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Incompatible catalog schema, model profile or embedding contract: this build requires 512-dimensional Matryoshka vectors; preserve this catalog, use a fresh data directory and reindex in Fractal Search")
+        formatter.write_str("Incompatible catalog schema, model profile or embedding contract: this build requires FP16-model 512-dimensional Matryoshka vectors; preserve this catalog, use a fresh data directory and reindex in Fractal Search")
     }
 }
 #[cfg(feature = "catalog")]
@@ -48,6 +48,40 @@ pub enum TextSearchMode {
 /// Every modality and query returns one finite, unit-length EMBEDDING_DIM vector.
 /// Native full-width reference outputs are never part of this storage contract.
 pub trait Embedder {
+    /// Explicit native tensor preparation capability; custom embedders retain
+    /// their raw-input contract. Unsupported prepared calls fail, never retry.
+    fn uses_prepared_inputs(&self) -> bool {
+        false
+    }
+    fn preparation_tokenizer(
+        &mut self,
+    ) -> anyhow::Result<std::sync::Arc<preprocess::QueryTokenizer>> {
+        anyhow::bail!("This embedder does not expose a preparation tokenizer")
+    }
+    fn embed_prepared_images(
+        &mut self,
+        _inputs: preprocess::ImageInputs,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::bail!("Prepared image inference is not implemented")
+    }
+    fn embed_prepared_audio(
+        &mut self,
+        _inputs: preprocess::AudioInputs,
+    ) -> anyhow::Result<Vec<f32>> {
+        anyhow::bail!("Prepared audio inference is not implemented")
+    }
+    fn embed_prepared_video(
+        &mut self,
+        _inputs: Vec<preprocess::ImageInputs>,
+    ) -> anyhow::Result<Vec<f32>> {
+        anyhow::bail!("Prepared video inference is not implemented")
+    }
+    fn embed_prepared_document(
+        &mut self,
+        _inputs: preprocess::TextInputs,
+    ) -> anyhow::Result<Vec<f32>> {
+        anyhow::bail!("Prepared document inference is not implemented")
+    }
     /// A verified implementation identity. None disables persistent vector reuse.
     fn embedding_profile(&self) -> Option<String> {
         None
@@ -79,3 +113,6 @@ pub fn initialize_image_decoders() {
 mod index_state;
 #[cfg(feature = "catalog")]
 mod store;
+
+#[cfg(feature = "catalog")]
+mod preparation_pool;

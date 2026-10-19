@@ -19,7 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
-ort = { version = "=2.0.0-rc.10", optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-24"], optional = true }
 lancedb = { version = "=0.37.1", default-features = false, optional = true }
 arrow-array = { version = "58", optional = true }
 arrow-schema = { version = "58", optional = true }

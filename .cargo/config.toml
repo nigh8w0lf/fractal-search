@@ -1,0 +1,4 @@
+[env]
+# The packaged provider and dependency diagnostics target CUDA 12 explicitly.
+# CPU-only builds do not enable or link the CUDA provider.
+ORT_CUDA_VERSION = "12"

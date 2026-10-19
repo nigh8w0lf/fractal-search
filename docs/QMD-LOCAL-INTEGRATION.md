@@ -1,5 +1,7 @@
 # QMD and 512D local source integration
 
+This report describes the earlier FP32 integration. The current FP16 contract and validation are documented in [FP16 validation](FP16-VALIDATION.md); historical measurements below are preserved.
+
 Integrated on 2026-10-12 in `integrate/qmd-512-20261012`. This is a source integration only: no binaries were built, no tests or inference ran, no installation or service restart occurred, and no user catalog/model cache was changed.
 
 ## Source ancestry and recovery

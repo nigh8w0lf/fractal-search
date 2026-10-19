@@ -1,5 +1,7 @@
 # Default 512-dimensional embedding validation
 
+This report describes the earlier FP32 integration. The current FP16 contract and validation are documented in [FP16 validation](FP16-VALIDATION.md); historical measurements below are preserved.
+
 Validated 2026-10-08 against source tree `ae6736c0589a188d9c9e654f09c7c1797d631cb0`, published as implementation commit `6548728de6c53ecb2a405da7b1eb8b7c8aba797e` (local verification commit `ce26a9ae6eeddbce972f812228d6bdc998079c90`), based on QMD checkpoint `cf09d084ffd07bdd81fb8b4f79b91b5eab7427e9`. This is the default indexed/query contract; native full-width APIs exist only for reference validation. No user dimension selector, migration, installation or catalog deletion was performed.
 
 ## Contract

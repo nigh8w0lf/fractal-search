@@ -55,6 +55,7 @@ SEARCH_MCP_LINKS=$(ldd "$SEARCH_BUNDLE/bin/fractal-search-mcp")
 [[ $SEARCH_MCP_LINKS != *'not found'* ]] || { echo "$SEARCH_MCP_LINKS" >&2; echo 'The MCP server has missing runtime dependencies' >&2; exit 1; }
 if ((!SEARCH_SKIP_SHELL)); then
   command -v omarchy >/dev/null && command -v omarchy-shell >/dev/null || { echo 'Omarchy Shell is required' >&2; exit 1; }
+  [[ -r /usr/lib/qt6/qml/QtMultimedia/qmldir ]] || { echo "Qt Multimedia is required for audio/video previews. Install with: omarchy pkg add qt6-multimedia qt6-multimedia-ffmpeg" >&2; exit 1; }
   omarchy plugin validate "$SEARCH_BUNDLE"
   omarchy-shell shell ping >/dev/null
 fi
@@ -134,19 +135,40 @@ SEARCH_OLD_BINDINGS="$SEARCH_STAGE/old-bindings"
 SEARCH_BINDING_APPLIED=0
 SEARCH_APPLIED=0
 SEARCH_DONE=0
+SEARCH_SERVICE_WAS_ACTIVE=0
+SEARCH_SERVICE_STOPPED=0
 cleanup() {
+  local SEARCH_EXIT=$?
+  local SEARCH_ROLLBACK_FAILED=0
+  # Attempt every rollback step and retain recovery files if any step fails.
+  set +e
   if ((SEARCH_APPLIED && !SEARCH_DONE)); then
     echo 'Install failed; restoring the previous plugin and service.' >&2
-    [[ ! -e $SEARCH_PLUGIN ]] || rm -rf -- "$SEARCH_PLUGIN"
-    [[ ! -e $SEARCH_OLD_PLUGIN ]] || mv -- "$SEARCH_OLD_PLUGIN" "$SEARCH_PLUGIN"
-    if [[ -e $SEARCH_OLD_UNIT ]]; then cp -- "$SEARCH_OLD_UNIT" "$SEARCH_UNIT"; else rm -f -- "$SEARCH_UNIT"; fi
-    if ((SEARCH_BINDING_APPLIED)); then
-      if [[ -e $SEARCH_OLD_BINDINGS ]]; then cp -p -- "$SEARCH_OLD_BINDINGS" "$SEARCH_BINDINGS"; else rm -f -- "$SEARCH_BINDINGS"; fi
-      if ((!SEARCH_SKIP_SHELL)); then hyprctl reload; fi
+    if ((!SEARCH_SKIP_SHELL)); then
+      systemctl --user stop fractal-search.service || SEARCH_ROLLBACK_FAILED=1
     fi
-    if ((!SEARCH_SKIP_SHELL)); then systemctl --user daemon-reload; omarchy-shell shell rescanPlugins; fi
+    if [[ -e $SEARCH_PLUGIN ]]; then rm -rf -- "$SEARCH_PLUGIN" || SEARCH_ROLLBACK_FAILED=1; fi
+    if [[ -e $SEARCH_OLD_PLUGIN ]]; then mv -- "$SEARCH_OLD_PLUGIN" "$SEARCH_PLUGIN" || SEARCH_ROLLBACK_FAILED=1; fi
+    if [[ -e $SEARCH_OLD_UNIT ]]; then cp -- "$SEARCH_OLD_UNIT" "$SEARCH_UNIT" || SEARCH_ROLLBACK_FAILED=1; else rm -f -- "$SEARCH_UNIT" || SEARCH_ROLLBACK_FAILED=1; fi
+    if ((SEARCH_BINDING_APPLIED)); then
+      if [[ -e $SEARCH_OLD_BINDINGS ]]; then cp -p -- "$SEARCH_OLD_BINDINGS" "$SEARCH_BINDINGS" || SEARCH_ROLLBACK_FAILED=1; else rm -f -- "$SEARCH_BINDINGS" || SEARCH_ROLLBACK_FAILED=1; fi
+      if ((!SEARCH_SKIP_SHELL)); then hyprctl reload || SEARCH_ROLLBACK_FAILED=1; fi
+    fi
+    if ((!SEARCH_SKIP_SHELL)); then
+      systemctl --user daemon-reload || SEARCH_ROLLBACK_FAILED=1
+      omarchy-shell shell rescanPlugins || SEARCH_ROLLBACK_FAILED=1
+    fi
   fi
-  rm -rf -- "$SEARCH_STAGE"
+  if ((!SEARCH_DONE && SEARCH_SERVICE_STOPPED && SEARCH_SERVICE_WAS_ACTIVE && !SEARCH_ROLLBACK_FAILED)); then
+    systemctl --user start fractal-search.service || SEARCH_ROLLBACK_FAILED=1
+  fi
+  if ((SEARCH_ROLLBACK_FAILED)); then
+    echo "Rollback incomplete; inspect the errors above. Recovery files retained at $SEARCH_STAGE" >&2
+    SEARCH_EXIT=1
+  else
+    rm -rf -- "$SEARCH_STAGE"
+  fi
+  exit "$SEARCH_EXIT"
 }
 trap cleanup EXIT
 mkdir -- "$SEARCH_STAGE/plugin"
@@ -230,12 +252,21 @@ WantedBy=graphical-session.target
 UNIT
 if [[ ! -e $SEARCH_DEST ]]; then
   mkdir -- "$SEARCH_DEST"
-  cp -a -- "$SEARCH_BUNDLE/bin" "$SEARCH_BUNDLE/uninstall.sh" "$SEARCH_BUNDLE/README.md" "$SEARCH_BUNDLE/MCP.md" "$SEARCH_BUNDLE/CUDA.md" "$SEARCH_BUNDLE/NOTICE" "$SEARCH_BUNDLE/LANCEDB-LICENSE" "$SEARCH_BUNDLE/bundle.json" "$SEARCH_DEST/"
+  cp -a -- "$SEARCH_BUNDLE/bin" "$SEARCH_BUNDLE/uninstall.sh" "$SEARCH_BUNDLE/README.md" "$SEARCH_BUNDLE/MCP.md" "$SEARCH_BUNDLE/CUDA.md" "$SEARCH_BUNDLE/LICENSE" "$SEARCH_BUNDLE/NOTICE" "$SEARCH_BUNDLE/LANCEDB-LICENSE" "$SEARCH_BUNDLE/bundle.json" "$SEARCH_DEST/"
 fi
 systemd-analyze --user verify "$SEARCH_STAGE/fractal-search.service" 2> "$SEARCH_STAGE/unit-errors" || { cat "$SEARCH_STAGE/unit-errors" >&2; exit 1; }
 if ((!SEARCH_SKIP_SHELL)); then
   # Stop finishes active inference and checkpoints before replacing the runtime.
-  if [[ -e $SEARCH_UNIT ]]; then systemctl --user stop fractal-search.service; fi
+  if [[ -e $SEARCH_UNIT ]]; then
+    SEARCH_SERVICE_STATE=$(systemctl --user show fractal-search.service --property=ActiveState --value)
+    case "$SEARCH_SERVICE_STATE" in
+      active|activating|reloading) SEARCH_SERVICE_WAS_ACTIVE=1 ;;
+      inactive|failed|deactivating) ;;
+      *) echo "Cannot determine previous service activity: $SEARCH_SERVICE_STATE" >&2; exit 1 ;;
+    esac
+    SEARCH_SERVICE_STOPPED=1
+    systemctl --user stop fractal-search.service
+  fi
   omarchy-shell shell hide fractal.search
 fi
 [[ ! -e $SEARCH_PLUGIN ]] || mv -- "$SEARCH_PLUGIN" "$SEARCH_OLD_PLUGIN"
@@ -271,6 +302,9 @@ if ((!SEARCH_SKIP_SHELL)); then
     sleep 0.2
   done
   ((SEARCH_STABLE >= 6)) || { echo "The installed panel did not load. Check quickshell log for Omarchy; rolling back." >&2; exit 1; }
+  if ((SEARCH_SERVICE_WAS_ACTIVE)); then
+    systemctl --user start fractal-search.service
+  fi
 fi
 SEARCH_DONE=1
 # Cleanup errors must not roll back a successfully installed plugin.

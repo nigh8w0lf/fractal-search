@@ -3,7 +3,9 @@
 Fractal Search supports native CUDA inference in its Omarchy Shell plugin backend
 and read-only MCP server.
 
-The current indexed/query profile is normalized 512D MRL: native 768D FP32 outputs are truncated to the leading 512 and L2-normalized on both providers. This does not reduce graph inference work or VRAM. Historical timings below are not measurements of this dimension change; see the [current model contract](../docs/MODELS.md).
+The Rust binding is pinned to `ort = 2.0.0-rc.12`, which bundles ONNX Runtime 1.24.2. Repository builds select CUDA 12 through `.cargo/config.toml`; packaging rejects an explicit incompatible `ORT_CUDA_VERSION`. CPU builds do not enable CUDA.
+
+The current indexed/query profile is normalized 512D MRL: native 768D float32 outputs from the pinned FP16 graphs are truncated to the leading 512 and L2-normalized on both providers. Projection alone does not reduce graph inference work. FP16 separately reduces weight storage; actual VRAM/latency needs measurement. Historical timings below are not measurements of this dimension change; see the [current model contract](../docs/MODELS.md).
 
 ## Selection and behavior
 
@@ -17,10 +19,9 @@ retries a failed CUDA session on CPU.
 CUDA accelerates the native EmbeddingGemma 2 vision, audio and shared/text ONNX sessions. Decoding,
 patch preparation, tokenization and LanceDB retrieval remain on CPU. ONNX Runtime
 may place small shape/control operations on CPU; actual placement must be verified. The validation below verifies that matrix and attention kernels
-execute on CUDA in all three graphs. TF32 is disabled to preserve the FP32 embedding
-profile. CPU and CUDA embeddings within the current indexed profile are compatible;
+execute on CUDA in all three graphs. TF32 is disabled for the FP32 operations retained in the upstream FP16 exports. CPU and CUDA embeddings within the current indexed profile are compatible;
 changing providers alone does not require a reindex. Moving from the previous
-768D indexed profile to 512D still requires a fresh catalog and explicit reindexing.
+FP32 indexed profiles to FP16/512D still requires a fresh catalog and explicit reindexing.
 
 `fractal-search providers` returns compiled capabilities without opening a catalog,
 loading a model or initializing a GPU. The normal status response reports
@@ -31,8 +32,7 @@ resident worker.
 Inference fetches only `sentence_embedding`, avoiding a copy of the unused
 `last_hidden_state` token matrix to host memory. CUDA sessions disable CPU
 worker-pool spinning so those threads sleep while waiting for work. CPU sessions
-retain their existing threading behavior. The FP32/profile and image budgets
-are unchanged; these optimizations do not require reindexing.
+retain their existing threading behavior. These execution optimizations preserve image budgets; the FP16 profile change requires a fresh catalog.
 
 ## Image batching
 
@@ -67,7 +67,7 @@ The CUDA bundle includes ONNX Runtime's CUDA/shared provider libraries. It does
 **not** redistribute NVIDIA's driver, CUDA or cuDNN libraries. This pinned ORT
 build uses CUDA 12.8 and cuDNN 9; see the [official compatibility table](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements).
 The required runtime loader names include `libcuda.so.1`, `libcudart.so.12`,
-`libcublas.so.12`, `libcublasLt.so.12`, `libcufft.so.11` and `libcudnn.so.9`.
+`libcublas.so.12`, `libcublasLt.so.12`, `libcufft.so.11`, `libcurand.so.10` and `libcudnn.so.9`.
 The CUDA 12.8 cuFFT package additionally needs `libnvJitLink.so.12`.
 
 If these libraries are in a custom directory, pass

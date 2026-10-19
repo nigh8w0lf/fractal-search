@@ -5,8 +5,7 @@ use ort::{
     execution_providers::CPUExecutionProvider,
     session::{
         builder::{GraphOptimizationLevel, SessionBuilder},
-        run_options::{OutputSelector, RunOptions},
-        Session,
+        OutputSelector, RunOptions, Session,
     },
     value::Tensor,
 };
@@ -16,6 +15,7 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -108,7 +108,14 @@ fn verify_model_file(model_dir: &Path, file: &ModelFile) -> Result<()> {
     Ok(())
 }
 
-// ort rc.10 rejects zero dimensions in from_array; allocate real empty tensors.
+// Builder errors own non-Send session options in ort rc.12. Preserve the
+// native error code/message while dropping those options; configuration errors
+// remain fatal and never recover an incompletely configured builder.
+fn session_builder_error(error: ort::Error<SessionBuilder>) -> anyhow::Error {
+    ort::Error::new_with_code(error.code(), error.to_string()).into()
+}
+
+// Absent modalities must be real zero-row tensors, not placeholder features.
 fn empty_media_features() -> Result<Tensor<f32>> {
     Ok(Tensor::new(
         &ort::memory::Allocator::default(),
@@ -119,8 +126,12 @@ fn empty_media_features() -> Result<Tensor<f32>> {
 fn media_feature_tensor(ids: &[i64], token: i64, features: Vec<f32>) -> Result<Tensor<f32>> {
     let count = ids.iter().filter(|&&id| id == token).count();
     ensure!(
-        features.len() == count * preprocess::HIDDEN_DIM && features.iter().all(|v| v.is_finite()),
+        features.len() == count * preprocess::HIDDEN_DIM,
         "Media token/feature count mismatch for token {token}"
+    );
+    ensure!(
+        features.iter().all(|v| v.is_finite()),
+        "Media encoder returned non-finite features for token {token} before shared-model inference"
     );
     if count == 0 {
         empty_media_features()
@@ -366,6 +377,48 @@ impl NativeRuntime {
 }
 
 impl Embedder for NativeRuntime {
+    fn uses_prepared_inputs(&self) -> bool {
+        true
+    }
+    fn preparation_tokenizer(&mut self) -> Result<Arc<preprocess::QueryTokenizer>> {
+        self.owner.execute(owner::NONE, |sessions| {
+            sessions.prepare_tokenizer()?;
+            Ok(sessions
+                .tokenizer
+                .as_ref()
+                .context("Tokenizer missing")?
+                .clone())
+        })
+    }
+    fn embed_prepared_images(&mut self, inputs: preprocess::ImageInputs) -> Result<Vec<Vec<f32>>> {
+        self.owner
+            .execute(owner::VISION, |sessions| {
+                sessions.embed_prepared_images(inputs)
+            })?
+            .iter()
+            .map(|vector| embeddings::project(vector))
+            .collect()
+    }
+    fn embed_prepared_audio(&mut self, inputs: preprocess::AudioInputs) -> Result<Vec<f32>> {
+        embeddings::project(&self.owner.execute(owner::AUDIO, |sessions| {
+            sessions.embed_prepared_audio(inputs)
+        })?)
+    }
+    fn embed_prepared_video(&mut self, inputs: Vec<preprocess::ImageInputs>) -> Result<Vec<f32>> {
+        embeddings::project(&self.owner.execute(owner::VISION, |sessions| {
+            sessions.embed_prepared_video(inputs)
+        })?)
+    }
+    fn embed_prepared_document(&mut self, inputs: preprocess::TextInputs) -> Result<Vec<f32>> {
+        embeddings::project(&self.owner.execute(owner::TEXT, |sessions| {
+            sessions.prepare_text()?;
+            sessions
+                .embed_tokens(inputs, Vec::new(), Vec::new(), Vec::new())?
+                .into_iter()
+                .next()
+                .context("No document embedding")
+        })?)
+    }
     fn embed_image(&mut self, image: &image::RgbImage) -> Result<Vec<f32>> {
         NativeRuntime::embed_images(self, std::slice::from_ref(image))?
             .into_iter()
@@ -406,7 +459,7 @@ struct RuntimeSessions {
     vision: Option<Session>,
     audio: Option<Session>,
     text: Option<Session>,
-    tokenizer: Option<preprocess::QueryTokenizer>,
+    tokenizer: Option<Arc<preprocess::QueryTokenizer>>,
     loads: [SessionLoad; 3],
 }
 
@@ -475,6 +528,7 @@ impl RuntimeSessions {
         }
         let manifest: Manifest =
             serde_json::from_str(include_str!("../models/embeddinggemma2.json"))?;
+        eprintln!("[Runtime] {}", ort::info());
         eprintln!(
             "[Model] Verifying {}/{} profile={MODEL_PROFILE} at {:?}",
             manifest.repository, manifest.revision, self.model_dir
@@ -487,36 +541,40 @@ impl RuntimeSessions {
     }
     fn session_builder(&self) -> Result<SessionBuilder> {
         let builder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(self.threads)?
-            .with_inter_threads(1)?
-            .with_parallel_execution(false)?;
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(session_builder_error)?
+            .with_intra_threads(self.threads)
+            .map_err(session_builder_error)?
+            .with_inter_threads(1)
+            .map_err(session_builder_error)?
+            .with_parallel_execution(false)
+            .map_err(session_builder_error)?;
         match self.provider {
-            ExecutionProvider::Cpu => {
-                Ok(
-                    builder.with_execution_providers([CPUExecutionProvider::default()
-                        .build()
-                        .error_on_failure()])?,
-                )
-            }
+            ExecutionProvider::Cpu => Ok(builder
+                .with_execution_providers([CPUExecutionProvider::default()
+                    .build()
+                    .error_on_failure()])
+                .map_err(session_builder_error)?),
             ExecutionProvider::Cuda { device_id } => {
                 #[cfg(feature = "cuda")]
                 {
                     use ort::execution_providers::CUDAExecutionProvider;
-                    // TF32 changes FP32 precision on Ampere and newer GPUs. Keep
-                    // the existing catalog profile's precision on every GPU.
+                    // FP16 exports retain some FP32 operations. Disable TF32
+                    // for those operations on Ampere and newer GPUs.
                     // CPU shape/control work still runs in a CUDA session, but
                     // its worker pools must sleep while waiting for GPU work.
                     let builder = builder
-                        .with_intra_op_spinning(false)?
-                        .with_inter_op_spinning(false)?;
+                        .with_intra_op_spinning(false)
+                        .map_err(session_builder_error)?
+                        .with_inter_op_spinning(false)
+                        .map_err(session_builder_error)?;
                     Ok(builder.with_execution_providers([
                         CUDAExecutionProvider::default()
                             .with_device_id(device_id)
                             .with_tf32(false)
                             .build()
                             .error_on_failure(),
-                    ]).with_context(|| format!("Initialize CUDA device {device_id}; the CUDA bundle, NVIDIA driver, CUDA 12 and cuDNN 9 libraries must be available. CPU retry is disabled"))?)
+                    ]).map_err(session_builder_error).with_context(|| format!("Initialize CUDA device {device_id}; the CUDA bundle, NVIDIA driver, CUDA 12 and cuDNN 9 libraries must be available. CPU retry is disabled"))?)
                 }
                 #[cfg(not(feature = "cuda"))]
                 bail!("CUDA device {device_id} requested in a CPU-only build")
@@ -527,11 +585,13 @@ impl RuntimeSessions {
         let start = Instant::now();
         let mut builder = self.session_builder()?;
         if let Some(directory) = &self.profiling_directory {
-            builder = builder.with_profiling(directory.join(format!(
-                "{}-{}",
-                self.provider.name(),
-                file.replace('/', "-")
-            )))?;
+            builder = builder
+                .with_profiling(directory.join(format!(
+                    "{}-{}",
+                    self.provider.name(),
+                    file.replace('/', "-")
+                )))
+                .map_err(session_builder_error)?;
         }
         let session = builder
             .commit_from_file(self.model_dir.join(file))
@@ -544,18 +604,18 @@ impl RuntimeSessions {
             })?;
         ensure!(
             session
-                .inputs
+                .inputs()
                 .iter()
-                .map(|i| i.name.as_str())
+                .map(|i| i.name())
                 .collect::<Vec<_>>()
                 == inputs,
             "Unexpected EmbeddingGemma 2 input contract for {file}"
         );
         ensure!(
             session
-                .outputs
+                .outputs()
                 .iter()
-                .map(|o| o.name.as_str())
+                .map(|o| o.name())
                 .collect::<Vec<_>>()
                 == outputs,
             "Unexpected EmbeddingGemma 2 output contract for {file}"
@@ -581,7 +641,7 @@ impl RuntimeSessions {
         self.verify()?;
         let start = Instant::now();
         self.vision = Some(self.session(
-            "onnx/vision_encoder.onnx",
+            "onnx/vision_encoder_fp16.onnx",
             &["pixel_values", "pixel_position_ids"],
             &["image_features"],
         )?);
@@ -595,7 +655,7 @@ impl RuntimeSessions {
         self.verify()?;
         let start = Instant::now();
         self.audio = Some(self.session(
-            "onnx/audio_encoder.onnx",
+            "onnx/audio_encoder_fp16.onnx",
             &["input_features", "input_features_mask"],
             &["audio_features"],
         )?);
@@ -616,9 +676,9 @@ impl RuntimeSessions {
                     .context("Pinned model manifest does not contain tokenizer.json")?;
                 verify_model_file(&self.model_dir, file)?;
             }
-            self.tokenizer = Some(preprocess::QueryTokenizer::from_file(
+            self.tokenizer = Some(Arc::new(preprocess::QueryTokenizer::from_file(
                 &self.model_dir.join("tokenizer.json"),
-            )?);
+            )?));
         }
         Ok(())
     }
@@ -632,7 +692,7 @@ impl RuntimeSessions {
         self.prepare_tokenizer()?;
         let start = Instant::now();
         self.text = Some(self.session(
-            "onnx/model.onnx",
+            "onnx/model_fp16.onnx",
             &[
                 "input_ids",
                 "attention_mask",
@@ -705,18 +765,30 @@ impl RuntimeSessions {
         );
         values
             .chunks_exact(NATIVE_EMBEDDING_DIM)
-            .map(embeddings::normalize)
+            .enumerate()
+            .map(|(index, vector)| {
+                embeddings::normalize(vector).with_context(|| {
+                    format!(
+                        "Shared model sentence_embedding row {} of {batch} (provider={})",
+                        index + 1,
+                        self.provider.name()
+                    )
+                })
+            })
             .collect()
     }
 
     pub fn embed_images(&mut self, images: &[image::RgbImage]) -> Result<Vec<Vec<f32>>> {
-        let start = Instant::now();
         let inputs = preprocess::prepare_images(images)?;
+        self.embed_prepared_images(inputs)
+    }
+    fn embed_prepared_images(&mut self, inputs: preprocess::ImageInputs) -> Result<Vec<Vec<f32>>> {
+        let start = Instant::now();
+        let batch = inputs.num_soft_tokens.len();
         let tokens = preprocess::image_tokens(&inputs.num_soft_tokens)?;
         let feature_count: usize = inputs.num_soft_tokens.iter().sum();
         self.prepare_text()?;
         self.load_vision()?;
-        let batch = images.len();
         let patches = inputs.max_patches;
         let prepared_ms = start.elapsed().as_secs_f64() * 1000.0;
         let inference = Instant::now();
@@ -770,7 +842,9 @@ impl RuntimeSessions {
     }
 
     pub fn embed_audio(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
-        let inputs = preprocess::prepare_audio(samples)?;
+        self.embed_prepared_audio(preprocess::prepare_audio(samples)?)
+    }
+    fn embed_prepared_audio(&mut self, inputs: preprocess::AudioInputs) -> Result<Vec<f32>> {
         let tokens = preprocess::audio_tokens(&[inputs.num_soft_tokens])?;
         self.prepare_text()?;
         self.load_audio()?;
@@ -808,16 +882,28 @@ impl RuntimeSessions {
             (1..=preprocess::MAX_VIDEO_FRAMES).contains(&frames.len()),
             "Video requires 1..=32 sampled frames"
         );
+        let inputs = frames
+            .iter()
+            .map(|frame| preprocess::prepare_video_frames(std::slice::from_ref(frame)))
+            .collect::<Result<Vec<_>>>()?;
+        self.embed_prepared_video(inputs)
+    }
+    fn embed_prepared_video(&mut self, inputs: Vec<preprocess::ImageInputs>) -> Result<Vec<f32>> {
+        ensure!(
+            (1..=preprocess::MAX_VIDEO_FRAMES).contains(&inputs.len()),
+            "Invalid prepared video frame count"
+        );
         self.prepare_text()?;
         let mut features = Vec::new();
-        let mut soft_tokens = Vec::with_capacity(frames.len());
-        // Encode one frame at a time to keep encoder memory independent of clip
-        // length. The shared backbone still embeds the whole temporal sequence.
-        for frame in frames {
-            let inputs = preprocess::prepare_video_frames(std::slice::from_ref(frame))?;
-            let count = inputs.num_soft_tokens[0];
+        let mut soft_tokens = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            ensure!(
+                input.num_soft_tokens.len() == 1,
+                "Prepared video frame must contain exactly one image"
+            );
+            let count = input.num_soft_tokens[0];
             soft_tokens.push(count);
-            features.extend(self.encode_visual(inputs, 1, count)?);
+            features.extend(self.encode_visual(input, 1, count)?);
         }
         let tokens = preprocess::video_tokens(&soft_tokens)?;
         self.embed_tokens(tokens, Vec::new(), features, Vec::new())?
@@ -961,7 +1047,7 @@ mod tests {
         let tensor = empty_media_features().unwrap();
         match tensor.dtype() {
             ort::value::ValueType::Tensor { ty, shape, .. } => {
-                assert_eq!(*ty, ort::tensor::TensorElementType::Float32);
+                assert_eq!(*ty, ort::value::TensorElementType::Float32);
                 assert_eq!(shape.as_ref(), &[0, preprocess::HIDDEN_DIM as i64]);
             }
             _ => panic!("Expected tensor"),
@@ -977,12 +1063,13 @@ mod tests {
         )
         .is_err());
         assert!(media_feature_tensor(&[], preprocess::VIDEO_TOKEN_ID, vec![1.0; 512]).is_err());
-        assert!(media_feature_tensor(
+        let error = media_feature_tensor(
             &[preprocess::IMAGE_TOKEN_ID],
             preprocess::IMAGE_TOKEN_ID,
-            vec![f32::NAN; 512]
+            vec![f32::NAN; 512],
         )
-        .is_err());
+        .unwrap_err();
+        assert!(error.to_string().contains("before shared-model inference"));
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! Images keep the existing native decoder. Audio/video require the explicitly
 //! installed `ffprobe` and `ffmpeg` executables; no network, playlist demuxer,
 //! Python runtime, alternate decoder, or automatic model download is used.
-//! Video frames are decoded at native size. Model-specific resize and patch
-//! preparation happen in the native model preprocessor, never in ffmpeg.
+//! Sampled video frames are bounded and downscaled before model-specific patch
+//! preparation. Original files are never changed.
 
 use anyhow::{bail, ensure, Context, Result};
 use image::RgbImage;
@@ -36,6 +36,8 @@ pub const AUDIO_SAMPLE_RATE: usize = 16_000;
 pub const MAX_VIDEO_FRAMES: usize = 30;
 pub const MAX_VIDEO_PIXELS: u64 = 1920 * 1080;
 pub const MAX_VIDEO_SIDE: u32 = 4096;
+const MAX_VIDEO_SOURCE_PIXELS: u64 = 4096 * 4096;
+const MAX_VIDEO_SOURCE_SIDE: u32 = 8192;
 const MAX_PROBE_BYTES: usize = 256 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_PPM_HEADER_BYTES: usize = 256;
@@ -122,9 +124,54 @@ pub fn kind_for_path(path: &Path) -> Option<MediaKind> {
     })
 }
 
+/// `.ts` is shared by TypeScript and MPEG transport streams. Only inspect a
+/// bounded prefix; unreadable files remain actionable errors, never exclusions.
+/// Binary/corrupt inputs still reach ffprobe and its normal error reporting.
+pub fn is_typescript_source(path: &Path) -> Result<bool> {
+    if !path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+    {
+        return Ok(false);
+    }
+    let mut prefix = Vec::new();
+    fs::File::open(path)
+        .with_context(|| format!("Opening ambiguous .ts file {path:?}"))?
+        .take(8192)
+        .read_to_end(&mut prefix)
+        .with_context(|| format!("Reading ambiguous .ts file {path:?}"))?;
+    // TS, M2TS and error-corrected TS packet strides. Require several headers,
+    // including a nonreserved adaptation-field-control value.
+    for stride in [188, 192, 204] {
+        for offset in 0..stride {
+            if (0..5).all(|packet| {
+                let at = offset + packet * stride;
+                prefix.get(at) == Some(&0x47)
+                    && prefix.get(at + 3).is_some_and(|byte| byte & 0x30 != 0)
+            }) {
+                return Ok(false);
+            }
+        }
+    }
+    // A prefix can end inside a UTF-8 character; validate its complete portion.
+    let text = match std::str::from_utf8(&prefix) {
+        Ok(text) => text,
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&prefix[..error.valid_up_to()])?
+        }
+        Err(_) => return Ok(false),
+    };
+    Ok(text.chars().all(|c| !c.is_control() || c.is_whitespace()))
+}
+
 pub fn inspect(path: &Path) -> Result<MediaInfo> {
+    inspect_with_cancel(path, &|| false)
+}
+pub(crate) fn inspect_with_cancel(path: &Path, cancelled: &impl Fn() -> bool) -> Result<MediaInfo> {
+    ensure!(!cancelled(), "Media inspection cancelled");
     let kind =
         kind_for_path(path).with_context(|| format!("Unsupported local media file {path:?}"))?;
+    ensure!(!is_typescript_source(path)?, "TypeScript .ts source is not supported for indexing; supported text extensions are .txt, .md and .markdown");
     match kind {
         MediaKind::Image => {
             crate::initialize_image_decoders();
@@ -155,7 +202,7 @@ pub fn inspect(path: &Path) -> Result<MediaInfo> {
                 video_duration_ms: None,
             })
         }
-        MediaKind::Audio | MediaKind::Video => probe(path, kind).map(|probe| probe.info),
+        MediaKind::Audio | MediaKind::Video => probe(path, kind, cancelled).map(|probe| probe.info),
     }
 }
 
@@ -208,6 +255,15 @@ where
 }
 
 pub fn decode_segment(path: &Path, info: &MediaInfo, spec: &SegmentSpec) -> Result<PreparedMedia> {
+    decode_segment_with_cancel(path, info, spec, &|| false)
+}
+pub(crate) fn decode_segment_with_cancel(
+    path: &Path,
+    info: &MediaInfo,
+    spec: &SegmentSpec,
+    cancelled: &impl Fn() -> bool,
+) -> Result<PreparedMedia> {
+    ensure!(!cancelled(), "Media decoding cancelled");
     validate_path_kind(path, info)?;
     validate_segment(info, spec)?;
     match spec.kind {
@@ -228,7 +284,13 @@ pub fn decode_segment(path: &Path, info: &MediaInfo, spec: &SegmentSpec) -> Resu
         MediaKind::Audio => {
             let path = checked_local_path(path, MAX_MEDIA_FILE_BYTES)?;
             let mut command = decode_command(&path, spec)?;
+            let max_samples = segment_duration(spec)? as usize * AUDIO_SAMPLE_RATE / 1000;
+            // Timestamp-based -t alone can admit a whole resampled codec frame.
+            // Normalize timestamps and enforce the exact interval in sample space.
+            let filter = format!("aresample=16000,atrim=end_sample={max_samples},asetpts=N/SR/TB");
             command.args([
+                "-af",
+                &filter,
                 "-map",
                 "0:a:0",
                 "-vn",
@@ -244,19 +306,20 @@ pub fn decode_segment(path: &Path, info: &MediaInfo, spec: &SegmentSpec) -> Resu
                 "f32le",
                 "pipe:1",
             ]);
-            let max_samples = segment_duration(spec)? as usize * AUDIO_SAMPLE_RATE / 1000;
-            let bytes = run_decoder(
+            let bytes = run_decoder_with_cancel(
                 &mut command,
                 max_samples * 4,
                 DECODE_TIMEOUT,
                 "ffmpeg audio decoder",
+                cancelled,
             )?;
             Ok(PreparedMedia::Audio {
                 samples: parse_audio(&bytes, max_samples)?,
             })
         }
         MediaKind::Video => {
-            validate_video_dimensions(info.width, info.height)?;
+            let (width, height) = video_frame_dimensions(info.width, info.height)?;
+            let filter = format!("fps=1:round=up:start_time=0,scale={width}:{height}:flags=area");
             let path = checked_local_path(path, MAX_MEDIA_FILE_BYTES)?;
             let mut command = decode_command(&path, spec)?;
             // A decoded array is supplied to the model, so its processor does not
@@ -270,7 +333,7 @@ pub fn decode_segment(path: &Path, info: &MediaInfo, spec: &SegmentSpec) -> Resu
                 "-sn",
                 "-dn",
                 "-vf",
-                "fps=1:round=up:start_time=0",
+                &filter,
                 "-frames:v",
                 &frame_limit.to_string(),
                 "-threads",
@@ -283,13 +346,14 @@ pub fn decode_segment(path: &Path, info: &MediaInfo, spec: &SegmentSpec) -> Resu
                 "image2pipe",
                 "pipe:1",
             ]);
-            let per_frame = usize::try_from(u64::from(info.width) * u64::from(info.height) * 3)?;
+            let per_frame = usize::try_from(u64::from(width) * u64::from(height) * 3)?;
             let output_limit = frame_limit * (per_frame + MAX_PPM_HEADER_BYTES);
-            let bytes = run_decoder(
+            let bytes = run_decoder_with_cancel(
                 &mut command,
                 output_limit,
                 DECODE_TIMEOUT,
                 "ffmpeg video decoder",
+                cancelled,
             )?;
             Ok(PreparedMedia::Video {
                 frames: parse_frames(&bytes, info, frame_limit)?,
@@ -566,10 +630,24 @@ fn validate_segment(info: &MediaInfo, spec: &SegmentSpec) -> Result<()> {
 }
 
 fn validate_video_dimensions(width: u32, height: u32) -> Result<()> {
-    ensure!(width > 0 && height > 0 && width <= MAX_VIDEO_SIDE && height <= MAX_VIDEO_SIDE
-        && u64::from(width) * u64::from(height) <= MAX_VIDEO_PIXELS,
-        "Video dimensions {width}x{height} exceed the native decode limit ({MAX_VIDEO_PIXELS} pixels, sides <= {MAX_VIDEO_SIDE}); prepare a smaller video explicitly before indexing");
+    ensure!(width > 0 && height > 0 && width <= MAX_VIDEO_SOURCE_SIDE && height <= MAX_VIDEO_SOURCE_SIDE
+        && u64::from(width) * u64::from(height) <= MAX_VIDEO_SOURCE_PIXELS,
+        "Video dimensions {width}x{height} exceed the source decode limit ({MAX_VIDEO_SOURCE_PIXELS} pixels, sides <= {MAX_VIDEO_SOURCE_SIDE}); prepare a smaller video before indexing");
     Ok(())
+}
+
+// Preserve aspect ratio to integer-pixel rounding and never upscale. The
+// model's own patch sizing still follows this bounded extraction step.
+fn video_frame_dimensions(width: u32, height: u32) -> Result<(u32, u32)> {
+    validate_video_dimensions(width, height)?;
+    let scale = (MAX_VIDEO_PIXELS as f64 / (f64::from(width) * f64::from(height)))
+        .sqrt()
+        .min(f64::from(MAX_VIDEO_SIDE) / f64::from(width.max(height)))
+        .min(1.0);
+    Ok((
+        (f64::from(width) * scale).floor().max(1.0) as u32,
+        (f64::from(height) * scale).floor().max(1.0) as u32,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -629,7 +707,7 @@ fn input_options(command: &mut Command) {
     ]);
 }
 
-fn probe(path: &Path, kind: MediaKind) -> Result<ProbedMedia> {
+fn probe(path: &Path, kind: MediaKind, cancelled: &impl Fn() -> bool) -> Result<ProbedMedia> {
     let path = checked_local_path(path, MAX_MEDIA_FILE_BYTES)?;
     let mut command = Command::new("ffprobe");
     input_options(&mut command);
@@ -637,11 +715,12 @@ fn probe(path: &Path, kind: MediaKind) -> Result<ProbedMedia> {
     // stdin explicitly for both tools, including probe builds with no such flag.
     command.args(["-show_entries", "format=start_time,duration:stream=codec_type,width,height,start_time,duration:stream_disposition=attached_pic:stream_tags=DURATION",
         "-of", "json", "-i"]).arg(&path);
-    let output = run_decoder(
+    let output = run_decoder_with_cancel(
         &mut command,
         MAX_PROBE_BYTES,
         PROBE_TIMEOUT,
         "ffprobe media inspector",
+        cancelled,
     )?;
     parse_probe(&output, kind).with_context(|| format!("Inspecting media metadata for {path:?}"))
 }
@@ -828,7 +907,9 @@ fn decode_command(path: &Path, spec: &SegmentSpec) -> Result<Command> {
         "Decoder input must be an absolute local path"
     );
     let mut command = Command::new("ffmpeg");
-    command.args(["-nostdin", "-xerror"]);
+    // The shared preparation pool owns parallelism; each decoder/filter graph
+    // must not create a second machine-wide worker pool.
+    command.args(["-nostdin", "-xerror", "-filter_threads", "1"]);
     input_options(&mut command);
     // Accurate input seek is ffmpeg's default for transcoding. Disable automatic
     // orientation so the pinned native no-EXIF-rotation pixel policy is preserved.
@@ -929,7 +1010,7 @@ fn parse_frames(bytes: &[u8], info: &MediaInfo, frame_limit: usize) -> Result<Ve
             "Video decoder must return 8-bit RGB frames"
         );
         validate_video_dimensions(width, height)?;
-        ensure!(width == info.width && height == info.height,
+        ensure!((width, height) == video_frame_dimensions(info.width, info.height)?,
             "Video dimensions changed during decode ({width}x{height}); prepare a constant-dimension video before indexing");
         // Exactly one separator follows maxval. Consuming all whitespace here
         // would eat valid pixel bytes, including a black/white first pixel.
@@ -956,11 +1037,12 @@ fn parse_frames(bytes: &[u8], info: &MediaInfo, frame_limit: usize) -> Result<Ve
 }
 
 #[cfg(unix)]
-fn run_decoder(
+fn run_decoder_with_cancel(
     command: &mut Command,
     stdout_limit: usize,
     timeout: Duration,
     label: &str,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<Vec<u8>> {
     use std::os::{fd::AsRawFd, unix::process::CommandExt};
     struct ChildGuard {
@@ -1087,6 +1169,7 @@ fn run_decoder(
     let mut status = None;
     let started = Instant::now();
     loop {
+        ensure!(!cancelled(), "{label} cancelled");
         ensure!(
             started.elapsed() < timeout,
             "{label} exceeded its {}-second time limit; split or simplify this media file",
@@ -1137,18 +1220,45 @@ fn run_decoder(
 }
 
 #[cfg(not(unix))]
-fn run_decoder(
+fn run_decoder_with_cancel(
     _command: &mut Command,
     _stdout_limit: usize,
     _timeout: Duration,
     _label: &str,
+    _cancelled: &impl Fn() -> bool,
 ) -> Result<Vec<u8>> {
     bail!("Bounded local ffmpeg decoding currently requires a Unix platform")
 }
 
 #[cfg(test)]
+fn run_decoder(
+    command: &mut Command,
+    stdout_limit: usize,
+    timeout: Duration,
+    label: &str,
+) -> Result<Vec<u8>> {
+    run_decoder_with_cancel(command, stdout_limit, timeout, label, &|| false)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_decoder_is_reaped_promptly() {
+        let started = Instant::now();
+        let error = run_decoder_with_cancel(
+            Command::new("sh").args(["-c", "sleep 20"]),
+            32,
+            Duration::from_secs(30),
+            "cancel test",
+            &|| started.elapsed() > Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 
     fn info(kind: MediaKind, duration_ms: u64) -> MediaInfo {
         MediaInfo {
@@ -1195,6 +1305,190 @@ mod tests {
             "archive.zip",
         ] {
             assert_eq!(kind_for_path(Path::new(name)), None);
+        }
+    }
+
+    #[test]
+    fn ambiguous_ts_checks_content_and_propagates_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["index.ts", "types.d.ts", "INDEX.TS"] {
+            let path = dir.path().join(name);
+            fs::write(&path, "export interface Item { title: string }\n").unwrap();
+            assert!(is_typescript_source(&path).unwrap());
+            assert!(inspect(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("TypeScript"));
+        }
+        let path = dir.path().join("transport.ts");
+        for stride in [188, 192, 204] {
+            let mut bytes = vec![0; stride * 6];
+            for packet in 0..6 {
+                bytes[packet * stride] = 0x47;
+                bytes[packet * stride + 3] = 0x10;
+            }
+            fs::write(&path, bytes).unwrap();
+            assert!(!is_typescript_source(&path).unwrap());
+        }
+        fs::write(&path, [0xff, 0x00, 0x47]).unwrap();
+        assert!(!is_typescript_source(&path).unwrap());
+        assert!(is_typescript_source(&dir.path().join("missing.ts")).is_err());
+    }
+
+    #[test]
+    fn video_resize_preserves_small_frames_and_bounds_large_landscape_portrait() {
+        for (width, height) in [(2, 2), (1920, 1080), (1080, 1920)] {
+            assert_eq!(
+                video_frame_dimensions(width, height).unwrap(),
+                (width, height)
+            );
+        }
+        for (width, height) in [
+            (2880, 1808),
+            (2784, 1856),
+            (3840, 2160),
+            (2160, 3840),
+            (8192, 1024),
+        ] {
+            let (w, h) = video_frame_dimensions(width, height).unwrap();
+            assert!(w <= width && h <= height && w <= MAX_VIDEO_SIDE && h <= MAX_VIDEO_SIDE);
+            assert!(u64::from(w) * u64::from(h) <= MAX_VIDEO_PIXELS);
+            assert!(
+                (f64::from(w) / f64::from(h) - f64::from(width) / f64::from(height)).abs() < 0.02
+            );
+        }
+    }
+
+    // Explicit integration check: requires system ffmpeg/ffprobe, no model or
+    // user catalog. Missing tools fail visibly when this test is requested.
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn native_media_resizes_video_and_bounds_audio_samples() {
+        fn generate(path: &Path, input: &str, duration: &str, codec: &str) {
+            let output = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-nostdin", "-f", "lavfi", "-i", input, "-t", duration,
+                    "-threads", "1", "-c", codec,
+                ])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let drift = dir.path().join("timestamp-drift.m4a");
+        let encoded = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=31",
+                "-af",
+                "asetpts=0.99*PTS",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&drift)
+            .output()
+            .unwrap();
+        assert!(encoded.status.success());
+        let metadata = inspect(&drift).unwrap();
+        let spec = segments(&drift, &metadata).unwrap().remove(0);
+        // Reproduce the original overflow with timestamp-only output trimming.
+        let mut legacy = decode_command(&drift, &spec).unwrap();
+        legacy.args([
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_f32le",
+            "-f",
+            "f32le",
+            "pipe:1",
+        ]);
+        let legacy = legacy.output().unwrap();
+        assert!(legacy.status.success());
+        assert!(legacy.stdout.len() > 480000 * 4);
+        let PreparedMedia::Audio { samples } = decode_segment(&drift, &metadata, &spec).unwrap()
+        else {
+            panic!("expected audio")
+        };
+        assert_eq!(samples.len(), 480000);
+        for (name, input, duration, codec) in [
+            ("wide.mp4", "color=c=red:s=2880x1808:r=1", "1", "mpeg4"),
+            ("portrait.mp4", "color=c=blue:s=2160x3840:r=1", "1", "mpeg4"),
+            (
+                "transport.ts",
+                "color=c=red:s=64x48:r=25",
+                "1",
+                "mpeg2video",
+            ),
+            (
+                "short.m4a",
+                "sine=frequency=440:sample_rate=44100",
+                "9.888",
+                "aac",
+            ),
+            (
+                "multi.m4a",
+                "sine=frequency=440:sample_rate=48000",
+                "30.123",
+                "aac",
+            ),
+            (
+                "exact.wav",
+                "sine=frequency=440:sample_rate=16000",
+                "60.001",
+                "pcm_f32le",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            generate(&path, input, duration, codec);
+            assert!(!is_typescript_source(&path).unwrap());
+            let metadata = inspect(&path).unwrap();
+            let specs = segments(&path, &metadata).unwrap();
+            let mut audio = Vec::new();
+            for spec in specs {
+                match decode_segment(&path, &metadata, &spec).unwrap() {
+                    PreparedMedia::Video { frames } => {
+                        assert!(!frames.is_empty());
+                        for frame in frames {
+                            assert_eq!(
+                                frame.dimensions(),
+                                video_frame_dimensions(metadata.width, metadata.height).unwrap()
+                            );
+                        }
+                    }
+                    PreparedMedia::Audio { samples } => {
+                        assert!(samples.len() <= segment_duration(&spec).unwrap() as usize * 16);
+                        audio.extend(samples);
+                    }
+                    _ => panic!("unexpected modality"),
+                }
+            }
+            if name == "exact.wav" {
+                // Concatenating the adjusted 30-second boundaries must retain
+                // every sample exactly once, not just satisfy per-segment limits.
+                let output = Command::new("ffmpeg")
+                    .args(["-v", "error", "-i"])
+                    .arg(&path)
+                    .args(["-f", "f32le", "-c:a", "pcm_f32le", "pipe:1"])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert_eq!(audio, parse_audio(&output.stdout, 960016).unwrap());
+                assert_eq!(audio.len(), 960016);
+            }
         }
     }
 
@@ -1589,14 +1883,14 @@ mod tests {
     }
 
     #[test]
-    fn dimensions_do_not_silently_resize_oversized_video() {
+    fn source_dimensions_are_bounded_before_explicit_frame_resize() {
         assert!(validate_video_dimensions(1920, 1080).is_ok());
         assert!(validate_video_dimensions(1080, 1920).is_ok());
         for dimensions in [
             (0, 1),
             (1, 0),
-            (1921, 1080),
-            (4097, 1),
+            (8192, 4096),
+            (8193, 1),
             (u32::MAX, u32::MAX),
         ] {
             assert!(validate_video_dimensions(dimensions.0, dimensions.1).is_err());

@@ -7,8 +7,8 @@ import math
 
 NATIVE_EMBEDDING_DIM = 768
 EMBEDDING_DIM = 512
-NATIVE_MODEL_PROFILE = "embeddinggemma2-daa72c51-fp32-multimodal-v1"
-MODEL_PROFILE = "embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2"
+NATIVE_MODEL_PROFILE = "embeddinggemma2-daa72c51-fp16-multimodal-v2"
+MODEL_PROFILE = "embeddinggemma2-daa72c51-fp16-multimodal-mrl512-v3"
 
 
 def project_indexed_vector(vector):
@@ -46,14 +46,10 @@ def validate_fixture_environment(environment, native=False):
         "native_embedding_dimension": NATIVE_EMBEDDING_DIM,
         "model_profile": NATIVE_MODEL_PROFILE if native else MODEL_PROFILE,
     }
-    # Old fixture generators emitted only the pinned export identity. The caller
-    # must explicitly select native mode; every reference then requires 768 values.
-    if native and not any(key in environment for key in expected):
-        return
     for key, value in expected.items():
         if environment.get(key) != value:
             raise ValueError(
                 f"Fixture {key} must be {value!r}; regenerate fixtures in the requested mode. "
-                "Native 768 fixtures remain supported by --native-output parity validation; "
+                "FP16 native 768 fixtures remain supported by --native-output parity validation; "
                 "use --native-fixtures to project them explicitly for indexed retrieval."
             )

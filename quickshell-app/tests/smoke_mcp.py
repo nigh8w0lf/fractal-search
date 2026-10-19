@@ -134,7 +134,7 @@ def main():
                 assert 'error' in mcp.tool(name, {**arguments, 'mediaKind': 'text', 'unknown': True}, success=False)
             status = data(mcp.tool("status"))
             assert status["textModelLoaded"] is False and status["assetCount"] == status["fileCount"] == 2
-            assert status["modelProfile"] == "embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2"
+            assert status["modelProfile"] == "embeddinggemma2-daa72c51-fp16-multimodal-mrl512-v3"
             page = data(mcp.tool("browse_assets", {"limit": 1}))
             assert page["total"] == 2 and len(page["items"]) == 1
             asset = page["items"][0]
@@ -159,7 +159,7 @@ def main():
             assert data(mcp.tool("status"))["textModelLoaded"] is False
             assert not any(str(root) in json.dumps(message) or "file://" in json.dumps(message) for message in mcp.history)
             mcp.stop()
-            assert "Loaded onnx/model.onnx" not in (root / "metadata.log").read_text()
+            assert "Loaded onnx/model_fp16.onnx" not in (root / "metadata.log").read_text()
             assert catalog_hashes(catalog) == original_hashes
             # Server and desktop remain concurrent. Model loads only for search.
             mcp = Mcp(binary, catalog, models, root / "search.log")
@@ -174,8 +174,8 @@ def main():
                 assert len(data(mcp.receive(ident))["items"]) == 1
             assert mcp.process.wait(timeout=120) == 0
             mcp.log.close()
-            assert "Loaded onnx/model.onnx" in (root / "search.log").read_text()
-            assert "Loaded onnx/vision_encoder.onnx" not in (root / "search.log").read_text()
+            assert "Loaded onnx/model_fp16.onnx" in (root / "search.log").read_text()
+            assert "Loaded onnx/vision_encoder_fp16.onnx" not in (root / "search.log").read_text()
             assert not any(str(root) in json.dumps(message) or "file://" in json.dumps(message) for message in mcp.history)
             # Invalid frames terminate explicitly after a bounded error response.
             mcp = Mcp(binary, catalog, models, root / "overlong.log")

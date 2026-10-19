@@ -97,10 +97,12 @@ a catalog/search redesign and explicit data-format decisions, not just a
 manifest edit.
 
 Image codecs remain explicit and match the supported formats. The native HEIF
-and TurboJPEG integrations remain in place. ONNX Runtime's default `std` feature
-also activates its ndarray support in the pinned rc.10 manifest; ndarray is
-additionally used by Lance, so disabling only the explicit ndarray default would
-not remove it. No decoder, model, provider or storage fallback is introduced.
+and TurboJPEG integrations remain in place. ONNX Runtime's `std` feature also
+activates ndarray support. The pinned rc.12
+binding uses ndarray 0.17 while Lance uses 0.16; this deliberate duplicate comes
+from their supported APIs and must not be removed by forcing a transitive upgrade.
+The binding enables explicit native runtime/download/TLS features, with CUDA
+remaining opt-in. No decoder, model, provider or storage fallback is introduced.
 
 ## Inference-only development checks
 

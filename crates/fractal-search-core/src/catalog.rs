@@ -1,17 +1,20 @@
 //! LanceDB catalog and incremental indexing. Originals are never modified.
+mod preparation;
 use crate::index_state::{
     hash_file, hash_file_with_cancel, is_racy, FileStamp as Stamp, FileState, IndexState,
     PassageLocation,
 };
 use crate::media::{self, MediaKind, PreparedMedia};
+use crate::preparation_pool::PreparationPool;
 #[cfg(test)]
 use crate::store::MAX_TEXT_EXCERPT_BYTES;
 use crate::store::{asset_filter, quote, Record, Store};
 use crate::{
     preprocess::decode_image, Embedder, EMBEDDING_DIM, MAX_IMAGE_BATCH_SIZE, MODEL_PROFILE,
 };
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use image::{codecs::webp::WebPEncoder, ExtendedColorType, RgbImage};
+use preparation::{FatalPreparation, FileData, FileTicket, NativeInput};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -172,11 +175,13 @@ struct PendingImage {
     content_hash: String,
     embedding_profile: Option<String>,
     verify_after: bool,
+    thumbnail: Vec<u8>,
 }
 
 struct IndexBatch {
     source_id: i64,
     images: Vec<RgbImage>,
+    inputs: Vec<crate::preprocess::ImageInputs>,
     pending: Vec<PendingImage>,
 }
 
@@ -196,10 +201,18 @@ impl IndexBatch {
         if cancelled() {
             return Ok(true);
         }
-        let vectors = embedder.embed_images(&self.images).with_context(|| {
+        let inferred = if embedder.uses_prepared_inputs() {
+            embedder.embed_prepared_images(preparation::combine_images(std::mem::take(
+                &mut self.inputs,
+            ))?)
+        } else {
+            embedder.embed_images(&self.images)
+        };
+        let vectors = inferred.with_context(|| {
             format!(
-                "Embed image batch of {} starting at {:?}; reduce Image batch size if device memory is insufficient",
-                self.images.len(), self.pending[0].path
+                "Embed image batch of {} starting at {:?}",
+                self.images.len(),
+                self.pending[0].path
             )
         })?;
         ensure!(
@@ -760,15 +773,84 @@ impl Catalog {
         let mut batch = IndexBatch {
             source_id,
             images: Vec::with_capacity(batch_size),
+            inputs: Vec::with_capacity(batch_size),
             pending: Vec::with_capacity(batch_size),
         };
-        for path in &paths {
+        let mut pool = PreparationPool::new()?;
+        let native = embedder.uses_prepared_inputs();
+        let mut tokenizer = None;
+        let mut prefetched: HashMap<PathBuf, FileTicket> = HashMap::new();
+        for (position, path) in paths.iter().enumerate() {
+            pool.check()?;
             if cancelled() {
                 return Ok(state.result(0, true, failures));
             }
+            // Prepare both images of the next common batch while this batch
+            // infers. At a modality boundary retain only one following file:
+            // two completed image reservations would otherwise starve the
+            // current media file's segment jobs of their preparation budget.
+            let lookahead = if batch_size > 1
+                && paths.get(position..position + 3).is_some_and(|window| {
+                    window
+                        .iter()
+                        .all(|path| media::kind_for_path(path) == Some(MediaKind::Image))
+                }) {
+                3
+            } else {
+                2
+            };
+            // Stat-identical files stay on the cheap scan path; admission below
+            // schedules repairs explicitly.
+            for (offset, candidate) in paths.iter().skip(position).take(lookahead).enumerate() {
+                // If this file was skipped by the cheap prefetch check, reserve
+                // room for a possible repair discovered during full admission.
+                if offset == 2 && !prefetched.contains_key(path) {
+                    break;
+                }
+                if prefetched.contains_key(candidate) {
+                    continue;
+                }
+                let old = manifest.get(text_path(candidate)?);
+                // Admission below reports source errors. Do not launch speculative
+                // decoding when the initial stat/type check itself has failed.
+                let candidate_stamp = match stamp(candidate) {
+                    Ok(stamp) => stamp,
+                    Err(_) => continue,
+                };
+                let unchanged_stat = old.is_some_and(|rows| {
+                    !rows.is_empty()
+                        && rows.iter().all(|row| {
+                            row.bytes == candidate_stamp.bytes
+                                && raw_modified(&row.modified) == candidate_stamp.modified
+                                && cache_is_current(row)
+                        })
+                });
+                if unchanged_stat && !options.reindex_text {
+                    continue;
+                }
+                match media::is_typescript_source(candidate) {
+                    Ok(false) => (),
+                    Ok(true) | Err(_) => continue,
+                }
+                if native
+                    && media::kind_for_path(candidate) == Some(MediaKind::Text)
+                    && tokenizer.is_none()
+                {
+                    tokenizer = Some(embedder.preparation_tokenizer()?);
+                }
+                prefetched.insert(
+                    candidate.clone(),
+                    preparation::submit_file(&pool, candidate, native, tokenizer.clone())?,
+                );
+            }
+            let ticket = prefetched.remove(path);
             let start = Instant::now();
             let path_text = text_path(path)?;
-            let before = match stamp(path).and_then(|stamp| {
+            let before = match media::is_typescript_source(path).and_then(|unsupported| {
+                if unsupported {
+                    return Ok(None);
+                }
+                let stamp = stamp(path)?;
                 let max_bytes =
                     match media::kind_for_path(path).context("Unsupported indexed file")? {
                         MediaKind::Image => crate::preprocess::MAX_FILE_BYTES,
@@ -779,9 +861,14 @@ impl Catalog {
                     stamp.bytes > 0 && stamp.bytes <= max_bytes,
                     "Source {path:?} must contain 1..={max_bytes} bytes"
                 );
-                Ok(stamp)
+                Ok(Some(stamp))
             }) {
-                Ok(stamp) => stamp,
+                Ok(Some(stamp)) => stamp,
+                Ok(None) => {
+                    state.current += 1;
+                    progress(&state)?;
+                    continue;
+                }
                 Err(error) => {
                     if batch.flush(
                         self,
@@ -902,6 +989,8 @@ impl Catalog {
             }
             let content_hash = content_hash
                 .context("Changed or cache-repaired file must have a checked content hash")?;
+            // Flush a partial image batch while the next media file is being
+            // prepared, rather than waiting for its first segment before inference.
             if media::kind_for_path(path) != Some(MediaKind::Image) {
                 if batch.flush(
                     self,
@@ -913,6 +1002,55 @@ impl Catalog {
                 )? {
                     return Ok(state.result(0, true, failures));
                 }
+            }
+            state.filename = path
+                .file_name()
+                .context("Media filename missing")?
+                .to_string_lossy()
+                .into_owned();
+            let ticket = match ticket {
+                Some(ticket) => ticket,
+                None => {
+                    if native && is_text && tokenizer.is_none() {
+                        tokenizer = Some(embedder.preparation_tokenizer()?);
+                    }
+                    preparation::submit_file(&pool, path, native, tokenizer.clone())?
+                }
+            };
+            let Some(prepared) = ticket.wait(&cancelled)? else {
+                return Ok(state.result(0, true, failures));
+            };
+            let prepared = match prepared.and_then(|prepared| {
+                ensure!(
+                    prepared.stamp == before,
+                    "File changed before preparation: {path:?}"
+                );
+                Ok(prepared.data)
+            }) {
+                Ok(prepared) => prepared,
+                Err(error) if error.is::<FatalPreparation>() => return Err(error),
+                Err(error) => {
+                    if batch.flush(
+                        self,
+                        embedder,
+                        &mut state,
+                        &mut failures,
+                        &cancelled,
+                        &mut progress,
+                    )? {
+                        return Ok(state.result(0, true, failures));
+                    }
+                    state.filename = path
+                        .file_name()
+                        .context("Media filename missing")?
+                        .to_string_lossy()
+                        .into_owned();
+                    state.record_failure(path, error, &mut failures);
+                    progress(&state)?;
+                    continue;
+                }
+            };
+            if media::kind_for_path(path) != Some(MediaKind::Image) {
                 state.failure = None;
                 state.filename = path
                     .file_name()
@@ -920,6 +1058,9 @@ impl Catalog {
                     .to_string_lossy()
                     .into_owned();
                 if self.index_media_file(
+                    &pool,
+                    prepared,
+                    tokenizer.clone(),
                     source_id,
                     path,
                     before,
@@ -942,28 +1083,13 @@ impl Catalog {
                 "Image has multiple indexed segments"
             );
             let existing = existing_rows.into_iter().next();
-            let image = match decode_image(path) {
-                Ok(image) => image,
-                Err(error) => {
-                    if batch.flush(
-                        self,
-                        embedder,
-                        &mut state,
-                        &mut failures,
-                        &cancelled,
-                        &mut progress,
-                    )? {
-                        return Ok(state.result(0, true, failures));
-                    }
-                    state.filename = path
-                        .file_name()
-                        .context("Image filename missing")?
-                        .to_string_lossy()
-                        .into_owned();
-                    state.record_failure(path, error, &mut failures);
-                    progress(&state)?;
-                    continue;
-                }
+            let FileData::Image {
+                image,
+                inputs,
+                thumbnail,
+            } = prepared
+            else {
+                bail!("Image preparation returned a different media type");
             };
             let pending = PendingImage {
                 path: path.clone(),
@@ -974,6 +1100,7 @@ impl Catalog {
                 content_hash,
                 embedding_profile: embedder.embedding_profile(),
                 verify_after,
+                thumbnail,
             };
             if unchanged {
                 if batch.flush(
@@ -1015,6 +1142,9 @@ impl Catalog {
             }
             // EmbeddingGemma2 pads every image to the same 2520-patch budget,
             // so consecutive images can share a batch regardless of dimensions.
+            if let Some(inputs) = inputs {
+                batch.inputs.push(inputs);
+            }
             batch.images.push(image);
             batch.pending.push(pending);
             if batch.images.len() == batch_size
@@ -1040,6 +1170,7 @@ impl Catalog {
         )? {
             return Ok(state.result(0, true, failures));
         }
+        pool.finish()?;
         // Only a completed traversal may prune missing files. Known files that
         // failed decoding stay in `seen`, preserving their last good entries.
         let seen: HashSet<_> = paths
@@ -1082,6 +1213,9 @@ impl Catalog {
     #[allow(clippy::too_many_arguments)]
     fn index_media_file<E: Embedder>(
         &self,
+        pool: &PreparationPool,
+        prepared: FileData,
+        tokenizer: Option<std::sync::Arc<crate::preprocess::QueryTokenizer>>,
         source_id: i64,
         path: &Path,
         before: Stamp,
@@ -1094,19 +1228,24 @@ impl Catalog {
         failures: &mut Vec<IndexFailure>,
         cancelled: &impl Fn() -> bool,
     ) -> Result<bool> {
-        let info = match media::inspect(path) {
-            Ok(info) => info,
-            Err(error) => {
-                state.record_failure(path, error, failures);
-                return Ok(cancelled());
-            }
+        let FileData::Media {
+            info,
+            specs,
+            mut first,
+        } = prepared
+        else {
+            bail!("Media preparation returned an image");
         };
         let mut tokenizer_failed = false;
-        let specs = match media::segments_with_token_counter(path, &info, |title, text| {
-            let result = embedder.document_token_count(title, text);
-            tokenizer_failed |= result.is_err();
-            result
-        }) {
+        let segmented = match specs {
+            Some(specs) => Ok(specs),
+            None => media::segments_with_token_counter(path, &info, |title, text| {
+                let result = embedder.document_token_count(title, text);
+                tokenizer_failed |= result.is_err();
+                result
+            }),
+        };
+        let specs = match segmented {
             Ok(specs) if !specs.is_empty() => specs,
             Ok(_) => {
                 state.record_failure(
@@ -1133,12 +1272,55 @@ impl Catalog {
         let mut rows = Vec::with_capacity(specs.len());
         let mut thumbnails = Vec::new();
         let mut locations = Vec::new();
-        for spec in specs {
+        // Long documents/clips should not scan every old segment for each new
+        // segment. Borrow the existing metadata once; retain it for cleanup.
+        let mut existing_by_segment = HashMap::with_capacity(existing.len());
+        for row in &existing {
+            ensure!(
+                existing_by_segment
+                    .insert((row.media_kind.as_str(), row.segment_index), row)
+                    .is_none(),
+                "Indexed file contains duplicate segment identities: {path:?}"
+            );
+        }
+        let mut tickets = std::collections::VecDeque::new();
+        let mut scheduled = usize::from(first.is_some());
+        for spec in &specs {
+            let ready = first.take();
+            let queued_limit = if ready.is_some() { 1 } else { 2 };
+            while scheduled < specs.len() && tickets.len() < queued_limit {
+                tickets.push_back(preparation::submit_segment(
+                    pool,
+                    path,
+                    &info,
+                    &specs[scheduled],
+                    embedder.uses_prepared_inputs(),
+                    tokenizer.clone(),
+                )?);
+                scheduled += 1;
+            }
             if cancelled() {
                 return Ok(true);
             }
-            let prepared = match media::decode_segment(path, &info, &spec) {
+            let result = if let Some(ready) = ready {
+                Ok(ready)
+            } else {
+                let Some(result) = tickets
+                    .pop_front()
+                    .context("Missing prepared segment ticket")?
+                    .wait(cancelled)?
+                else {
+                    return Ok(true);
+                };
+                result
+            };
+            let preparation::PreparedSegment {
+                raw: prepared,
+                input,
+                thumbnail,
+            } = match result {
                 Ok(prepared) => prepared,
+                Err(error) if error.is::<FatalPreparation>() => return Err(error),
                 Err(error) => {
                     state.record_failure(path, error, failures);
                     return Ok(cancelled());
@@ -1149,9 +1331,9 @@ impl Catalog {
             }
             // Modality-local indices survive soundtrack additions/removals and
             // slight tail-boundary changes when a file grows or shrinks.
-            let old = existing.iter().find(|row| {
-                row.media_kind == spec.kind.as_str() && row.segment_index == spec.index
-            });
+            let old = existing_by_segment
+                .get(&(spec.kind.as_str(), spec.index))
+                .copied();
             let asset_id = old
                 .map(|row| row.asset_id.clone())
                 .unwrap_or_else(|| format!("asset_{}", Uuid::new_v4()));
@@ -1179,7 +1361,13 @@ impl Catalog {
                         {
                             Ok(cached)
                         } else {
-                            let vector = embedder.embed_document(title, text)?;
+                            let vector = match input {
+                                NativeInput::Text(tokens) => {
+                                    embedder.embed_prepared_document(tokens)
+                                }
+                                NativeInput::Raw => embedder.embed_document(title, text),
+                                _ => bail!("Prepared text input type mismatch"),
+                            }?;
                             validate_embedding(&vector)?;
                             if let Some(key) = key {
                                 self.index_state.save_vector(&key, &vector)?;
@@ -1187,8 +1375,16 @@ impl Catalog {
                             Ok(vector)
                         }
                     }
-                    PreparedMedia::Audio { samples } => embedder.embed_audio(samples),
-                    PreparedMedia::Video { frames } => embedder.embed_video(frames),
+                    PreparedMedia::Audio { samples } => match input {
+                        NativeInput::Audio(inputs) => embedder.embed_prepared_audio(inputs),
+                        NativeInput::Raw => embedder.embed_audio(samples),
+                        _ => bail!("Prepared audio input type mismatch"),
+                    },
+                    PreparedMedia::Video { frames } => match input {
+                        NativeInput::Video(inputs) => embedder.embed_prepared_video(inputs),
+                        NativeInput::Raw => embedder.embed_video(frames),
+                        _ => bail!("Prepared video input type mismatch"),
+                    },
                 }
                 .with_context(|| {
                     format!(
@@ -1212,7 +1408,10 @@ impl Catalog {
                     let cache = self
                         .thumbnails
                         .join(format!("{asset_id}-{}.webp", &digest[..16]));
-                    thumbnails.push((cache.clone(), thumbnail(frame)?));
+                    thumbnails.push((
+                        cache.clone(),
+                        thumbnail.context("Prepared video thumbnail missing")?,
+                    ));
                     (
                         frame.width(),
                         frame.height(),
@@ -1374,6 +1573,7 @@ impl Catalog {
             content_hash,
             embedding_profile,
             verify_after,
+            thumbnail,
         } = pending;
         let source_check = stamp(&path).and_then(|after| {
             ensure!(
@@ -1402,7 +1602,7 @@ impl Catalog {
             .thumbnails
             .join(format!("{asset_id}-{}.webp", &digest[..16]));
         let thumb_start = Instant::now();
-        write_atomic(&cache, &thumbnail(image)?)?;
+        write_atomic(&cache, &thumbnail)?;
         if let Err(error) = stamp(&path).and_then(|after| {
             ensure!(
                 before == after,
@@ -1617,6 +1817,42 @@ mod tests {
             invalid_embedding: None,
         }
     }
+    #[test]
+    fn image_lookahead_leaves_room_for_a_same_stat_sidecar_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let photos = root.path().join("photos");
+        let data = root.path().join("data");
+        fs::create_dir(&photos).unwrap();
+        save(&photos.join("a.png"), [255, 0, 0]);
+        let mut catalog = Catalog::open(&data).unwrap();
+        let mut model = batch_embedder();
+        catalog
+            .index_with_batch_size(&photos, &mut model, 2, || false, |_| Ok(()))
+            .unwrap();
+        // Source stat and thumbnail still match, but full admission must rebuild
+        // this file's missing generation-bound state. Two later outputs must not
+        // occupy all reservations before that repair job can start.
+        fs::remove_dir_all(data.join("index-state-v1/files")).unwrap();
+        save(&photos.join("b.png"), [0, 255, 0]);
+        save(&photos.join("c.png"), [0, 0, 255]);
+        let start = Instant::now();
+        let result = catalog
+            .index_with_batch_size(
+                &photos,
+                &mut model,
+                2,
+                || start.elapsed() > std::time::Duration::from_secs(10),
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(
+            !result.cancelled,
+            "Lookahead starved the current repair job"
+        );
+        assert_eq!((result.indexed, result.failed), (3, 0));
+        assert_eq!(catalog.status().unwrap().asset_count, 3);
+    }
+
     #[test]
     fn indexing_batches_respect_the_limit_flush_tails_and_reuse_embeddings() {
         for size in [1, 2, 3, 8] {
@@ -2670,6 +2906,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("media");
         fs::create_dir(&source).unwrap();
+        fs::write(source.join("index.ts"), "export const count = 1;\n").unwrap();
+        fs::write(source.join("types.d.ts"), "export interface Item {}\n").unwrap();
         let video = source.join("movie.mkv");
         let created = Command::new("ffmpeg")
             .args([

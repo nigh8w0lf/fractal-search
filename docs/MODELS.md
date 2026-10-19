@@ -10,15 +10,15 @@ Use **Set up model** in the panel, or the optional development downloader:
 python3 scripts/fetch-embeddinggemma2.py /absolute/model/cache
 ```
 
-The eleven pinned FP32 assets total 2,960,874,003 bytes, approximately 2.96 GB (2.76 GiB). Existing files must pass size/hash verification; corrupt or incomplete files fail visibly. Nested graph paths and distinct per-file `.part` files are preserved. Only verified downloads become final assets; cancellation retains previously verified assets.
+The eleven pinned FP16-model assets total 1,497,222,022 bytes, approximately 1.50 GB (1.39 GiB). Existing files must pass size/hash verification; corrupt or incomplete files fail visibly. Nested graph paths and distinct per-file `.part` files are preserved. Only verified downloads become final assets; cancellation retains previously verified assets.
 
-The persistent application cache is `$XDG_CACHE_HOME/fractal-search/models/embeddinggemma2-daa72c51`, normally under `~/.cache`. Select the cache root containing `tokenizer.json` and `onnx/`, not the `onnx/` subdirectory. Do not store weights in the repository or use a temporary directory for an installed application.
+The persistent application cache is `$XDG_CACHE_HOME/fractal-search/models/embeddinggemma2-daa72c51-fp16`, normally under `~/.cache`. Select the cache root containing `tokenizer.json` and `onnx/`, not the `onnx/` subdirectory. Do not store weights in the repository or use a temporary directory for an installed application.
 
 | Assets | Purpose |
 | --- | --- |
-| `onnx/model.onnx` and `.onnx_data` | Shared text backbone and normalized sentence output |
-| `onnx/vision_encoder.onnx` and `.onnx_data` | Image/frame features |
-| `onnx/audio_encoder.onnx` and `.onnx_data` | Audio features |
+| `onnx/model_fp16.onnx` and `.onnx_data` | Shared text backbone and normalized sentence output |
+| `onnx/vision_encoder_fp16.onnx` and `.onnx_data` | Image/frame features |
+| `onnx/audio_encoder_fp16.onnx` and `.onnx_data` | Audio features |
 | `tokenizer.json`, `tokenizer_config.json` | Exact text vocabulary and tokenization |
 | `config.json`, `processor_config.json`, `preprocessor_config.json` | Pinned model/processor contract and reference tooling |
 
@@ -26,13 +26,13 @@ The export declares Apache-2.0. Preserve applicable licenses and attribution whe
 
 ## Embedding and catalog contract
 
-The pinned FP32 graph and model asset manifest are unchanged: `sentence_embedding` natively contains 768 dimensions under the native graph contract `embeddinggemma2-daa72c51-fp32-multimodal-v1`. Production uses a separate indexed contract, `embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2`: validate the native output, keep the **leading 512 values**, then **L2-normalize that prefix**. Apply this identical projection to every image, text passage, audio segment, temporal visual-video segment and query. Indexed vectors must be finite, nonzero and unit normalized. Do not merely slice a normalized native vector and assume it stays normalized.
+All three pinned graphs use the upstream FP16 variants with float32 input/output interfaces: `sentence_embedding` natively contains 768 dimensions under the native graph contract `embeddinggemma2-daa72c51-fp16-multimodal-v2`. Production uses a separate indexed contract, `embeddinggemma2-daa72c51-fp16-multimodal-mrl512-v3`: validate the native output, keep the **leading 512 values**, then **L2-normalize that prefix**. Apply this identical projection to every image, text passage, audio segment, temporal visual-video segment and query. Indexed vectors must be finite, nonzero and unit normalized. Do not merely slice a normalized native vector and assume it stays normalized.
 
-Schema stays **4**, with its separate lexical/extraction contracts. Catalog metadata validates the indexed model profile, dimension 512 and `fractal.embedding_projection = native768-leading512-l2-v1` together; a missing or conflicting projection guard is incompatible. The private vector-cache format is also versioned and keys its entries by the indexed dimension/projection contract. Existing schema-4 catalogs carrying the previous 768-dimensional profile are incompatible and fail clearly. Use a separate fresh `--data-dir /absolute/new/catalog` and explicitly reindex the desired folders; the current installation preserves old catalogs and never deletes, converts or mixes them automatically. The verified pinned model cache can be reused. No 768/256 dimension selector is exposed to users; explicit full-768 output is for native reference/parity tooling only.
+Schema stays **4**, with its separate lexical/extraction contracts. Catalog metadata validates the indexed model profile, dimension 512 and `fractal.embedding_projection = native768-leading512-l2-v1` together; a missing or conflicting projection guard is incompatible. The private vector-cache format is also versioned and keys its entries by the indexed dimension/projection contract. Existing FP32 schema-4 catalogs (768D or 512D) are incompatible and fail clearly. Use a separate fresh `--data-dir /absolute/new/catalog` and explicitly reindex the desired folders; the current installation preserves old catalogs and never deletes, converts or mixes them automatically. Download the FP16 assets into the separate default cache; the previous FP32 cache is preserved and cannot satisfy this manifest. No 768/256 dimension selector is exposed to users; explicit full-768 output is for native reference/parity tooling only.
 
 This follows [Google's Matryoshka guidance](https://huggingface.co/google/embeddinggemma-2#3-matryoshka-dimension-truncation). Published model-card scores at 512 versus native 768 dimensions are MTEB multilingual v2 61.17 versus 61.36, MIEB lite 64.32 versus 64.64, and MMEB v2 overall 58.38 versus 59.01. These are upstream benchmark results, not measurements of this app or its labeled corpus.
 
-Raw FP32 vector payloads fall from 3,072 to 2,048 bytes per segment, a one-third reduction before database/index overhead. Similarity scoring processes fewer coordinates, but application latency improvements require measurement. The native graph still computes all 768 outputs: this change does **not** reduce model weights, inference work, model RAM or VRAM.
+Raw FP32 vector payloads fall from 3,072 to 2,048 bytes per segment, a one-third reduction before database/index overhead. Similarity scoring processes fewer coordinates, but application latency improvements require measurement. The native graph still computes all 768 outputs: the dimension projection alone does **not** reduce model weights or inference work. The separate FP16 graph change reduces the full asset set from 2,960,874,003 to 1,497,222,022 bytes (49.4% less). Upstream retains some FP32 operations and all floating I/O. Runtime RAM/VRAM and latency need provider/workload measurements; they are not guaranteed to halve.
 
 The shared graph takes int64 `input_ids`/`attention_mask` and float32 image/video/audio feature matrices with 512 columns. Absent modalities still receive real empty `[0, 512]` tensors. Use `sentence_embedding`, which already includes the graph's native projection, masked mean pooling and 768D normalization, then perform the separate leading-512/L2 indexed projection described above. `last_hidden_state` is not the current retrieval representation. Video features go to `video_features`, not `image_features`.
 
@@ -52,6 +52,8 @@ Native preprocessing converts RGB, performs aspect-preserving antialiased bicubi
 
 Consecutive images can be batched (saved setting 1–8, default 1). Skips, unchanged files and batch tails may yield smaller batches. Failure never triggers a smaller-batch retry or provider fallback. A larger batch needs more memory; no fixed RAM/VRAM envelope is claimed.
 
+The [shared preparation pool](INDEXING-WORKERS.md) constructs native image patches, document tokens, audio features and video frame inputs on CPU workers ahead of serial inference. It uses the same preprocessing functions and embedding projection as synchronous runtime calls; models, token budgets, profiles and catalog schema do not change.
+
 ### Audio and video
 
 System FFmpeg decodes mono 16 kHz float PCM in segments up to 30 seconds. Audio extraction uses a periodic 320-sample Hann window, hop 160 and FFT 512; prepends 160 zeros; right-pads to a multiple of 128; and calculates 128 unnormalized HTK mel bands from 0–8 kHz over magnitude, not power. It computes `log(mel + 0.001)` without normalization, dither or preemphasis. Boolean masks downsample every four frames, producing at most 750 soft tokens per 30 seconds. Fewer than 161 samples are rejected.
@@ -60,11 +62,13 @@ Video visual segments are at most 30 seconds, sampled at 1 fps with at most 30 f
 
 A video's soundtrack is indexed separately as timestamped audio segments. The first audio and first non-cover-art video track are selected; alternate tracks/subtitles/attachments are not indexed. Stream offsets are normalized to the container origin. Tiny final intervals adjust the preceding boundary without losing or overlapping source content.
 
-Audio/video inputs are capped at 2 GiB/two hours. Video frames above 2,073,600 pixels or a 4,096-pixel side are rejected. Decoders have local-only protocol/demuxer allowlists, time/output/memory bounds and process-group cleanup. Corrupt packets and error-level stderr fail visibly, even if FFmpeg exits successfully. A failed segment prevents partial replacement of the file's previous complete segment set.
+Audio/video inputs are capped at 2 GiB/two hours. Video sources may contain up to 16,777,216 pixels with sides up to 8,192 pixels. Sampled frames are downscaled, preserving aspect ratio to pixel rounding and never upscaling, to at most 2,073,600 pixels and a 4,096-pixel side before model preprocessing. Originals remain unchanged. Ambiguous `.ts` files are checked for transport-stream headers and text content: TypeScript source is excluded, while binary inputs still undergo normal decoder validation. Audio is resampled to mono 16 kHz and trimmed to the segment’s exact sample budget (at most 480,000 samples), with normalized output timestamps. Decoders have local-only protocol/demuxer allowlists, time/output/memory bounds and process-group cleanup. Corrupt packets and error-level stderr fail visibly, even if FFmpeg exits successfully. A failed segment prevents partial replacement of the file's previous complete segment set.
+
+See [FP16 validation](FP16-VALIDATION.md) for current checks and deployment status.
 
 ## Providers and validation
 
-CPU and CUDA use the same native FP32 graphs and normalized 512D indexed profile. CUDA is explicit, disables TF32, and fails visibly without retrying on CPU. The shared backbone loads for text or any media inference; vision/audio encoders remain lazy. Browsing and metadata load no models. See [CUDA.md](../quickshell-app/CUDA.md) for actual provider-placement validation.
+CPU and CUDA use the same pinned FP16 graphs and normalized 512D indexed profile. CUDA is explicit, disables TF32, and fails visibly without retrying on CPU. The shared backbone loads for text or any media inference; vision/audio encoders remain lazy. Browsing and metadata load no models. See [CUDA.md](../quickshell-app/CUDA.md) for actual provider-placement validation.
 
 Reference generation uses Hugging Face's Gemma4 image/audio preprocessing and the pinned tokenizer, followed by the pinned export in Python ONNX Runtime. It does not compare with Google's original PyTorch checkpoint. Optional development dependencies are NumPy, Pillow, Torch, Torchvision, Transformers exposing these processors, and ONNX Runtime; production inference remains Rust-only. The generator records dependency versions and performs no remote model-code execution or automatic asset download.
 
@@ -87,7 +91,7 @@ cargo run --locked -p fractal-search-core --example validate_embeddinggemma2 -- 
   --native-output /absolute/model/cache /absolute/new/native-fixtures/fixtures.json
 ```
 
-Existing full-768 reference fixtures remain useful in this explicit native validator mode. To compare them with the production 512D catalog, the retrieval comparator's `--native-fixtures` option explicitly projects their references first; it does not switch the catalog or queries to 768D. Freshly generated native fixtures include mode metadata; pre-mode native fixtures require this explicit option and every vector is still checked as native 768D.
+Regenerate reference fixtures against the FP16 graphs. FP32 and unversioned fixtures are rejected in both indexed and native modes. To compare FP16 native fixtures with the production 512D catalog, the retrieval comparator's `--native-fixtures` option explicitly projects their references first; it does not switch the catalog or queries to 768D. Native fixtures require matching precision/profile metadata and every vector is checked as native 768D.
 
 Model-free projection, fixture-mode and evaluation-protocol checks:
 
@@ -102,4 +106,4 @@ The validator checks tokens, masks, patches and feature tensors, then requires e
 
 The optimized development runtime's [2026-10-08 CPU/CUDA validation](../quickshell-app/CUDA.md#development-optimization-validation-2026-10-08) passed twelve embedding comparisons across all four modalities and verified CUDA matrix/attention execution in all three graphs. The separate [synthetic indexing comparison](../quickshell-app/README.md#development-optimization-validation-2026-10-08) retained 24 identical search scores. Those reports retain their workload/compiler limitations; full CUDA batch-eight and labeled relevance were not established.
 
-These historical optimization measurements used the prior 768D indexed profile and do not establish integrated 512D parity or relevance.
+These historical optimization measurements used the prior FP32/768D indexed profile and do not establish FP16/512D parity or relevance.

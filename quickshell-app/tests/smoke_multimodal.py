@@ -77,9 +77,9 @@ def main():
         try:
             ready = desktop.until(lambda event: event.get('event') == 'ready')['payload']
             assert ready['catalog']['fileCount'] == ready['catalog']['assetCount'] == 0
-            assert ready['catalog']['modelProfile'] == 'embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2'
+            assert ready['catalog']['modelProfile'] == 'embeddinggemma2-daa72c51-fp16-multimodal-mrl512-v3'
             request = desktop.send({'type': 'index', 'directory': str(originals)})
-            # Multimodal FP32 inference can take minutes on CPU.
+            # Multimodal inference can take minutes on CPU.
             desktop.until(lambda event: event.get('id') == request and 'ok' in event, timeout=1800)
             indexed = desktop.response(request)
             assert indexed['indexed'] == 5 and indexed['failed'] == 0, indexed
@@ -131,7 +131,7 @@ def main():
             mcp = Mcp(args.mcp.resolve(), catalog, args.models.resolve(), root / 'mcp.log')
             status = data(mcp.tool('status'))
             assert status['assetCount'] == count and status['fileCount'] == 5 and not status['textModelLoaded']
-            assert status['modelProfile'] == 'embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2'
+            assert status['modelProfile'] == 'embeddinggemma2-daa72c51-fp16-multimodal-mrl512-v3'
             page = data(mcp.tool('browse_assets', {'limit': 100}))
             assert page['total'] == count
             for item in page['items']:
@@ -171,8 +171,8 @@ def main():
             assert not any(str(root) in json.dumps(message) or 'file://' in json.dumps(message) for message in mcp.history)
             mcp.stop(); mcp = None
             assert catalog_hashes(catalog) == before
-            assert 'Loaded onnx/vision_encoder.onnx' not in (root / 'mcp.log').read_text()
-            assert 'Loaded onnx/audio_encoder.onnx' not in (root / 'mcp.log').read_text()
+            assert 'Loaded onnx/vision_encoder_fp16.onnx' not in (root / 'mcp.log').read_text()
+            assert 'Loaded onnx/audio_encoder_fp16.onnx' not in (root / 'mcp.log').read_text()
             desktop.close()
         finally:
             if mcp is not None:

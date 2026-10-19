@@ -3,7 +3,7 @@
 
 Requires NumPy, Pillow, PyTorch, Torchvision and Transformers with
 Gemma4ImageProcessor support. Full parity also needs ONNX Runtime and an
-existing verified FP32 model cache. --preprocess-only uses only the verified
+existing verified FP16 model cache. --preprocess-only uses only the verified
 config/tokenizer files and never opens a model graph or weights.
 No network access, remote model code, catalog access, or weight downloads occur.
 The default reference projects native output to leading-512/L2-normalized indexed
@@ -103,7 +103,7 @@ def main():
         options.inter_op_num_threads = 1
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        model = ort.InferenceSession(str(models / "onnx/model.onnx"), options,
+        model = ort.InferenceSession(str(models / "onnx/model_fp16.onnx"), options,
                                     providers=["CPUExecutionProvider"])
     vision = None
     audio_encoder = None
@@ -230,7 +230,7 @@ def main():
         features = empty
         if not args.preprocess_only:
             if vision is None:
-                vision = ort.InferenceSession(str(models / "onnx/vision_encoder.onnx"), options,
+                vision = ort.InferenceSession(str(models / "onnx/vision_encoder_fp16.onnx"), options,
                                              providers=["CPUExecutionProvider"])
             features = vision.run(["image_features"], {
                 "pixel_values": pixels, "pixel_position_ids": positions,
@@ -275,7 +275,7 @@ def main():
         features = empty
         if not args.preprocess_only:
             if vision is None:
-                vision = ort.InferenceSession(str(models / "onnx/vision_encoder.onnx"), options,
+                vision = ort.InferenceSession(str(models / "onnx/vision_encoder_fp16.onnx"), options,
                                              providers=["CPUExecutionProvider"])
             features = vision.run(["image_features"], {
                 "pixel_values": pixels, "pixel_position_ids": positions,
@@ -305,7 +305,7 @@ def main():
         import gc
         gc.collect()
     if not args.preprocess_only:
-        audio_encoder = ort.InferenceSession(str(models / "onnx/audio_encoder.onnx"), options,
+        audio_encoder = ort.InferenceSession(str(models / "onnx/audio_encoder_fp16.onnx"), options,
                                             providers=["CPUExecutionProvider"])
 
     audio_cases = {

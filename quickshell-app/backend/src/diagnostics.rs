@@ -15,7 +15,7 @@ use std::{
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_OUTPUT: usize = 256 * 1024;
 const MAX_DIRECTORIES: usize = 256;
-// ORT 1.22's CUDA 12 build uses cuDNN 9. The provider dependency check below
+// ORT 1.24.2's CUDA 12 build uses cuDNN 9. The provider dependency check below
 // also reports transitive requirements specific to the installed build.
 const REQUIRED: &[(&str, &str)] = &[
     ("libcuda.so.1", "NVIDIA driver"),
@@ -23,6 +23,7 @@ const REQUIRED: &[(&str, &str)] = &[
     ("libcublas.so.12", "CUDA 12 cuBLAS"),
     ("libcublasLt.so.12", "CUDA 12 cuBLAS Lt"),
     ("libcufft.so.11", "CUDA 12 cuFFT"),
+    ("libcurand.so.10", "CUDA 12 cuRAND"),
     ("libnvJitLink.so.12", "CUDA 12 nvJitLink"),
     ("libcudnn.so.9", "cuDNN 9"),
     (

@@ -39,6 +39,10 @@ def main():
         assert bindings.read_text() == original_bindings
         assert list((data / 'fractal-search/runtime').glob('*/bin/fractal-folder-picker'))
         assert list((data / 'fractal-search/runtime').glob('*/bin/fractal-search-mcp'))
+        installed_license = list((data / 'fractal-search/runtime').glob('*/LICENSE'))
+        assert len(installed_license) == 1
+        assert installed_license[0].read_bytes() == (bundle / 'LICENSE').read_bytes()
+        assert (installed_license[0].parent / 'LANCEDB-LICENSE').read_bytes() == (bundle / 'LANCEDB-LICENSE').read_bytes()
         mcp = plugin / 'fractal-search-mcp'
         help_result = subprocess.run([str(mcp), '--help'], text=True, capture_output=True)
         assert help_result.returncode == 0, help_result.stdout + help_result.stderr
@@ -108,14 +112,30 @@ def main():
         marker.write_bytes(saved)
         fakebin = root / 'commands'; fakebin.mkdir()
         wrappers = {
-            'systemctl': '#!/bin/sh\nif [ "$2" = disable ]; then rm "$XDG_CONFIG_HOME/systemd/user/graphical-session.target.wants/fractal-search.service"; fi\nexit 0\n',
-            'omarchy-shell': '#!/bin/sh\necho ok\n',
-            'omarchy': '#!/bin/sh\nif [ "$2" = enable ]; then echo "injected enable failure" >&2; exit 9; fi\nexit 0\n',
+            'systemctl': """#!/bin/sh
+case "$2" in
+  show) cat "$SEARCH_TEST_STATE" ;;
+  stop) echo inactive > "$SEARCH_TEST_STATE" ;;
+  start)
+    if [ -e "$SEARCH_TEST_FAIL_START" ]; then rm "$SEARCH_TEST_FAIL_START"; echo 'injected start failure' >&2; exit 9; fi
+    echo active > "$SEARCH_TEST_STATE" ;;
+  disable) rm "$XDG_CONFIG_HOME/systemd/user/graphical-session.target.wants/fractal-search.service" ;;
+esac
+exit 0
+""",
+            'omarchy-shell': """#!/bin/sh
+if [ "$2" = call ]; then basename "$(cat "$SEARCH_TEST_PLUGIN/.fractal-search-install")"; else echo ok; fi
+""",
+            'omarchy': '#!/bin/sh\nif [ "$2" = enable ] && [ "$SEARCH_TEST_FAIL_ENABLE" = 1 ]; then echo "injected enable failure" >&2; exit 9; fi\nexit 0\n',
             'hyprctl': '#!/bin/sh\nexit 0\n',
         }
         for name, text in wrappers.items():
             p = fakebin / name; p.write_text(text); p.chmod(0o755)
-        environment = dict(os.environ, PATH=str(fakebin)+':'+os.environ['PATH'])
+        service_state = root / 'service-state'; service_state.write_text('active\n')
+        fail_start = root / 'fail-start'
+        environment = dict(os.environ, PATH=str(fakebin)+':'+os.environ['PATH'],
+                           SEARCH_TEST_STATE=str(service_state), SEARCH_TEST_PLUGIN=str(plugin),
+                           SEARCH_TEST_FAIL_START=str(fail_start), SEARCH_TEST_FAIL_ENABLE='1')
         obsolete = data / 'fractal-search/runtime/0.1.0-aaaaaaaaaaaa-cpu'
         if not obsolete.exists():
             (obsolete / 'bin').mkdir(parents=True)
@@ -124,9 +144,23 @@ def main():
         failed = install(False, env=environment)
         assert obsolete.exists(), 'Failed installation pruned an older build'
         assert 'restoring the previous' in failed.stderr
+        assert service_state.read_text().strip() == 'active', 'Rollback did not restore the active service'
         assert panel.read_bytes() == original_ui
         assert unit.read_bytes() == original_unit
         assert catalog.read_bytes() == b'untouched catalog marker'
+        success_environment = dict(environment, SEARCH_TEST_FAIL_ENABLE='0')
+        install(env=success_environment)
+        assert service_state.read_text().strip() == 'active', 'Update did not restart the service'
+        service_state.write_text('inactive\n')
+        install(env=success_environment)
+        assert service_state.read_text().strip() == 'inactive', 'Update started a previously inactive service'
+        service_state.write_text('active\n')
+        fail_start.touch()
+        failed_start = install(False, env=success_environment)
+        assert 'injected start failure' in failed_start.stderr
+        assert service_state.read_text().strip() == 'active', 'Start failure rollback did not restore service'
+        assert unit.read_bytes() == original_unit
+        assert panel.read_bytes() == original_ui
         ldd = fakebin / 'ldd'; ldd.write_text('#!/bin/sh\necho "libheif.so.1 => not found"\n'); ldd.chmod(0o755)
         assert 'native runtime dependencies' in install(False, ['--skip-shell'], environment).stderr
         assert unit.read_bytes() == original_unit
@@ -144,6 +178,7 @@ def main():
         ldd.unlink()
         failed = install(False, env=environment)
         assert 'restoring the previous' in failed.stderr
+        assert service_state.read_text().strip() == 'active', 'Rollback did not restore the active service'
         assert bindings.read_text() == installed_bindings
         uninstall = subprocess.run([str(bundle / 'uninstall.sh')], env=dict(environment, XDG_CONFIG_HOME=str(config)), text=True, capture_output=True)
         assert uninstall.returncode == 0,uninstall.stdout+uninstall.stderr
@@ -151,7 +186,7 @@ def main():
         assert catalog.read_bytes() == b'untouched catalog marker'
         assert not plugin.exists()
         assert not enabled_link.is_symlink()
-    print('Installer: install/update, stable MCP command, explicit provider/persistence, catalog preservation, checksum failure, unmanaged paths, missing runtime, close binding update/rollback and uninstall passed')
+    print('Installer: install/update, stable MCP command, explicit provider/persistence, catalog preservation, checksum failure, unmanaged paths, missing runtime, close binding update/rollback, active/inactive service preservation, failed-start recovery and uninstall passed')
 
 
 if __name__ == '__main__':

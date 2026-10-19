@@ -1,0 +1,73 @@
+# Shared indexing preparation workers
+
+Every source scan creates two CPU preparation threads shared by image, text, audio and video jobs. No new dependencies or runtime settings are introduced. The catalog thread still admits files in sorted order, checks content hashes/reuse, owns model calls, commits results and performs lexical maintenance. Native ONNX sessions are never shared with preparation workers.
+
+## Work and bounds
+
+- Images: decode and build the pinned image tensors ahead of inference. Consecutive images still use the saved batch size (1–8); merging individually prepared tensors preserves the existing batch layout exactly.
+- Text: read/extract passages with real formatted-input token checks, then tokenize passages using an immutable, verified tokenizer shared with the runtime. Cached document vectors still bypass inference. Custom/test embedders without native input support retain their explicit raw-input/token-count contract.
+- Audio: decode/resample/trim the segment and compute native audio features ahead of inference.
+- Video: decode/downscale the segment and prepare its frame tensors ahead of serial vision inference. Soundtrack segments use the same pool as audio files. File lookahead includes preparation of the first segment, allowing short clips to overlap the previous file’s inference too.
+
+Lookahead is limited to the following file and the following segment of the current file. With image batching enabled, a run of consecutive images permits two following files so both images of a batch of two can prepare during inference. At modality boundaries this returns to one following file, leaving reservation space for the current media file’s segment jobs. The queue allows at most four pending jobs. Abandoned queued work is removed before admission; completed outputs retain reservations until consumed or discarded. Budget admission follows submission order so later outputs cannot starve the result the catalog awaits.
+
+The reservation budget is 2 GiB: 1 GiB per still-image job, 512 MiB per audio/video file-or-segment job, and 16 MiB per text job. These are conservative scheduling reservations, **not a process RSS limit**. They exclude the caller's active image batch/current segment, ONNX allocations and decoder subprocess memory. Existing image/sample/frame/output limits and subprocess resource/time limits continue to apply. FFmpeg decoding and filter graphs use one thread each to avoid nested machine-wide parallelism. Large image batches and models can still require substantial memory. The pool does not dynamically switch providers, shrink batches or retry failures.
+
+Unchanged files with current caches are not routinely decoded. Speculative preparation can be discarded when content-hash admission establishes that a touched file is unchanged. Image thumbnails and video posters are encoded from the same decoded pixels inside preparation jobs; encoding failures remain fatal. Hash verification, thumbnail/cache publication and database writes stay on the catalog thread. More workers or parallel model calls are not implied by this implementation.
+
+## Failure and cancellation contract
+
+Read/decode/source-change failures remain per-file reports and preserve earlier indexed generations. Native input construction errors, worker panics, model failures and storage/cache-write errors stop indexing with an actionable error. Preparation checks source stamps before and after work and again against the catalog's admitted stamp; existing final stat/hash checks remain in place.
+
+Cancellation signals the shared pool, discards queued jobs and joins active preparation. Stop and abandoned-job notifications synchronize with the same mutex used by sleeping workers, preventing a lost wakeup from leaving shutdown blocked after an error or cancellation. FFmpeg/ffprobe polling observes cancellation and reaps its process group. CPU operations that cannot be interrupted finish before their thread joins. In-flight inference remains noninterruptible: still-image batching commits the current image after inference, while an incomplete multi-segment file publishes no partial rows. Cancelled traversals never prune unvisited entries.
+
+`[Preparation]` stderr summaries report workers, task count, summed worker time and peak reserved bytes. Summed worker time can exceed wall time because jobs overlap. It is not GPU time or measured RSS. Image `thumbnail_and_store_ms` measures publication/storage after worker thumbnail encoding (older logs also included encoding). Image `decode_ms` includes catalog admission/wait time; `prepare_and_load_ms` now excludes CPU tensor preparation performed by the pool, so those stages must not be compared as like-for-like before/after preprocessing measurements.
+
+## Validation
+
+Pool tests cover actual two-worker overlap, held-result backpressure, cancellation/join, stop-notification synchronization, abandoned jobs and fatal panics. An exact tensor test compares merged individual image preparation with the existing native batch preparation. Catalog regressions exercise batching, same-stat sidecar repair under lookahead, reuse, source errors and atomic cancellation; decoder cancellation has a subprocess test.
+
+Run the workspace CPU/CUDA checks in `AGENTS.md`. The opt-in `native_audio_video_and_soundtrack_segments_share_one_catalog` and `native_media_resizes_video_and_bounds_audio_samples` Rust tests require FFmpeg. `quickshell-app/tests/smoke_multimodal.py` exercises real pinned-model inference for all four media types using a temporary synthetic catalog. The existing `benchmark_indexing.py` compares warmed synthetic image throughput and search scores; it does not establish text/audio/video throughput or large-library performance.
+
+The change preserves schema, extraction/model profiles, vector caching and normalized 512-dimensional embeddings. Existing catalogs need no reset or reindex.
+
+## Local validation — 2026-10-15
+
+The final CUDA-feature core suite passed 140 tests (six opt-in tests excluded from its default run). Three selected opt-in checks then passed: bounded native decoding, the mixed-media catalog test, and native-to-indexed projection parity for every modality/query using the existing verified model cache. CPU and CUDA workspace checks passed. The workspace unit suites also passed during development; the final preparation changes were retested through the core suite and real CUDA multimodal smoke test. The latter covers unchanged rescans, failed replacement preservation, filtered retrieval and read-only MCP after originals are removed.
+
+Warmed CUDA measurements with image batch size 2, the same model cache/provider/thread settings, no concurrent build and temporary synthetic catalogs:
+
+| Fixture | Installed baseline | Shared pool | Score parity |
+| --- | --- | --- | --- |
+| Eight 1024×1536 PNGs | 3.943 s; repeat 4.040 s | 3.364 s | 24 scores identical |
+| Five mixed files: image, Markdown, 31-second audio, video with soundtrack, silent video | 4.112 s | 2.366 s | Nine scores; maximum absolute difference 5.96e-8 |
+
+That is approximately 17–20% higher image throughput and 74% higher mixed-fixture throughput (15–17% and 42% less elapsed time respectively). These small warmed scans do not establish sustained large-library performance or separate per-modality improvements. Mixed-fixture text passages reuse compatible vectors from warmup, so it is **not a text embedding throughput benchmark**. Image parent-process CPU time was 4.97 s versus 4.72–4.86 s before: overlap trades slightly more CPU work for lower elapsed time here.
+
+`quickshell-app/tests/benchmark_multimodal.py BINARY MODELS NEW_OUTPUT [--compare PREVIOUS_REPORT]` reproduces the mixed fixture, using the same provider environment as `benchmark_indexing.py`. The recorded reports/logs are under `/tmp/fractal-pool-before`, `/tmp/fractal-pool-before-repeat`, `/tmp/fractal-pool-after-final`, `/tmp/fractal-pool-mixed-before` and `/tmp/fractal-pool-mixed-after`. The mixed run used an equivalent temporary harness before the reusable script was added; the reusable script additionally records binary/model-profile metadata. Reports from that temporary harness lack the new profile field and should be regenerated before using the reusable script's comparison option.
+
+Installer smoke checks passed with the explicit host CUDA library directory. Bundle `0.1.0-01398195788a-close-cuda-0-5376c7db` was installed; plugin ping and active CUDA text warmup were verified. Settings, runtime provider configuration and personal bindings remained byte-identical; login registration remained disabled and the previously active backend was restarted. The install pruned one obsolete runtime and retained the current/previous builds. Local parallel linking exceeded available memory once; final builds used `-j 1` without changing the project's incremental caching or optimization settings.
+
+## Hardware-independent indexing overhead
+
+The default single-image batch transfers prepared tensor buffers directly to inference without a second copy; larger batches reserve the final capacity once and append in order. Input values, model graphs, provider selection, batch size, worker count and memory reservations are unchanged.
+
+Database serialization builds Arrow columns for groups of up to 256 segments instead of allocating a complete set of one-row columns for every segment. New non-text files also skip the old-text count query when the same table snapshot has already established that there are no rows to replace. Every group is validated before starting the same atomic per-file replacement; images still commit individually. Long files match previous segment identities through a per-file lookup table rather than scanning all previous segments repeatedly. No database format, search behavior, cache profile or durability changes are involved, and no reindex is required.
+
+Regression checks cover exact input tensors, buffer ownership for a single image, byte-identical thumbnails, grouped nullable Arrow columns, cross-group validation before commit, and existing cancellation/source-change behavior. An opt-in model-free serialization benchmark compares 50 iterations of 300 synthetic video/audio records using one-row versus grouped construction:
+
+```bash
+cargo test --workspace --locked --lib benchmark_segment_record_batches -- --ignored --nocapture
+```
+
+This isolates record construction; it does not measure model inference, disk commits or end-to-end media throughput.
+
+### Validation — 2026-10-16
+
+CPU and CUDA workspace checks and test suites passed (168 tests in each configuration, seven opt-in core tests excluded). The new model-free record-construction benchmark passed separately: 50 iterations of 300 synthetic audio/video records took 210.78 ms as one-row batches versus 28.52 ms in bounded groups, about 7.4× faster **for construction alone**, excluding database commits and inference. Exact thumbnail bytes and image tensors were preserved. The real CUDA multimodal smoke check passed, including soundtrack segments, stable rescans, failed replacement preservation, hybrid filtering and read-only MCP with removed originals. CPU image inference also retained all 24 benchmark search scores exactly.
+
+Initial warmed image runs varied: CPU 57.44 s before versus 61.08 s after; CUDA 3.83 s versus 4.25 s. The differences were dominated by inference timing, despite reduced serial publication time. A consecutive CUDA baseline/update repeat measured 3.44 s versus 3.31 s (about 4% higher throughput), with inference at 3.070/3.042 s and serial publication at 0.237/0.113 s. The repeated CPU baseline/update pair measured 56.94/57.87 s (the update was about 1.7% slower); no CPU image-throughput gain is established. All 24 image search scores matched exactly in every comparison. These are eight-image synthetic runs at batch size two on one host, not a universal speedup claim. The stage named `thumbnail_and_store_ms` intentionally excludes worker encoding in the updated implementation, so its reduction reflects work moved off the serial path as well as a skipped database query; it is not a claim of that much CPU work eliminated.
+
+Reports and logs are under `/tmp/fractal-efficiency-*`. The first sandboxed socket test and CUDA initialization attempts were blocked by the environment; both succeeded with the required host access. No user catalog was used for validation.
+
+Bundle `0.1.0-a83decfb6b72-close-cuda-0-5376c7db` was installed after the temporary installer suite passed. Plugin ping and CUDA text warmup succeeded. Settings, provider configuration and personal bindings remained byte-identical; the previously active service was restored and login registration remained disabled. The installer pruned one obsolete runtime. No reindex or schema change was required.

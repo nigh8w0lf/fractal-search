@@ -213,6 +213,9 @@ while not (root / 'restart.complete').exists():
             });
         }
         function refreshDiagnostics()'''))
+        panel_source.write_text(panel_source.read_text().replace('previewLoading: app.previewLoading,',
+            'previewLoading: app.previewLoading, mediaPlaying: mediaPreview.playing, mediaLoaded: mediaPreview.loaded, mediaError: mediaPreview.playbackError,').replace('function refreshDiagnostics()',
+            'function clickPlayback(): void { input.mouseClick(input.findChild(mediaPreview, "playbackToggle")); }\n        function mutePlayback(): void { input.mouseClick(input.findChild(mediaPreview, "playbackMute")); }\n        function refreshDiagnostics()'))
         # An opaque desktop window exercises remapping above another app.
         shell = ui / 'shell.qml'
         shell.write_text(shell.read_text().replace('ShellRoot {', '''ShellRoot {
@@ -437,10 +440,10 @@ with (root / 'viewer.log').open('a') as log:
         media = root / 'media'; media.mkdir()
         (media / 'notes.md').write_text('A red bicycle beside the cafe. Exact identifier QX42.', encoding='utf-8')
         subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
-                        'sine=frequency=440:sample_rate=16000:duration=1', str(media / 'tone.wav')],
+                        'sine=frequency=440:sample_rate=16000:duration=3', str(media / 'tone.wav')],
                        check=True, capture_output=True, timeout=30)
         subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
-                        'color=c=blue:s=96x64:r=2:d=1', '-an', '-c:v', 'mpeg4', str(media / 'clip.mp4')],
+                        'color=c=blue:s=96x64:r=2:d=3', '-an', '-c:v', 'mpeg4', str(media / 'clip.mp4')],
                        check=True, capture_output=True, timeout=30)
         call('test', 'index', str(media))
         wait(lambda s: not s['indexing'] and s['assetCount'] == 5 and s['fileCount'] == 5, timeout=180)
@@ -453,6 +456,14 @@ with (root / 'viewer.log').open('a') as log:
                 assert not state['previewUrl'] and state['previewText'], state
             elif kind == 'video':
                 assert state['previewUrl'], state
+            assert not state['mediaPlaying'] and not state['mediaLoaded'], state
+            if kind in ['audio', 'video']:
+                if kind == 'audio':
+                    call('test', 'mutePlayback')
+                call('test', 'clickPlayback')
+                wait(lambda s: s['mediaPlaying'] and not s['mediaError'], timeout=15)
+                call('test', 'clickPlayback')
+                wait(lambda s: not s['mediaPlaying'] and s['mediaLoaded'])
         media_source_index = 1 + next(index for index, source in enumerate(all_media['sources']) if source['directory'] == str(media))
         call('test', 'chooseFilter', 'sourceFilter', str(media_source_index))
         filtered = wait(lambda s: not s['loading'] and s['count'] == 3)

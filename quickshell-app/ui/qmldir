@@ -19,3 +19,5 @@ AcceleratorSection 1.0 AcceleratorSection.qml
 GroupedTextMatches 1.0 GroupedTextMatches.qml
 ModelIdlePolicy 1.0 ModelIdlePolicy.qml
 ModelRuntimeSection 1.0 ModelRuntimeSection.qml
+MediaPreview 1.0 MediaPreview.qml
+SearchSlider 1.0 SearchSlider.qml

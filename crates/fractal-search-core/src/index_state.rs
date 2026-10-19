@@ -13,7 +13,7 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) const EMBEDDING_CACHE_VERSION: &str =
-    "formatted-input-assets-tokenizer-preprocess-fp32-mrl512-v2";
+    "formatted-input-assets-tokenizer-preprocess-fp16-mrl512-v3";
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_VECTOR_BYTES: u64 = 32 * 1024;
 
@@ -257,7 +257,7 @@ impl IndexState {
             runtime,
             include_str!("../models/embeddinggemma2.json"),
             "text",
-            "fp32",
+            "fp16",
             EMBEDDING_PROJECTION,
             "tokenizers-0.22.2-bos-eos-literal-specials",
             extraction,

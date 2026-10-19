@@ -155,7 +155,7 @@ impl State {
         saved.map(Ok).unwrap_or_else(|| {
             dirs::cache_dir()
                 .context("Cannot locate model cache")
-                .map(|path| path.join("fractal-search/models/embeddinggemma2-daa72c51"))
+                .map(|path| path.join("fractal-search/models/embeddinggemma2-daa72c51-fp16"))
         })
     }
     fn execute(&mut self, action: Action) -> Result<CallToolResult> {

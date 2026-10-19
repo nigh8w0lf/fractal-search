@@ -219,7 +219,7 @@ def main():
             client.response(2)
             assert process.wait(timeout=15) == 0
             client.close()
-            assert not (empty / 'onnx/vision_encoder.onnx').exists()
+            assert not (empty / 'onnx/vision_encoder_fp16.onnx').exists()
             print('Offline model-download progress/cancel leaves no unverified asset', flush=True)
         finally:
             stop(process); log.close()

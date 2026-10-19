@@ -493,7 +493,7 @@ fn serve(options: Options) -> Result<()> {
         Some(path) => path,
         None => dirs::cache_dir()
             .context("Cannot determine model cache directory")?
-            .join("fractal-search/models/embeddinggemma2-daa72c51"),
+            .join("fractal-search/models/embeddinggemma2-daa72c51-fp16"),
     };
     let model_dir = if model_dir.is_absolute() {
         model_dir

@@ -144,6 +144,27 @@ fn main() -> Result<()> {
         );
         let fixtures: Vec<Fixture> = serde_json::from_slice(&fs::read(&file)?)?;
         let directory = file.parent().context("Fixture directory missing")?;
+        if !preprocess_only {
+            let environment: serde_json::Value = serde_json::from_slice(
+                &fs::read(directory.join("environment.json"))
+                    .context("Reference environment is required; regenerate FP16 fixtures")?,
+            )?;
+            ensure!(
+                environment["model_profile"].as_str()
+                    == Some(if native_output {
+                        NATIVE_MODEL_PROFILE
+                    } else {
+                        MODEL_PROFILE
+                    })
+                    && environment["embedding_dimension"].as_u64()
+                        == Some(embedding_dimension as u64)
+                    && environment["native_embedding_dimension"].as_u64()
+                        == Some(NATIVE_EMBEDDING_DIM as u64)
+                    && environment["output_mode"].as_str()
+                        == Some(if native_output { "native" } else { "indexed" }),
+                "Reference precision/profile or output mode differs; regenerate FP16 fixtures"
+            );
+        }
         for fixture in fixtures {
             eprintln!("[Parity] {}", fixture.name);
             let mut preprocessing_max_abs_error = 0.0_f32;

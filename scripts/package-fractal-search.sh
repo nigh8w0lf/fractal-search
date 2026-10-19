@@ -15,6 +15,10 @@ while (($#)); do
   esac
 done
 cd -- "$SEARCH_ROOT"
+if ((SEARCH_CUDA)) && [[ ${ORT_CUDA_VERSION-12} != 12 ]]; then
+  echo 'CUDA bundles require ORT_CUDA_VERSION=12 to match the supported runtime libraries.' >&2
+  exit 1
+fi
 if ((SEARCH_BUILD)); then
   SEARCH_ARGS=(build --locked -p fractal-search -p fractal-folder-picker -p fractal-search-mcp --bins)
   [[ $SEARCH_PROFILE == release ]] && SEARCH_ARGS+=(--release)
@@ -45,7 +49,11 @@ cp -- "$SEARCH_MCP" "$SEARCH_OUTPUT/bin/fractal-search-mcp"
 if ((SEARCH_CUDA)); then
   cp -L -- "$SEARCH_TARGET/$SEARCH_PROFILE/libonnxruntime_providers_shared.so" "$SEARCH_TARGET/$SEARCH_PROFILE/libonnxruntime_providers_cuda.so" "$SEARCH_OUTPUT/bin/"
 fi
-cp -- quickshell-app/manifest.json quickshell-app/packaging/install.sh quickshell-app/packaging/prune-runtimes.sh quickshell-app/packaging/uninstall.sh quickshell-app/packaging/close-window.sh quickshell-app/packaging/close-binding.sh quickshell-app/packaging/README.md quickshell-app/packaging/NOTICE "$SEARCH_OUTPUT/"
+# Keep one source manifest at the repository root for marketplace discovery.
+# Bundles flatten quickshell-app/, so rebase only the panel entry point.
+jq -e '.entryPoints.panel == "quickshell-app/ui/SearchPanel.qml"' manifest.json >/dev/null || { echo 'Unexpected source panel entry point; update bundle layout explicitly.' >&2; exit 1; }
+jq '.entryPoints.panel = "ui/SearchPanel.qml"' manifest.json > "$SEARCH_OUTPUT/manifest.json"
+cp -- LICENSE quickshell-app/packaging/install.sh quickshell-app/packaging/prune-runtimes.sh quickshell-app/packaging/uninstall.sh quickshell-app/packaging/close-window.sh quickshell-app/packaging/close-binding.sh quickshell-app/packaging/README.md quickshell-app/packaging/NOTICE "$SEARCH_OUTPUT/"
 cp -- vendor/lancedb/LICENSE "$SEARCH_OUTPUT/LANCEDB-LICENSE"
 for SEARCH_QML in quickshell-app/ui/*.qml quickshell-app/ui/qmldir; do
   [[ ${SEARCH_QML##*/} == shell.qml ]] && continue

@@ -28,6 +28,7 @@ use std::{
 };
 
 const MAX_ROWS: usize = 250_000;
+const WRITE_BATCH_ROWS: usize = 256;
 const TEXT_INDEX_NAME: &str = "text_passage_bm25_v1";
 const MAX_INDEXED_TEXT_BYTES: usize = 1024 + 1 + 4096;
 const RRF_K: f64 = 60.0;
@@ -198,45 +199,79 @@ fn schema() -> Arc<Schema> {
     ))
 }
 fn batch(row: &Record) -> Result<RecordBatch> {
-    if let Some(vector) = &row.embedding {
-        validate_embedding(vector)?;
+    records_batch(std::slice::from_ref(row))
+}
+
+// Build each column once per bounded group, not once per segment. All groups
+// are validated before the atomic file replacement starts.
+fn records_batch(rows: &[Record]) -> Result<RecordBatch> {
+    ensure!(
+        !rows.is_empty() && rows.len() <= WRITE_BATCH_ROWS,
+        "Invalid catalog write batch size"
+    );
+    for row in rows {
+        if let Some(vector) = &row.embedding {
+            validate_embedding(vector)?;
+        }
+        ensure!(
+            (row.kind == "source" && row.embedding.is_none())
+                || (row.kind == "asset" && row.embedding.is_some()),
+            "Invalid catalog record kind or missing asset embedding"
+        );
+        ensure!(
+            row.source_id > 0 && row.source_id <= i64::from(i32::MAX),
+            "Invalid catalog source ID"
+        );
+        validate_record_metadata(row)?;
+        validate_indexed_text(row)?;
     }
-    ensure!(
-        (row.kind == "source" && row.embedding.is_none())
-            || (row.kind == "asset" && row.embedding.is_some()),
-        "Invalid catalog record kind or missing asset embedding"
-    );
-    ensure!(
-        row.source_id > 0 && row.source_id <= i64::from(i32::MAX),
-        "Invalid catalog source ID"
-    );
-    validate_record_metadata(row)?;
-    validate_indexed_text(row)?;
-    let string = |value: &str| -> ArrayRef { Arc::new(StringArray::from(vec![value])) };
+    let string = |get: fn(&Record) -> &str| -> ArrayRef {
+        Arc::new(StringArray::from_iter_values(rows.iter().map(get)))
+    };
+    let optional_string = |get: fn(&Record) -> Option<&str>| -> ArrayRef {
+        Arc::new(StringArray::from_iter(rows.iter().map(get)))
+    };
     let embedding = FixedSizeListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>(
-        [row.embedding.as_ref().map(|v| v.iter().copied().map(Some))],
+        rows.iter()
+            .map(|row| row.embedding.as_ref().map(|v| v.iter().copied().map(Some))),
         EMBEDDING_DIM as i32,
     );
     Ok(RecordBatch::try_new(
         schema(),
         vec![
-            string(&row.kind),
-            string(&row.asset_id),
-            Arc::new(Int64Array::from(vec![row.source_id])),
-            string(&row.path),
-            string(&row.filename),
-            Arc::new(UInt32Array::from(vec![row.width])),
-            Arc::new(UInt32Array::from(vec![row.height])),
-            Arc::new(UInt64Array::from(vec![row.bytes])),
-            string(&row.modified),
-            Arc::new(StringArray::from(vec![row.thumbnail.as_deref()])),
-            string(&row.media_kind),
-            Arc::new(UInt32Array::from(vec![row.segment_index])),
-            Arc::new(UInt64Array::from(vec![row.start_ms])),
-            Arc::new(UInt64Array::from(vec![row.end_ms])),
-            Arc::new(StringArray::from(vec![row.text_excerpt.as_deref()])),
-            Arc::new(StringArray::from(vec![row.indexed_text.as_deref()])),
-            string(&row.filename.to_ascii_lowercase()),
+            string(|row| &row.kind),
+            string(|row| &row.asset_id),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.source_id).collect::<Vec<_>>(),
+            )),
+            string(|row| &row.path),
+            string(|row| &row.filename),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|row| row.width).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|row| row.height).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|row| row.bytes).collect::<Vec<_>>(),
+            )),
+            string(|row| &row.modified),
+            optional_string(|row| row.thumbnail.as_deref()),
+            string(|row| &row.media_kind),
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|row| row.segment_index).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|row| row.start_ms).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|row| row.end_ms).collect::<Vec<_>>(),
+            )),
+            optional_string(|row| row.text_excerpt.as_deref()),
+            optional_string(|row| row.indexed_text.as_deref()),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.filename.to_ascii_lowercase()),
+            )),
             Arc::new(embedding),
         ],
     )?)
@@ -918,7 +953,10 @@ impl Store {
                 "Replacement segment indices must be contiguous from zero within each modality"
             );
         }
-        let batches = rows.iter().map(batch).collect::<Result<Vec<_>>>()?;
+        let batches = rows
+            .chunks(WRITE_BATCH_ROWS)
+            .map(records_batch)
+            .collect::<Result<Vec<_>>>()?;
         let filter = format!(
             "kind = 'asset' AND source_id = {source_id} AND path = {}",
             quote(path)
@@ -932,10 +970,11 @@ impl Store {
             let total = table.count_rows(Some("kind = 'asset'".into())).await?;
             let replaced = table.count_rows(Some(filter.clone())).await?;
             let text_changed = rows.iter().any(|row| row.media_kind == "text")
-                || table
-                    .count_rows(Some(format!("({filter}) AND media_kind = 'text'")))
-                    .await?
-                    > 0;
+                || (replaced > 0
+                    && table
+                        .count_rows(Some(format!("({filter}) AND media_kind = 'text'")))
+                        .await?
+                        > 0);
             ensure!(
                 total - replaced + rows.len() <= MAX_ROWS,
                 "Catalog segment limit reached; choose smaller source folders"
@@ -2921,6 +2960,14 @@ mod tests {
                 Some("fgclip2-base-33f3b9d4-dynamic-torch291-short64-v1"),
             ),
             ("fractal.model_profile", Some(crate::NATIVE_MODEL_PROFILE)),
+            (
+                "fractal.model_profile",
+                Some("embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2"),
+            ),
+            (
+                "fractal.model_profile",
+                Some("embeddinggemma2-daa72c51-fp32-multimodal-v1"),
+            ),
             ("fractal.embedding_dim", Some("768")),
             ("fractal.embedding_dim", Some("1024")),
             ("fractal.embedding_projection", Some("native768-l2")),
@@ -3164,6 +3211,72 @@ mod tests {
             (hit[0].0.media_kind.as_str(), hit[0].0.segment_index),
             ("audio", 0)
         );
+    }
+
+    #[test]
+    fn grouped_segment_writes_preserve_columns_and_validate_before_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), false).unwrap();
+        // Cross the 256-row Arrow batch boundary, mixing nullable columns.
+        let rows = (0..150)
+            .flat_map(|index| {
+                [
+                    segment(&format!("video-{index}"), "video", index, 0),
+                    segment(&format!("audio-{index}"), "audio", index, 1),
+                ]
+            })
+            .collect::<Vec<_>>();
+        for group in rows.chunks(256) {
+            let grouped = records_batch(group).unwrap();
+            for (index, row) in group.iter().enumerate() {
+                let single = batch(row).unwrap();
+                for (left, right) in grouped.columns().iter().zip(single.columns()) {
+                    assert_eq!(left.slice(index, 1).to_data(), right.to_data());
+                }
+            }
+        }
+        store.replace_file(42, &rows[0].path, &rows).unwrap();
+        let before = store.runtime.block_on(store.snapshot()).unwrap();
+        let version = store.runtime.block_on(before.version()).unwrap();
+        assert_eq!(store.source_manifest(42).unwrap().len(), 300);
+        let mut invalid = rows.clone();
+        invalid[299].embedding = Some(vec![0.0; EMBEDDING_DIM]);
+        assert!(store.replace_file(42, &rows[0].path, &invalid).is_err());
+        let after = store.runtime.block_on(store.snapshot()).unwrap();
+        assert_eq!(store.runtime.block_on(after.version()).unwrap(), version);
+        assert_eq!(
+            store.asset("audio-149", true).unwrap().embedding,
+            rows[299].embedding
+        );
+    }
+
+    #[test]
+    #[ignore = "opt-in model-free record construction benchmark"]
+    fn benchmark_segment_record_batches() {
+        let rows = (0..150)
+            .flat_map(|index| {
+                [
+                    segment(&format!("video-{index}"), "video", index, 0),
+                    segment(&format!("audio-{index}"), "audio", index, 1),
+                ]
+            })
+            .collect::<Vec<_>>();
+        for grouped in [false, true] {
+            let start = std::time::Instant::now();
+            for _ in 0..50 {
+                let batches = rows
+                    .chunks(if grouped { WRITE_BATCH_ROWS } else { 1 })
+                    .map(records_batch)
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap();
+                std::hint::black_box(batches);
+            }
+            eprintln!(
+                "[RecordBatchBenchmark] grouped={grouped} rows={} iterations=50 elapsed_ms={:.2}",
+                rows.len(),
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
     #[test]
     fn invalid_multisegment_replacements_leave_every_old_row_untouched() {

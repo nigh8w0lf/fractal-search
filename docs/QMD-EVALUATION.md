@@ -35,9 +35,9 @@ literal ICU BM25 tokenizer and identical Text/source prefilters:
 2. **Dense-only:** exact cosine ranking of the actual model query embedding
 3. **Hybrid:** current equal-weight, one-based RRF with k=60
 
-The native graph remains 768-dimensional FP32; indexing and queries both keep
+The pinned FP16 graph emits 768-dimensional float32 output; indexing and queries both keep
 the leading 512 values and L2-normalize them. The harness requires indexed profile
-`embeddinggemma2-daa72c51-fp32-multimodal-mrl512-v2` and `embedding_dimension: 512`
+`embeddinggemma2-daa72c51-fp16-multimodal-mrl512-v3` and `embedding_dimension: 512`
 from every adapter phase, rejecting old adapters instead of mixing contracts.
 Native 768-dimensional numerical parity is a separate explicit tool mode.
 
