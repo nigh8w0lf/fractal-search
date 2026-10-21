@@ -8,7 +8,7 @@ Installation, everyday use, supported files and troubleshooting.
 
 **Manual setup is required.** End users should use a compatible prebuilt bundle's `install.sh`; no Rust compiler or Python environment is required. Omarchy's generic `omarchy plugin add` command only clones the repository; it does not build the native binaries, create the user service or generate runtime paths. Do not enable a raw clone as a working installation.
 
-Use a compatible CPU or CUDA release bundle and its checksums. Until public release downloads are available, see the [development guide](DEVELOPMENT.md) to build from source. Check the release's architecture/system-library requirements and archive checksum, extract it, then run from the extracted directory:
+Use a compatible [CPU or CUDA release bundle](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.0) and its checksums. For source builds, see the [development guide](DEVELOPMENT.md). Check the release's architecture/system-library requirements and archive checksum, extract it, then run from the extracted directory:
 
 ```bash
 sha256sum --check SHA256SUMS

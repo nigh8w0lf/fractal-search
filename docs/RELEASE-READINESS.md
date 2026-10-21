@@ -1,9 +1,11 @@
-# Private release readiness — 2026-10-22
+# Release readiness — 2026-10-22
 
 Target: Fractal Search 0.1.0 for current **x86_64 Omarchy with Omarchy Shell**.
-The repository remains private. No public release, tag or marketplace submission
-is authorized by this preparation. Local archives are under `dist/releases/`;
-release output is excluded from Git.
+The owner authorized public repository visibility and the CPU/CUDA release on
+2026-10-22. [Release v0.1.0](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.0)
+provides both bundles, matching source, checksums and validation/platform reports.
+Generated release output is excluded from Git. Marketplace submission is separate
+and has not been authorized or performed.
 
 ## Compatibility
 
@@ -82,21 +84,27 @@ from all local commit histories with git-filter-repo. The current source tree
 was unchanged, and the post-rewrite reachable-object scan found no binary media.
 A private recovery bundle and commit map are stored outside this repository.
 
-The owner authorized updating only GitHub main. Its cleaned history was pushed
-with an explicit expected-tip force-with-lease check. Other remote branches were
-left untouched for the owner to delete; they can still retain the old media until
-removed. Existing clones must be refreshed to avoid reintroducing removed blobs.
+GitHub main was cleaned with an explicit expected-tip force-with-lease check.
+All five other remote branches were subsequently deleted at the owner's request;
+only main remained when release publication was prepared. A fresh single-branch
+GitHub clone confirmed that none of the three media paths occurs in main's
+history. Existing clones must be refreshed to avoid reintroducing removed blobs.
 
-## Deliberately remaining before publication
+## Release handoff and marketplace follow-up
 
-1. Delete the other remote branches that retain old history, as planned by the
-   owner. Main is cleaned; no other remote branch was rewritten.
-2. Authorize public visibility and release publication, then create the release
-   tag and upload the reviewed CPU/CUDA/source archives, checksums and notes.
-3. Replace the README's unavailable-download note with the actual release link.
-4. Confirm the ownership/submission checklist and submit the prepared
-   [listing draft](MARKETPLACE-SUBMISSION.md).
-5. Resolve the marketplace's exact-commit review and obtain maintainer approval.
+The README links the versioned CPU/CUDA downloads and checksums. The release
+contains the exact clean source snapshot identified by bundle.json, with the
+same tested executables and complete third-party notices. Archive contents,
+permissions, provenance and checksums are verified before upload. These archives
+are unsigned; checksums provide integrity rather than independent publisher identity.
+
+Remaining marketplace work:
+
+1. Recheck plugin ID availability and the current submission requirements.
+2. Confirm the ownership/submission checklist and authorize submission of the
+   prepared [listing draft](MARKETPLACE-SUBMISSION.md).
+3. Request manual setup and resolve the marketplace's exact-commit review before
+   obtaining maintainer approval.
 
 The [release workflow](RELEASING.md) describes packaging and distribution;
 [official submission requirements](https://github.com/omacom/omarchy-plugin-marketplace/blob/main/SUBMISSION.md)

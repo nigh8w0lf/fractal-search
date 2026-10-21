@@ -1,10 +1,11 @@
 # Marketplace submission draft
 
-Not submitted. Keep the repository private until the owner authorizes publication.
+Not submitted. Repository and release publication are authorized separately;
+this draft does not authorize a marketplace submission.
 The intended title is **[Plugin]: Fractal Search**. After publishing the reviewed
 source and release assets, copy the six sections below into the official issue
 form. The unchecked statements must be verified and confirmed by the owner before
-submission; the current public-repository statement is deliberately unchecked.
+submission; all statements remain unchecked until that review.
 
 ### Repository URL
 
@@ -32,8 +33,7 @@ bounded cached excerpts/thumbnails without original paths or file bytes.
 Please apply `manual-setup` before approval. The generic git-plugin installer
 cannot install our required native binaries or user service. Users install the
 CPU or CUDA prebuilt bundle through its documented `install.sh`; no compiler or
-Python is needed. Release downloads and system requirements must be linked from
-the root README before this draft is submitted.
+Python is needed. Release downloads and system requirements are linked from the root README.
 
 Installation writes a user-owned plugin, versioned runtime and systemd user unit.
 It preserves catalogs, model caches, provider settings and existing bindings.

@@ -15,7 +15,7 @@ Start with the [project overview](../README.md).
 - [Contributor instructions](../AGENTS.md): engineering constraints and validation commands.
 - [Plugin-specific guidance](../quickshell-app/AGENTS.md): desktop UI and service invariants.
 - [Release preparation](RELEASING.md): CPU/CUDA bundles, third-party attribution and marketplace publication.
-- [Release readiness](RELEASE-READINESS.md): private prepublication checks, compatibility and remaining actions.
+- [Release readiness](RELEASE-READINESS.md): release checks, compatibility and marketplace follow-up.
 - [Marketplace submission draft](MARKETPLACE-SUBMISSION.md): prepared listing text, not submitted.
 - [Dependency review](DEPENDENCIES.md): workspace separation and build-footprint decisions.
 

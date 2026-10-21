@@ -28,7 +28,15 @@ Audio/video files are limited to 2 GiB and two hours. PDF, Office documents, OCR
 
 The prebuilt bundles target **up-to-date x86_64 Omarchy with Omarchy Shell**. Runtime dependencies are system packages; no custom build tools are needed. **Use the app’s bundle installer:** Omarchy’s generic git-plugin installer does not install the native backend.
 
-For a compatible prebuilt CPU or CUDA bundle, verify the downloaded archive against its release checksum, extract it, then run inside the extracted directory:
+Download **[v0.1.0](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.0)**:
+
+| Linux x86_64 | Download |
+| --- | --- |
+| CPU | [CPU bundle](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.0/fractal-search-0.1.0-linux-x86_64-cpu.tar.gz) |
+| NVIDIA CUDA | [CUDA bundle](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.0/fractal-search-0.1.0-linux-x86_64-cuda.tar.gz) |
+| Verification | [SHA256SUMS](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.0/SHA256SUMS) |
+
+Verify the downloaded archive against its release checksum, extract it, then run inside the extracted directory:
 
 ```bash
 sha256sum --check SHA256SUMS
@@ -42,7 +50,7 @@ Required system packages include FFmpeg, Qt Multimedia with its FFmpeg backend, 
 
 On first launch, select **Set up model** to download and verify about **1.50 GB** of model assets, or choose an existing verified cache. Add folders under **Settings → Folders**, let indexing finish, then type a description to search.
 
-Public release downloads are not yet linked here. To build from source, follow the [development guide](docs/DEVELOPMENT.md#build-and-install-from-source). For agent-assisted installation or troubleshooting, use [AGENT-SETUP.md](docs/AGENT-SETUP.md); it is also included in release bundles.
+To build from source, follow the [development guide](docs/DEVELOPMENT.md#build-and-install-from-source). For agent-assisted installation or troubleshooting, use [AGENT-SETUP.md](docs/AGENT-SETUP.md); it is also included in release bundles.
 
 ## Updates and removal
 

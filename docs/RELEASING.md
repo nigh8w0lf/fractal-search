@@ -103,6 +103,6 @@ Follow the [current publishing guide](https://plugins.omarchy.org/publish.html) 
 
 Fractal Search is [MIT licensed](../LICENSE), copyright 2026 nigh8w0lf (Ashwin Cheekati). Vendored LanceDB retains its [Apache-2.0 license](../vendor/lancedb/LICENSE) and [patch provenance](../vendor/lancedb/PATCHES.md). Dependencies and downloaded models retain their own licenses. Each bundle includes [NOTICE](../quickshell-app/packaging/NOTICE), full third-party license/notice texts, an exact resolved dependency inventory, ONNX Runtime/Rust runtime attribution and covered MPL source. See [release preparation](RELEASING.md) for provenance, platform limits and validation.
 
-## Private release preparation
+## Release readiness
 
 Target current x86_64 Omarchy with Omarchy Shell. Build tools are maintainer-only requirements; end users install standard runtime packages and the prebuilt bundle. NVIDIA acceleration additionally requires CUDA 12/cuDNN 9, which are not implied by an installed NVIDIA driver. See the [release readiness report](RELEASE-READINESS.md) for the tested scope and remaining publication actions, and the [submission draft](MARKETPLACE-SUBMISSION.md) for listing text. Neither document authorizes publication.
