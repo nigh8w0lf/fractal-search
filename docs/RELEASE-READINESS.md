@@ -1,12 +1,27 @@
 # Release readiness — 2026-10-22
 
-Target: Fractal Search 0.1.0 for current **x86_64 Omarchy with Omarchy Shell**.
+Target: Fractal Search 0.1.1 for current **x86_64 Omarchy with Omarchy Shell**.
 The owner authorized public repository visibility and the CPU/CUDA release on
 2026-10-22. [Release v0.1.0](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.0)
 provides both bundles, matching source, checksums and validation/platform reports.
 Generated release output is excluded from Git. The owner subsequently authorized
 [marketplace submission #12503](https://github.com/omacom/omarchy-plugin-marketplace/issues/12503).
 Initial validation passed; maintainer review and listing approval remain pending.
+
+## v0.1.1 update
+
+The owner authorized publication of CPU and CUDA v0.1.1 bundles on 2026-10-22.
+This update adds **Connect an AI agent** under Preferences, with copyable MCP
+configuration, the actual installed launcher path and a setup-guide action.
+It also includes the approved demo-frame previews and updated documentation.
+There is no catalog, model, native inference or dependency change, and no reindex
+is required. Cargo package versions remain unchanged for this UI/installer patch;
+the plugin manifest and bundle metadata identify release 0.1.1.
+
+The native clipboard/narrow-layout and full settings chrome checks passed for
+the UI change. Fresh bundle checks and exact source provenance are recorded in
+v0.1.1's attached VALIDATION.json. Historical evidence below describes v0.1.0
+unless explicitly identified otherwise. Keep the published v0.1.0 assets intact.
 
 ## Compatibility
 

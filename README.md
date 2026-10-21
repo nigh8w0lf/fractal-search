@@ -32,13 +32,13 @@ Audio/video files are limited to 2 GiB and two hours. PDF, Office documents, OCR
 
 The prebuilt bundles target **up-to-date x86_64 Omarchy with Omarchy Shell**. Runtime dependencies are system packages; no custom build tools are needed. **Use the app’s bundle installer:** Omarchy’s generic git-plugin installer does not install the native backend.
 
-Download **[v0.1.0](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.0)**:
+Download **[v0.1.1](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.1)**:
 
 | Linux x86_64 | Download |
 | --- | --- |
-| CPU | [CPU bundle](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.0/fractal-search-0.1.0-linux-x86_64-cpu.tar.gz) |
-| NVIDIA CUDA | [CUDA bundle](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.0/fractal-search-0.1.0-linux-x86_64-cuda.tar.gz) |
-| Verification | [SHA256SUMS](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.0/SHA256SUMS) |
+| CPU | [CPU bundle](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/fractal-search-0.1.1-linux-x86_64-cpu.tar.gz) |
+| NVIDIA CUDA | [CUDA bundle](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/fractal-search-0.1.1-linux-x86_64-cuda.tar.gz) |
+| Verification | [SHA256SUMS](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/SHA256SUMS) |
 
 Verify the downloaded archive against its release checksum, extract it, then run inside the extracted directory:
 
