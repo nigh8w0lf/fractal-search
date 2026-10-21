@@ -118,7 +118,9 @@ pub fn decode_image(path: &Path) -> Result<RgbImage> {
         .with_guessed_format()
         .with_context(|| format!("Detecting image format {path:?}"))?;
     if reader.format() == Some(ImageFormat::Jpeg) {
-        let mut decoder = turbojpeg::Decompressor::new()?;
+        let mut decoder = turbojpeg::Decompressor::new()
+            .context("Initialize JPEG decoder")
+            .context(crate::media::FatalMediaFailure)?;
         let header = decoder
             .read_header(&bytes)
             .with_context(|| format!("Reading JPEG header {path:?}"))?;
@@ -126,7 +128,8 @@ pub fn decode_image(path: &Path) -> Result<RgbImage> {
         let decoded = turbojpeg::decompress(&bytes, turbojpeg::PixelFormat::RGB)
             .with_context(|| format!("Decoding JPEG {path:?}"))?;
         return RgbImage::from_raw(header.width as u32, header.height as u32, decoded.pixels)
-            .context("JPEG decoder returned an invalid RGB buffer");
+            .context("JPEG decoder returned an invalid RGB buffer")
+            .context(crate::media::FatalMediaFailure);
     }
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MAX_PIXELS * 4);

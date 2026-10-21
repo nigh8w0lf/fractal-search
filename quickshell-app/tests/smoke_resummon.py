@@ -161,11 +161,11 @@ while not (root / 'restart.complete').exists():
         (ui / 'Ui').symlink_to('/usr/share/omarchy/shell/Ui', target_is_directory=True)
         # Test-only controls dispatch input exclusively to this private window.
         settings_source = ui / 'SettingsPage.qml'
-        settings_source.write_text(settings_source.read_text().replace('id: page', 'id: page; property alias testScroll: settingsScroll').replace('text: modelData', 'objectName: modelData; text: modelData').replace('text: "Keep folders up to date"', 'objectName: "watchChangesToggle"; text: "Keep folders up to date"'))
+        settings_source.write_text(settings_source.read_text().replace('id: page', 'id: page; property alias testScroll: settingsScroll').replace('text: modelData', 'objectName: modelData; text: modelData').replace('text: "Indexing issues"', 'objectName: "indexingIssuesButton"; text: "Indexing issues"').replace('text: "Keep folders up to date"', 'objectName: "watchChangesToggle"; text: "Keep folders up to date"'))
         panel_source = ui / 'SearchPanel.qml'
         panel_source.write_text(panel_source.read_text().replace('import QtQuick\n', 'import QtQuick\nimport QtTest\n').replace('id: panel', 'id: panel; TestCase { id: input; when: false }', 1).replace('ResultActions {', 'ResultActions { id: previewTestActions', 1).replace(
             'function refreshDiagnostics()',
-            'function scrollSettings(amount: real): void { settingsPage.testScroll.contentItem.contentY = amount; }\n        function clickTab(name: string): void { const button = input.findChild(settingsPage, name); if (!button) throw new Error("Missing tab " + name); input.mouseClick(button); }\n        function clickOpen(): void { const button = input.findChild(previewTestActions, "openImageButton"); if (!button) throw new Error("Missing open action"); input.mouseClick(button); }\n        function tabKey(key: int): void { input.keyClick(key); }\n        function clickReveal(): void { input.mouseClick(input.findChild(previewTestActions, "revealImageButton")); }\n        function toggleWatch(): void { input.mouseClick(input.findChild(settingsPage, "watchChangesToggle")); }\n        function chooseImageBatch(size: int): void { const choice = input.findChild(settingsPage, "imageBatchSizeChoice"); if (!choice) throw new Error("Missing image batch size"); input.mouseClick(choice); input.keyClick(Qt.Key_Home); for (let n = 1; n < size; ++n) input.keyClick(Qt.Key_Down); input.keyClick(Qt.Key_Return); }\n        function clickRestartNow(): void { input.mouseClick(restartDialog.confirmButton); }\n        function refreshDiagnostics()'))
+            'function scrollSettings(amount: real): void { settingsPage.testScroll.contentItem.contentY = Math.min(amount, Math.max(0, settingsPage.testScroll.contentItem.contentHeight - settingsPage.testScroll.contentItem.height)); }\n        function clickTab(name: string): void { const button = input.findChild(settingsPage, name); if (!button) throw new Error("Missing tab " + name); input.mouseClick(button); }\n        function clickOpen(): void { const button = input.findChild(previewTestActions, "openImageButton"); if (!button) throw new Error("Missing open action"); input.mouseClick(button); }\n        function tabKey(key: int): void { input.keyClick(key); }\n        function clickReveal(): void { input.mouseClick(input.findChild(previewTestActions, "revealImageButton")); }\n        function toggleWatch(): void { input.mouseClick(input.findChild(settingsPage, "watchChangesToggle")); }\n        function chooseImageBatch(size: int): void { const choice = input.findChild(settingsPage, "imageBatchSizeChoice"); if (!choice) throw new Error("Missing image batch size"); input.mouseClick(choice); input.keyClick(Qt.Key_Home); for (let n = 1; n < size; ++n) input.keyClick(Qt.Key_Down); input.keyClick(Qt.Key_Return); }\n        function clickRestartNow(): void { input.mouseClick(restartDialog.confirmButton); }\n        function refreshDiagnostics()'))
         panel_source.write_text(panel_source.read_text().replace('query: app.query,', 'query: app.query, mediaKind: app.mediaKind, previewText: app.previewText(),').replace('function refreshDiagnostics()', '''function chooseFilter(name: string, index: int): void {
             const choice = input.findChild(canvas, name);
             if (!choice) throw new Error("Missing filter " + name);
@@ -184,7 +184,16 @@ while not (root / 'restart.complete').exists():
             return app.loading;
         }
         function refreshDiagnostics()'''))
-        panel_source.write_text(panel_source.read_text().replace('function refreshDiagnostics()', '''function uiScale(value: real): void { Style.spacingScale = value; }
+        panel_source.write_text(panel_source.read_text().replace('function refreshDiagnostics()', '''function partialVideoReport(): void {
+            app.restoreReport({failed: 1, failures: [{path: "/fixture/movie.mp4", error: "Visuals and valid audio indexed; 1 audio segment(s) skipped. Rescan to retry missing audio. Audio segment 1 (30021–30037 ms): Audio decoder returned 0 samples"}], failuresOmitted: 0});
+        }
+        function clickIssueClose(): void { input.mouseClick(issueClose); }
+        function clickIndexingIssues(): void {
+            const button = input.findChild(settingsPage, "indexingIssuesButton");
+            if (!button) throw new Error("Missing indexing issues button");
+            input.mouseClick(button);
+        }
+        function uiScale(value: real): void { Style.spacingScale = value; }
         function footerAction(index: int): void { input.mouseClick(hotkeysFlow.children[index]); }
         function filterGeometry(): string {
             const kind = input.findChild(canvas, "mediaKindFilter");
@@ -304,9 +313,28 @@ with (root / 'viewer.log').open('a') as log:
         if args.chrome_only:
             call('test', 'settings')
             wait(lambda s: s['page'] == 'settings' and not s['animating'])
+            call('test', 'partialVideoReport')
+            state = wait(lambda s: s['failed'] == 1)
+            assert 'file(s) with indexing issues' in state['error'], state
+            call('test', 'scrollSettings', '10000')
+            time.sleep(.3)
+            call('test', 'clickIndexingIssues')
+            wait(lambda s: s['skippedFilesVisible'])
+            time.sleep(.3)
+            subprocess.run(['grim', str(root / 'partial-video-report.png')], env=env, check=True, timeout=5)
+            call('test', 'clickIssueClose')
+            wait(lambda s: not s['skippedFilesVisible'])
             call('test', 'resize', '480', '440')
             time.sleep(.4)
             subprocess.run(['grim', str(root / 'chrome-narrow.png')], env=env, check=True, timeout=5)
+            call('test', 'scrollSettings', '10000')
+            time.sleep(.3)
+            call('test', 'clickIndexingIssues')
+            wait(lambda s: s['skippedFilesVisible'])
+            time.sleep(.3)
+            subprocess.run(['grim', str(root / 'partial-video-report-narrow.png')], env=env, check=True, timeout=5)
+            call('test', 'clickIssueClose')
+            wait(lambda s: not s['skippedFilesVisible'])
             call('test', 'back')
             call('search', 'toggle')
             call('search', 'summon')
@@ -314,7 +342,7 @@ with (root / 'viewer.log').open('a') as log:
             call('search', 'close')
             assert panel.wait(timeout=20) == 0
             assert backend.wait(timeout=20) == 0
-            print(f'Panel chrome passed on a light backdrop at display scale {args.display_scale}: compact/scaled spacing, footer clicks, empty results, narrow settings and resummon.', flush=True)
+            print(f'Panel chrome passed on a light backdrop at display scale {args.display_scale}: compact/scaled spacing, footer clicks, empty results, normal/narrow partial-video reports, report button clicks, narrow settings and resummon.', flush=True)
             return
         photos = root / 'photos'; photos.mkdir()
         png(photos / 'red.png', color=(200, 40, 20))

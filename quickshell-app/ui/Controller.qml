@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Omarchy
 
 Item {
     id: app
@@ -104,13 +105,13 @@ Item {
     property double nextId: 1
     property double discardedBeforeId: 0
     readonly property var colors: ({
-            background: Color.popups.background,
-            foreground: Color.popups.text,
-            accent: Color.accent,
-            surface: Qt.alpha(Color.foreground, 0.06),
-            muted: Color.muted,
-            error: Color.urgent,
-            success: Color.accent
+            background: Omarchy.Color.popups.background,
+            foreground: Omarchy.Color.popups.text,
+            accent: Omarchy.Color.accent,
+            surface: Qt.alpha(Omarchy.Color.foreground, 0.06),
+            muted: Omarchy.Color.muted,
+            error: Omarchy.Color.urgent,
+            success: Omarchy.Color.accent
         })
     readonly property color foregroundColor: colors.foreground
     readonly property color secondaryText: Qt.rgba(foregroundColor.r, foregroundColor.g, foregroundColor.b, 0.65)
@@ -296,7 +297,7 @@ Item {
                 indexFailures = message.payload.failures;
                 notice = "Index updated · " + message.payload.indexed + " file(s) updated";
                 if (indexFailureCount)
-                    fail(indexFailureCount + " file(s) skipped. Open Skipped files for details.");
+                    fail(indexFailureCount + " file(s) with indexing issues. Open Indexing issues for details.");
                 browse(false, false);
                 return;
             }
@@ -316,7 +317,7 @@ Item {
                     // later model/storage error prevents a final result.
                     if (indexFailures.length < 100)
                         indexFailures = indexFailures.concat([progress.failure]);
-                    fail(indexFailureCount + " file(s) skipped. Latest: " + progress.failure.path + "\n" + progress.failure.error);
+                    fail(indexFailureCount + " file(s) with indexing issues. Latest: " + progress.failure.path + "\n" + progress.failure.error);
                 }
                 return;
             }
@@ -373,7 +374,7 @@ Item {
         if (report.error)
             fail(report.error);
         else if (report.failed)
-            fail(report.failed + " file(s) skipped. Open Skipped files for details.");
+            fail(report.failed + " file(s) with indexing issues. Open Indexing issues for details.");
     }
     function installModels() {
         if (!ready || busy)
@@ -647,9 +648,9 @@ Item {
             if (result) {
                 app.indexFailureCount = result.failed;
                 app.indexFailures = result.failures;
-                app.notice = (result.cancelled ? "Indexing stopped. " : result.failed ? "Indexing finished with errors. " : "Folder indexed. ") + result.indexed + " updated · " + result.unchanged + " unchanged" + (result.failed ? " · " + result.failed + " skipped" : "") + (result.removed ? " · " + result.removed + " removed from index" : "");
+                app.notice = (result.cancelled ? "Indexing stopped. " : result.failed ? "Indexing finished with errors. " : "Folder indexed. ") + result.indexed + " updated · " + result.unchanged + " unchanged" + (result.failed ? " · " + result.failed + " with issues" : "") + (result.removed ? " · " + result.removed + " removed from index" : "");
                 if (result.failed)
-                    app.errorMessage = result.failed + " file(s) could not be indexed. Open Skipped files for the filenames and errors, then rescan after repairing them.";
+                    app.errorMessage = result.failed + " file(s) had skipped content. Open Indexing issues for details; successfully indexed segments remain searchable. Rescan to retry.";
                 app.activeQuery = "";
                 app.query = "";
                 if (app.reindexQueue.length && !result.cancelled && !result.failed)

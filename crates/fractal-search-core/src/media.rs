@@ -47,6 +47,29 @@ const DECODE_TIMEOUT: Duration = Duration::from_secs(90);
 // playlist demuxers, even if a file is renamed to a supported extension.
 const INPUT_FORMATS: &str = "mov,matroska,webm,avi,mpeg,mpegts,ogg,asf,wav,mp3,flac,aac,aiff";
 
+/// A soundtrack decode failure may leave a video's visual index usable.
+/// This marker never covers model preparation, inference or source validation.
+#[derive(Debug)]
+pub(crate) struct AudioDecodeFailure;
+impl std::fmt::Display for AudioDecodeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Decode audio segment")
+    }
+}
+
+/// Dependency, subprocess infrastructure or app-contract failure, never bad media.
+/// Keep this marker through context wrapping so the catalog cannot skip it.
+#[derive(Debug)]
+pub(crate) struct FatalMediaFailure;
+impl std::fmt::Display for FatalMediaFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Media pipeline failed; fix the dependency or app error before rescanning"
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
@@ -265,7 +288,7 @@ pub(crate) fn decode_segment_with_cancel(
 ) -> Result<PreparedMedia> {
     ensure!(!cancelled(), "Media decoding cancelled");
     validate_path_kind(path, info)?;
-    validate_segment(info, spec)?;
+    validate_segment(info, spec).context(FatalMediaFailure)?;
     match spec.kind {
         MediaKind::Image => {
             bail!("Image segments must use the native preprocess::decode_image decoder")
@@ -312,9 +335,10 @@ pub(crate) fn decode_segment_with_cancel(
                 DECODE_TIMEOUT,
                 "ffmpeg audio decoder",
                 cancelled,
-            )?;
+            )
+            .context(AudioDecodeFailure)?;
             Ok(PreparedMedia::Audio {
-                samples: parse_audio(&bytes, max_samples)?,
+                samples: parse_audio(&bytes, max_samples).context(AudioDecodeFailure)?,
             })
         }
         MediaKind::Video => {
@@ -810,8 +834,9 @@ fn parse_probe(bytes: &[u8], kind: MediaKind) -> Result<ProbedMedia> {
         matches!(kind, MediaKind::Audio | MediaKind::Video),
         "Expected audio or video metadata"
     );
-    let output: ProbeOutput =
-        serde_json::from_slice(bytes).context("ffprobe returned malformed metadata JSON")?;
+    let output: ProbeOutput = serde_json::from_slice(bytes)
+        .context("ffprobe returned malformed metadata JSON")
+        .context(FatalMediaFailure)?;
     ensure!(
         !output.streams.is_empty() && output.streams.len() <= 32,
         "Media must have 1..=32 streams"
@@ -933,11 +958,20 @@ fn decode_command(path: &Path, spec: &SegmentSpec) -> Result<Command> {
 }
 
 fn parse_audio(bytes: &[u8], max_samples: usize) -> Result<Vec<f32>> {
-    ensure!(bytes.len() > 160 * 4 && bytes.len() % 4 == 0, "Audio decoder returned <=160 or incomplete float32 samples; container duration may overstate this soundtrack, so trim or split it explicitly");
-    ensure!(
-        bytes.len() / 4 <= max_samples,
-        "Audio decoder exceeded the segment sample limit"
-    );
+    if bytes.len() % 4 != 0 {
+        return Err(anyhow::anyhow!(
+            "Audio decoder returned an incomplete float32 sample ({} bytes)",
+            bytes.len()
+        )
+        .context(FatalMediaFailure));
+    }
+    ensure!(bytes.len() > 160 * 4, "Audio decoder returned {} samples; the model requires more than 160 (10 ms at 16 kHz). The requested interval may extend beyond the decodable soundtrack", bytes.len() / 4);
+    if bytes.len() / 4 > max_samples {
+        return Err(
+            anyhow::anyhow!("Audio decoder exceeded the segment sample limit")
+                .context(FatalMediaFailure),
+        );
+    }
     let mut samples = Vec::with_capacity(bytes.len() / 4);
     for sample in bytes.chunks_exact(4) {
         let value = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
@@ -1107,10 +1141,14 @@ fn run_decoder_with_cancel(
             {
                 Ok(false)
             }
-            Err(error) => Err(error).context("Reading decoder pipe"),
+            Err(error) => Err(error)
+                .context("Reading decoder pipe")
+                .context(FatalMediaFailure),
         }
     }
-    ensure!(!timeout.is_zero(), "Decoder timeout must be positive");
+    if timeout.is_zero() {
+        return Err(anyhow::anyhow!("Decoder timeout must be positive").context(FatalMediaFailure));
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1144,7 +1182,9 @@ fn run_decoder_with_cancel(
                 "Cannot start {label}; check executable permissions and subprocess resource limits"
             )
         };
-        anyhow::Error::new(error).context(message)
+        anyhow::Error::new(error)
+            .context(message)
+            .context(FatalMediaFailure)
     })?;
     let mut guard = ChildGuard {
         child,
@@ -1154,14 +1194,16 @@ fn run_decoder_with_cancel(
         .child
         .stdout
         .take()
-        .context("Missing decoder stdout pipe")?;
+        .context("Missing decoder stdout pipe")
+        .context(FatalMediaFailure)?;
     let mut stderr = guard
         .child
         .stderr
         .take()
-        .context("Missing decoder stderr pipe")?;
-    nonblocking(stdout.as_raw_fd())?;
-    nonblocking(stderr.as_raw_fd())?;
+        .context("Missing decoder stderr pipe")
+        .context(FatalMediaFailure)?;
+    nonblocking(stdout.as_raw_fd()).context(FatalMediaFailure)?;
+    nonblocking(stderr.as_raw_fd()).context(FatalMediaFailure)?;
     let mut output = Vec::new();
     let mut errors = Vec::new();
     let mut stdout_done = false;
@@ -1187,7 +1229,8 @@ fn run_decoder_with_cancel(
             status = guard
                 .child
                 .try_wait()
-                .with_context(|| format!("Waiting for {label}"))?;
+                .with_context(|| format!("Waiting for {label}"))
+                .context(FatalMediaFailure)?;
         }
         if let Some(status) = status {
             if stdout_done && stderr_done {
@@ -1198,6 +1241,12 @@ fn run_decoder_with_cancel(
                         !character.is_control() || matches!(*character, '\n' | '\t')
                     })
                     .collect();
+                if status.code().is_none() {
+                    return Err(anyhow::anyhow!(
+                        "{label} terminated abnormally ({status}); check decoder crashes and system resource limits: {}",
+                        detail.trim()
+                    ).context(FatalMediaFailure));
+                }
                 ensure!(
                     status.success(),
                     "{label} failed ({status}): {}",
@@ -1227,7 +1276,10 @@ fn run_decoder_with_cancel(
     _label: &str,
     _cancelled: &impl Fn() -> bool,
 ) -> Result<Vec<u8>> {
-    bail!("Bounded local ffmpeg decoding currently requires a Unix platform")
+    Err(
+        anyhow::anyhow!("Bounded local ffmpeg decoding currently requires a Unix platform")
+            .context(FatalMediaFailure),
+    )
 }
 
 #[cfg(test)]
@@ -1958,6 +2010,7 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("bad"));
         assert!(error.to_string().contains("7"));
+        assert!(!error.is::<FatalMediaFailure>());
     }
 
     #[cfg(unix)]
@@ -1996,12 +2049,51 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    #[test]
+    fn decoder_contract_errors_are_fatal_but_empty_audio_is_recoverable() {
+        assert!(parse_audio(&[0; 645], 200)
+            .unwrap_err()
+            .is::<FatalMediaFailure>());
+        assert!(parse_audio(&[0; 644], 160)
+            .unwrap_err()
+            .is::<FatalMediaFailure>());
+        assert!(!parse_audio(&[], 200).unwrap_err().is::<FatalMediaFailure>());
+        assert!(parse_probe(b"not JSON", MediaKind::Video)
+            .err()
+            .expect("Malformed JSON must fail")
+            .is::<FatalMediaFailure>());
+        let metadata = info(MediaKind::Video, 1000);
+        let mut spec = timed_segments(&metadata).unwrap().remove(0);
+        spec.end_ms = Some(2000);
+        let error = decode_segment(Path::new("fixture.mp4"), &metadata, &spec).unwrap_err();
+        assert!(error.is::<FatalMediaFailure>());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_crash_and_invalid_timeout_are_fatal() {
+        let crash = run_decoder(
+            &mut shell("kill -KILL $$"),
+            32,
+            Duration::from_secs(2),
+            "fixture",
+        )
+        .unwrap_err();
+        assert!(crash.is::<FatalMediaFailure>());
+        assert!(format!("{crash:#}").contains("terminated abnormally"));
+        let timeout = run_decoder(&mut shell("exit 0"), 32, Duration::ZERO, "fixture").unwrap_err();
+        assert!(timeout.is::<FatalMediaFailure>());
+    }
+
     #[cfg(unix)]
     #[test]
     fn missing_decoder_dependency_is_actionable() {
         let mut command = Command::new("/nonexistent/fractal-test-decoder");
         let error =
             run_decoder(&mut command, 32, Duration::from_secs(1), "ffmpeg test").unwrap_err();
-        assert!(error.to_string().contains("install ffmpeg and ffprobe"));
+        assert!(format!("{error:#}").contains("install ffmpeg and ffprobe"));
+        assert!(error.is::<FatalMediaFailure>());
+        // Soundtrack context must never turn a system failure into a skipped interval.
+        assert!(error.context(AudioDecodeFailure).is::<FatalMediaFailure>());
     }
 }

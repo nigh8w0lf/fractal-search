@@ -43,6 +43,9 @@ pub(crate) struct FileState {
     pub extraction_profile: String,
     pub embedding_profile: Option<String>,
     pub locations: Vec<PassageLocation>,
+    /// Partial video commits must retry missing audio segments on the next scan.
+    #[serde(default)]
+    pub audio_incomplete: bool,
 }
 
 impl FileState {
@@ -67,6 +70,7 @@ impl FileState {
             extraction_profile: extraction.into(),
             embedding_profile: embedding,
             locations,
+            audio_incomplete: false,
         }
     }
     pub fn matches_profile(&self, embedding: Option<&str>, extraction: Option<&str>) -> bool {

@@ -125,6 +125,18 @@ pub struct IndexResult {
     pub failures_omitted: usize,
 }
 
+fn bounded_failure_message(mut message: String) -> String {
+    if message.len() > MAX_FAILURE_MESSAGE_BYTES {
+        let mut end = MAX_FAILURE_MESSAGE_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push_str("… [message truncated; full error in backend log]");
+    }
+    message
+}
+
 impl IndexProgress {
     fn record_failure(
         &mut self,
@@ -132,17 +144,18 @@ impl IndexProgress {
         error: anyhow::Error,
         failures: &mut Vec<IndexFailure>,
     ) {
-        let mut message = format!("{error:#}");
-        eprintln!("[Index] Skipped file {path:?}: {message}");
-        if message.len() > MAX_FAILURE_MESSAGE_BYTES {
-            let mut end = MAX_FAILURE_MESSAGE_BYTES;
-            while !message.is_char_boundary(end) {
-                end -= 1;
-            }
-            message.truncate(end);
-            message.push_str("… [message truncated; full error in backend log]");
-        }
         self.current += 1;
+        self.record_issue(path, error, failures);
+    }
+
+    fn record_issue(
+        &mut self,
+        path: &Path,
+        error: anyhow::Error,
+        failures: &mut Vec<IndexFailure>,
+    ) {
+        eprintln!("[Index] File indexing issue {path:?}: {error:#}");
+        let message = bounded_failure_message(format!("{error:#}"));
         self.failed += 1;
         self.failure = Some(IndexFailure {
             path: path.display().to_string(),
@@ -961,7 +974,7 @@ impl Catalog {
                     .as_ref()
                     .is_some_and(|old| content_hash.as_ref() == Some(&old.content_sha256));
             let unchanged = cheap_unchanged || content_unchanged;
-            if unchanged && caches_current {
+            if unchanged && caches_current && !saved.as_ref().is_some_and(|s| s.audio_incomplete) {
                 if batch.flush(
                     self,
                     embedder,
@@ -1028,7 +1041,11 @@ impl Catalog {
                 Ok(prepared.data)
             }) {
                 Ok(prepared) => prepared,
-                Err(error) if error.is::<FatalPreparation>() => return Err(error),
+                Err(error)
+                    if error.is::<FatalPreparation>() || error.is::<media::FatalMediaFailure>() =>
+                {
+                    return Err(error)
+                }
                 Err(error) => {
                     if batch.flush(
                         self,
@@ -1245,7 +1262,7 @@ impl Catalog {
                 result
             }),
         };
-        let specs = match segmented {
+        let mut specs = match segmented {
             Ok(specs) if !specs.is_empty() => specs,
             Ok(_) => {
                 state.record_failure(
@@ -1263,6 +1280,12 @@ impl Catalog {
                 return Ok(cancelled());
             }
         };
+        // Complete visuals first so a bad soundtrack can be reported separately.
+        // The prefetched first segment is already the first visual segment.
+        if info.kind == MediaKind::Video {
+            specs.sort_by_key(|spec| spec.kind == MediaKind::Audio);
+        }
+        let mut audio_failures = Vec::new();
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1320,7 +1343,31 @@ impl Catalog {
                 thumbnail,
             } = match result {
                 Ok(prepared) => prepared,
-                Err(error) if error.is::<FatalPreparation>() => return Err(error),
+                Err(error)
+                    if error.is::<FatalPreparation>() || error.is::<media::FatalMediaFailure>() =>
+                {
+                    return Err(error)
+                }
+                Err(error)
+                    if info.kind == MediaKind::Video
+                        && spec.kind == MediaKind::Audio
+                        && error.is::<media::AudioDecodeFailure>() =>
+                {
+                    if cancelled() {
+                        return Ok(true);
+                    }
+                    let error = error.context(format!(
+                        "Audio segment {} ({}–{} ms)",
+                        spec.index,
+                        spec.start_ms.context("Audio segment start missing")?,
+                        spec.end_ms.context("Audio segment end missing")?
+                    ));
+                    eprintln!("[Index] Audio decode failed in {path:?}: {error:#}");
+                    // At most MAX_TIMED_SEGMENTS bounded messages. Keep valid
+                    // rows on both sides of a gap and report the missing intervals.
+                    audio_failures.push(bounded_failure_message(format!("{error:#}")));
+                    continue;
+                }
                 Err(error) => {
                     state.record_failure(path, error, failures);
                     return Ok(cancelled());
@@ -1456,6 +1503,7 @@ impl Catalog {
                 embedding: Some(embedding),
             });
         }
+        drop(tickets);
         let check = || {
             stamp(path).and_then(|after| {
                 ensure!(
@@ -1479,8 +1527,8 @@ impl Catalog {
         if cancelled() {
             return Ok(true);
         }
-        // Cache files are staged only after every segment has decoded and passed
-        // the vector contract. Old cache names remain valid until the commit.
+        // Cache files are staged after all segments have been attempted and every
+        // retained vector is valid. Old cache names remain valid until commit.
         for (cache, bytes) in &thumbnails {
             if let Err(error) = write_atomic(cache, bytes) {
                 self.discard_staged_thumbnails(&thumbnails, &existing)?;
@@ -1508,18 +1556,16 @@ impl Catalog {
         } else {
             "native-media-segments-v1"
         };
-        self.index_state.save(
-            source_id,
-            text_path(path)?,
-            &FileState::new(
-                &rows,
-                before,
-                content_hash,
-                extraction,
-                embedder.embedding_profile(),
-                locations,
-            ),
-        )?;
+        let mut saved = FileState::new(
+            &rows,
+            before,
+            content_hash,
+            extraction,
+            embedder.embedding_profile(),
+            locations,
+        );
+        saved.audio_incomplete = !audio_failures.is_empty();
+        self.index_state.save(source_id, text_path(path)?, &saved)?;
         let retained = rows
             .iter()
             .filter_map(|row| row.thumbnail.as_deref())
@@ -1536,6 +1582,16 @@ impl Catalog {
         }
         state.indexed += 1;
         state.current += 1;
+        if !audio_failures.is_empty() {
+            state.record_issue(
+                path,
+                anyhow::anyhow!(
+                    "Visuals and valid audio indexed; {} audio segment(s) skipped. Rescan to retry missing audio.\n{}",
+                    audio_failures.len(), audio_failures.join("\n")
+                ),
+                failures,
+            );
+        }
         Ok(cancelled())
     }
     fn discard_staged_thumbnails(
@@ -2899,6 +2955,281 @@ mod tests {
             Ok(vector)
         }
     }
+    #[test]
+    #[ignore = "requires installed ffmpeg and ffprobe; temporary synthetic media only"]
+    fn video_audio_decode_failure_keeps_valid_segments_and_retries_after_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let path = source.join("movie.mkv");
+        let created = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=32x24:r=1:d=31",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=16000:duration=31",
+                "-c:v",
+                "ffv1",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(created.success());
+        let healthy = fs::read(&path).unwrap();
+        let data = root.path().join("data");
+        let mut catalog = Catalog::open(&data).unwrap();
+        let mut model = MediaEmbedder {
+            audio_calls: 0,
+            video_calls: 0,
+        };
+        let complete = catalog
+            .index(&source, &mut model, || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!((complete.indexed, complete.failed), (1, 0));
+        let old = serde_json::to_string(&catalog.browse(0, 100).unwrap()).unwrap();
+        // Overstate only the soundtrack's Matroska duration. Its last two declared
+        // intervals have no packets, after two successfully decoded audio segments.
+        let mut broken = healthy.clone();
+        let needle = b"00:00:31.000000000";
+        let offset = broken
+            .windows(needle.len())
+            .rposition(|w| w == needle)
+            .unwrap();
+        broken[offset..offset + needle.len()].copy_from_slice(b"00:01:31.000000000");
+        fs::write(&path, &broken).unwrap();
+        assert_eq!(
+            media::inspect(&path).unwrap().audio_duration_ms,
+            Some(91_000)
+        );
+
+        struct FailingAudio;
+        impl Embedder for FailingAudio {
+            fn embed_images(&mut self, _: &[RgbImage]) -> Result<Vec<Vec<f32>>> {
+                bail!("unused images")
+            }
+            fn embed_image(&mut self, _: &RgbImage) -> Result<Vec<f32>> {
+                bail!("unused image")
+            }
+            fn embed_text(&mut self, _: &str) -> Result<Vec<f32>> {
+                bail!("unused text")
+            }
+            fn embed_video(&mut self, _: &[RgbImage]) -> Result<Vec<f32>> {
+                let mut v = vec![0.; EMBEDDING_DIM];
+                v[4] = 1.;
+                Ok(v)
+            }
+            fn embed_audio(&mut self, _: &[f32]) -> Result<Vec<f32>> {
+                bail!("injected model failure")
+            }
+        }
+        let error = catalog
+            .index(&source, &mut FailingAudio, || false, |_| Ok(()))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected model failure"));
+        assert_eq!(
+            serde_json::to_string(&catalog.browse(0, 100).unwrap()).unwrap(),
+            old
+        );
+
+        struct CancellingVideo<'a>(&'a std::cell::Cell<bool>);
+        impl Embedder for CancellingVideo<'_> {
+            fn embed_images(&mut self, _: &[RgbImage]) -> Result<Vec<Vec<f32>>> {
+                bail!("unused images")
+            }
+            fn embed_image(&mut self, _: &RgbImage) -> Result<Vec<f32>> {
+                bail!("unused image")
+            }
+            fn embed_text(&mut self, _: &str) -> Result<Vec<f32>> {
+                bail!("unused text")
+            }
+            fn embed_video(&mut self, _: &[RgbImage]) -> Result<Vec<f32>> {
+                self.0.set(true);
+                let mut v = vec![0.; EMBEDDING_DIM];
+                v[4] = 1.;
+                Ok(v)
+            }
+        }
+        let cancel = std::cell::Cell::new(false);
+        let stopped = catalog
+            .index(
+                &source,
+                &mut CancellingVideo(&cancel),
+                || cancel.get(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(stopped.cancelled);
+        assert_eq!(
+            serde_json::to_string(&catalog.browse(0, 100).unwrap()).unwrap(),
+            old
+        );
+
+        let mut last_progress = None;
+        let partial = catalog
+            .index(
+                &source,
+                &mut model,
+                || false,
+                |p| {
+                    last_progress = Some((p.current, p.total));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (partial.indexed, partial.failed, partial.unchanged),
+            (1, 1, 0)
+        );
+        assert_eq!(last_progress, Some((1, 1)));
+        assert!(partial.failures[0]
+            .error
+            .contains("Visuals and valid audio indexed; 2 audio segment(s) skipped"));
+        assert!(partial.failures[0].error.contains("60000–90000 ms"));
+        assert!(partial.failures[0].error.contains("90000–91000 ms"));
+        assert_eq!(catalog.status().unwrap().asset_count, 4);
+        let partial_rows = catalog.browse(0, 100).unwrap().items;
+        assert_eq!(
+            partial_rows
+                .iter()
+                .filter(|r| r.media_kind == "video")
+                .count(),
+            2
+        );
+        let audio_indices: HashSet<_> = partial_rows
+            .iter()
+            .filter(|r| r.media_kind == "audio")
+            .map(|r| r.segment_index)
+            .collect();
+        assert_eq!(audio_indices, HashSet::from([0, 1]));
+        // Exercise failed intervals BEFORE valid audio, without adding decoder
+        // substitution hooks: reorder the real synthetic file's valid specs.
+        let mut pool = PreparationPool::new().unwrap();
+        let prepared = preparation::submit_file(&pool, &path, false, None)
+            .unwrap()
+            .wait(&|| false)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut prepared = prepared.data;
+        let FileData::Media {
+            specs: Some(specs), ..
+        } = &mut prepared
+        else {
+            panic!("Expected timed media")
+        };
+        specs.sort_by_key(|spec| {
+            (
+                spec.kind == MediaKind::Audio,
+                if spec.kind == MediaKind::Audio {
+                    u32::MAX - spec.index
+                } else {
+                    spec.index
+                },
+            )
+        });
+        let mut existing = partial_rows
+            .iter()
+            .map(|row| catalog.store.asset(&row.asset_id, true).unwrap())
+            .collect::<Vec<_>>();
+        let source_id = existing[0].source_id;
+        // A failed interval must not retain a stale row from an older generation.
+        let mut stale = existing
+            .iter()
+            .find(|row| row.media_kind == "audio")
+            .unwrap()
+            .clone();
+        stale.asset_id = format!("asset_{}", Uuid::new_v4());
+        stale.segment_index = 2;
+        stale.start_ms = Some(60_000);
+        stale.end_ms = Some(90_000);
+        existing.push(stale);
+        catalog
+            .store
+            .replace_file(source_id, text_path(&path).unwrap(), &existing)
+            .unwrap();
+        let before = stamp(&path).unwrap();
+        let mut state = IndexProgress {
+            stage: "scanning",
+            directory: text_path(&source).unwrap().to_owned(),
+            current: 0,
+            total: 1,
+            indexed: 0,
+            unchanged: 0,
+            failed: 0,
+            filename: "movie.mkv".into(),
+            failure: None,
+        };
+        let mut issues = Vec::new();
+        let audio_before_gap = model.audio_calls;
+        assert!(!catalog
+            .index_media_file(
+                &pool,
+                prepared,
+                None,
+                source_id,
+                &path,
+                before.clone(),
+                existing,
+                false,
+                hash_file(&path, &before).unwrap(),
+                true,
+                &mut model,
+                &mut state,
+                &mut issues,
+                &|| false
+            )
+            .unwrap());
+        pool.finish().unwrap();
+        assert_eq!(
+            (state.current, state.indexed, state.failed, issues.len()),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(
+            model.audio_calls,
+            audio_before_gap + 2,
+            "Valid audio after failures must still be embedded"
+        );
+        let rows = catalog.browse(0, 100).unwrap().items;
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|row| row.segment_index < 2));
+        let audio_before = model.audio_calls;
+        let video_before = model.video_calls;
+        drop(catalog);
+        let mut catalog = Catalog::open(&data).unwrap();
+        let retry = catalog
+            .index(&source, &mut model, || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!((retry.indexed, retry.failed, retry.unchanged), (1, 1, 0));
+        assert_eq!(
+            model.audio_calls, audio_before,
+            "Reuse valid audio vectors on retry"
+        );
+        assert_eq!(
+            model.video_calls, video_before,
+            "Reuse unchanged visual vectors"
+        );
+        // A repaired soundtrack replaces the partial generation atomically.
+        fs::write(&path, healthy).unwrap();
+        let repaired = catalog
+            .index(&source, &mut model, || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!((repaired.indexed, repaired.failed), (1, 0));
+        assert_eq!(catalog.status().unwrap().asset_count, 4);
+        let same = catalog
+            .index(&source, &mut model, || false, |_| Ok(()))
+            .unwrap();
+        assert_eq!((same.unchanged, same.failed), (1, 0));
+    }
+
     #[test]
     #[ignore = "requires installed ffmpeg and ffprobe; uses only temporary generated media and fake embeddings"]
     fn native_audio_video_and_soundtrack_segments_share_one_catalog() {

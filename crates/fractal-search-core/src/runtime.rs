@@ -571,6 +571,10 @@ impl RuntimeSessions {
                     Ok(builder.with_execution_providers([
                         CUDAExecutionProvider::default()
                             .with_device_id(device_id)
+                            // Three resident graphs have independent arenas.
+                            // Avoid geometric over-reservation as batch and
+                            // sequence sizes change during a mixed-media scan.
+                            .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested)
                             .with_tf32(false)
                             .build()
                             .error_on_failure(),
@@ -580,6 +584,20 @@ impl RuntimeSessions {
                 bail!("CUDA device {device_id} requested in a CPU-only build")
             }
         }
+    }
+    fn run_options(&self) -> Result<RunOptions> {
+        let mut options = RunOptions::new()?;
+        if let ExecutionProvider::Cuda { device_id } = self.provider {
+            // Encoders and the shared model execute serially but own separate
+            // arenas. Return unused scratch buffers after every run so a prior
+            // image batch cannot reserve the memory needed by audio or video.
+            // Weights and live outputs remain allocated; inference is not retried.
+            options.add_config_entry(
+                "memory.enable_memory_arena_shrinkage",
+                format!("gpu:{device_id}"),
+            )?;
+        }
+        Ok(options)
     }
     fn session(&self, file: &str, inputs: &[&str], outputs: &[&str]) -> Result<Session> {
         let start = Instant::now();
@@ -745,7 +763,8 @@ impl RuntimeSessions {
             Tensor::from_array(([batch, sequence], inputs.attention_mask.into_boxed_slice()))?;
         // Fetch only the retrieval vector. Returning last_hidden_state would
         // copy the unused token matrix back to CPU on every CUDA inference.
-        let options = RunOptions::new()?
+        let options = self
+            .run_options()?
             .with_outputs(OutputSelector::no_default().with("sentence_embedding"));
         let outputs = self
             .text
@@ -813,13 +832,15 @@ impl RuntimeSessions {
             [batch, patches, 2],
             inputs.pixel_position_ids.into_boxed_slice(),
         ))?;
+        let options = self.run_options()?;
         let outputs = self
             .vision
             .as_mut()
             .context("Vision session not initialized")?
-            .run(ort::inputs![
-                "pixel_values" => pixels, "pixel_position_ids" => positions
-            ])?;
+            .run_with_options(
+                ort::inputs!["pixel_values" => pixels, "pixel_position_ids" => positions],
+                &options,
+            )?;
         let (shape, values) = outputs["image_features"].try_extract_tensor::<f32>()?;
         ensure!(
             shape.as_ref() == [feature_count as i64, preprocess::HIDDEN_DIM as i64],
@@ -857,13 +878,15 @@ impl RuntimeSessions {
                 [1, inputs.num_frames],
                 inputs.input_features_mask.into_boxed_slice(),
             ))?;
+            let options = self.run_options()?;
             let output = self
                 .audio
                 .as_mut()
                 .context("Audio session not initialized")?
-                .run(ort::inputs![
-                    "input_features" => data, "input_features_mask" => mask
-                ])?;
+                .run_with_options(
+                    ort::inputs!["input_features" => data, "input_features_mask" => mask],
+                    &options,
+                )?;
             let (shape, values) = output["audio_features"].try_extract_tensor::<f32>()?;
             ensure!(
                 shape.as_ref() == [inputs.num_soft_tokens as i64, preprocess::HIDDEN_DIM as i64],

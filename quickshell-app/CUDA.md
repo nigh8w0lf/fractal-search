@@ -34,6 +34,22 @@ Inference fetches only `sentence_embedding`, avoiding a copy of the unused
 worker-pool spinning so those threads sleep while waiting for work. CPU sessions
 retain their existing threading behavior. These execution optimizations preserve image budgets; the FP16 profile change requires a fresh catalog.
 
+## GPU memory ownership
+
+Each of the three resident graphs has its own GPU arena. CUDA uses
+`kSameAsRequested` growth and `memory.enable_memory_arena_shrinkage=gpu:N`
+on every shared/vision/audio call. Unused scratch allocations return to the GPU
+after the call; weights and live outputs remain allocated. CPU arena behavior,
+model precision, image batches, video sampling and context budgets are unchanged.
+This uses [ONNX Runtime's arena shrinkage support](https://onnxruntime.ai/docs/get-started/with-c.html#features).
+
+A small failed allocation can indicate that earlier graph arenas have consumed
+nearly all device memory, rather than that the requested buffer is unusually
+large. Memory reclamation reduces that retained capacity but cannot guarantee
+that every workload fits every GPU. Allocation failures remain fatal, with no
+automatic retry, smaller batch, shorter video segment or CPU substitution. A
+runtime-only allocation-policy update does not require a catalog reset.
+
 ## Image batching
 
 Settings → Performance → **Image batch size** accepts 1–8 (default 1). Save it and choose **Restart now** to apply it, or **Later** to keep the running size until the next service start. Both manual and watched scans use that startup value. Compatible consecutive images share inference; tails and changes in patch budget produce smaller batches. GPU out-of-memory and other inference errors remain visible without retrying at a smaller size or on CPU.

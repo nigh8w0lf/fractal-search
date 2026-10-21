@@ -227,12 +227,12 @@ ColumnLayout {
                     SearchText {
                         Layout.fillWidth: true
                         Layout.minimumWidth: 0
-                        text: "Last scan · " + page.app.indexFailureCount + " skipped"
+                        text: "Last scan · " + page.app.indexFailureCount + " with issues"
                         color: page.app.colors.error
                         wrapMode: Text.WordWrap
                     }
                     SearchButton {
-                        text: "Skipped files"
+                        text: "Indexing issues"
                         colors: page.app.colors
                         onClicked: page.showSkippedFiles()
                     }

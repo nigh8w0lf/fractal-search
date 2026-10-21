@@ -528,7 +528,7 @@ Item {
                                     onClicked: errorDialog.open()
                                 }
                                 SearchButton {
-                                    text: "Skipped files (" + app.indexFailureCount + ")"
+                                    text: "Indexing issues (" + app.indexFailureCount + ")"
                                     colors: app.colors
                                     visible: app.showIndexReport
                                     onClicked: skippedFiles.open()
@@ -1130,12 +1130,26 @@ Item {
                 focus: true
                 enter: Transition {}
                 exit: Transition {}
-                title: "Skipped files (" + app.indexFailureCount + ")"
+                title: "Indexing issues (" + app.indexFailureCount + ")"
                 palette.windowText: app.colors.foreground
                 palette.text: app.colors.foreground
                 palette.buttonText: app.colors.foreground
                 palette.button: app.colors.surface
-                standardButtons: Dialog.Close
+                footer: Item {
+                    implicitHeight: issueClose.implicitHeight + Style.space(20)
+                    SearchButton {
+                        id: issueClose
+                        anchors.right: parent.right
+                        anchors.rightMargin: Style.space(12)
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Close"
+                        colors: app.colors
+                        onClicked: skippedFiles.close()
+                        Keys.onReturnPressed: skippedFiles.close()
+                        Keys.onEnterPressed: skippedFiles.close()
+                    }
+                }
+                onOpened: issueClose.forceActiveFocus()
                 background: Rectangle {
                     color: app.colors.background
                     border.color: app.borderColor
@@ -1143,7 +1157,7 @@ Item {
                 contentItem: ColumnLayout {
                     SearchText {
                         Layout.fillWidth: true
-                        text: "Repair these files and rescan the folder." + (app.indexFailures.length < app.indexFailureCount ? " Showing the first " + app.indexFailures.length + " errors." : "")
+                        text: "Review skipped content below, then rescan to retry. Successfully indexed segments remain searchable." + (app.indexFailures.length < app.indexFailureCount ? " Showing the first " + app.indexFailures.length + " errors." : "")
                         color: app.colors.foreground
                         wrapMode: Text.WordWrap
                     }

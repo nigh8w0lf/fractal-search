@@ -172,3 +172,66 @@ Diagnostic copies and temporary catalogs were removed after validation; reports
 and logs remain under `/tmp`. Temporary inference tools, scratch executables,
 superseded bundles and the diagnostic Rust toolchain were removed; project
 incremental/build caches were retained.
+
+## CUDA arena retention — 2026-10-20
+
+A watched scan failed on video segment 0 at an attention Transpose allocation of
+1,376,256 bytes. Read-only host inspection found the installed backend holding
+7,796 MiB on the 8,192 MiB RTX 2080 Max-Q, with 1 MiB reported free device memory.
+The preceding log included image batches up to four and audio/video inference.
+This was an allocation failure; it did not report non-finite embeddings.
+
+The three resident CUDA graphs previously used separate, non-shrinking arenas
+with geometric growth. The runtime now selects `kSameAsRequested` growth and
+requests unused GPU arena reclamation after every graph call through
+`memory.enable_memory_arena_shrinkage=gpu:N`. The shared model still selects only
+`sentence_embedding`. Resident weights/live outputs remain allocated, while
+unused scratch regions are released. CPU allocator behavior, graph precision,
+preprocessing, batching, provider and segment budgets are unchanged. No retry,
+quality reduction, provider substitution, model change or catalog migration is
+introduced. See [ORT arena documentation](https://onnxruntime.ai/docs/get-started/with-c.html#features)
+and the [pinned run-option contract](https://github.com/microsoft/onnxruntime/blob/v1.24.2/include/onnxruntime/core/session/onnxruntime_run_options_config_keys.h).
+
+The isolated synthetic workload used image batches of 4/3/2/1/4 with differing
+aspect ratios, a 30-second tone and a 30-second 768×1280 video. Retained process
+GPU memory after the mixed sequence was 6,326 MiB before versus 1,710 MiB after.
+Changing only arena growth had left 5,668 MiB retained, so per-run reclamation was
+also necessary. A fresh-video-only run held 2,848 MiB before versus 1,130 MiB
+after. These are `nvidia-smi` snapshots after completed calls, not transient peak
+measurements or universal GPU requirements. Reallocation has a potential latency
+cost; the concurrent builds and short runs do not establish a throughput change.
+
+With explicit authorization, a temporary copy of the reported 720×1280,
+11.966667-second video was indexed both fresh and after the mixed sequence. Both
+its video and audio were searchable. Retained memory after the mixed case was
+5,428 MiB before versus 1,712 MiB after. Across 57 search scores for three queries
+in the fresh/mixed catalogs, maximum absolute before/after difference was
+5.960464477539063e-8. The original live scan and its exact accumulated allocation
+state were not replayed; even the isolated baseline completed this copied file.
+The evidence establishes reduced retention and successful inference, not a
+promise that every workload fits every GPU. Original media and the live catalog
+were not used as test outputs, reset or reindexed.
+
+Reports: `/tmp/fractal-video-memory-ehgl1qxh/report.json` (synthetic baseline),
+`/tmp/fractal-video-memory-ujxx8293/report.json` (synthetic update),
+`/tmp/fractal-video-memory-s_fkaivz/report.json` (approved-copy baseline),
+`/tmp/fractal-video-memory-jzlu_x4z/report.json` (approved-copy update), and
+`/tmp/fractal-video-memory-score-parity.json` (57-score comparison).
+
+Current-source CPU/CUDA workspace checks and suites passed: 169 tests per
+configuration, seven opt-in tests ignored in each default suite. Formatting and
+diff checks passed. Native validation passed 12 CPU/CUDA embedding comparisons
+(minimum cosine 0.9999830226), repeated cross-modality calls, and all three
+CUDA graph profiles with zero CPU matrix/attention events. The report is
+`/tmp/fractal-memory-parity/report.json`. Isolated installer checks passed
+install/update, provider/configuration preservation, rollback, service activity
+restoration, pruning and uninstall. Diagnostic media and temporary catalogs were
+removed after the approved-copy/synthetic measurements; reports/logs were retained.
+
+Installed bundle `0.1.0-750324cfc993-close-cuda-0-5376c7db` matched the validated
+binary/provider hashes and returned that version through plugin ping. The
+service remained active and completed CUDA text warmup. Settings, provider
+configuration and personal bindings were hash-identical; login registration
+remained disabled. The installer pruned one obsolete runtime and preserved the
+catalog and model cache. No live-library rescan was initiated. The temporary
+Rust toolchain and staging bundle were removed; incremental/build caches remain.
