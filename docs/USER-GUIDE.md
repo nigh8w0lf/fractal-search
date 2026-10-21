@@ -35,12 +35,14 @@ After a successful install, obsolete runtime builds are removed automatically. T
 
 First-run **Set up model** downloads and verifies about 1.50 GB of pinned assets. **Choose folder** under Settings → Performance can reuse an existing verified model cache. Then add your folders under Settings → Folders.
 
+In **Settings → Preferences → Connect an AI agent**, copy the installed server path or MCP JSON configuration, or open the setup guide. Paste the configuration into your MCP client; the client launches its own read-only server. This does not register clients automatically.
+
 ## Search and settings
 
 - **Search:** a compact description field with a Settings gear icon and keyboard hints. Typing searches after a short pause; Enter submits immediately. There is no Browse all photos button. The existing empty-query Enter action still lists indexed segments.
 - **Results:** a thumbnail list and selected-result preview, friendly folder names, All folders and All file types / Images / Text / Audio / Video filters, and explicit **Open file** / **Show in folder** buttons. Preferences offers list-and-preview or list-only layout; narrow windows use the list with actions beneath it. A photo grid is not implemented.
 - **Settings → Folders:** add folders, see file and segment counts, remove a folder from the index, rescan folders, keep folders up to date and review indexing issues. Removing a folder preserves originals and asks for confirmation.
-- **Settings → Preferences:** prepare search at login, hide after opening a file, maximum results (default 6) and result layout.
+- **Settings → Preferences:** prepare search at login, hide after opening a file, maximum results (default 6), result layout and MCP client setup.
 - **Settings → Performance:** model setup, a compact Accelerator section, image batch size, shortcut setup and Stop service. Accelerator checks GPU requirements automatically when shown, displays actual CPU/GPU activity, and greys out an unavailable GPU. Details expands the report; Copy diagnostics prepares it to share with your agent. Availability does not mean active GPU inference and never changes the configured provider.
 
 Up/Down selects results, Enter opens the selection, Ctrl+Enter shows it in the file manager, and Ctrl+, opens Settings. Escape goes back or hides the panel. Ctrl+Q asks to stop the service; Cancel is focused by default, using the same confirmation component as folder removal. Left/Right switches a focused settings tab. All panels follow Omarchy’s theme and font tokens, including popup border colors, gradients and widths. Shortcut hints are clickable, with consistent spacing and visible hover/keyboard focus states.

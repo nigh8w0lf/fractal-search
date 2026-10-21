@@ -17,7 +17,7 @@ cannot be verified by the opener. The installer requires GLib's `gio` command.
 Settings has three tabs:
 
 - **Folders:** add search folders, see their file and segment counts, rescan, keep folders up to date, review indexing issues, or remove a folder from the index. Removal always asks for confirmation and preserves originals.
-- **Preferences:** prepare search at login, hide after opening a file, and choose the result count and layout.
+- **Preferences:** prepare search at login, hide after opening a file, choose the result count and layout, and connect an AI agent through MCP.
 - **Performance:** set up the search engine, inspect GPU requirements, copy diagnostics, choose image batch size, configure a launcher shortcut, and stop the service safely.
 
 The tabs remain visible while their contents scroll. Left/Right switches a focused tab. All panels use the active Omarchy theme; confirmations share the same component and default to Cancel. The launcher uses the shared `qs.Ui.BorderSurface` and popup border specification, including gradients and per-side widths. Header/footer geometry scales with theme spacing; clickable shortcut hints share the button focus/hover styling.

@@ -600,6 +600,13 @@ Item {
                             Layout.maximumWidth: 660
                             Layout.alignment: Qt.AlignHCenter
                             app: app
+                            mcpExecutable: runtimeConfig.mcpExecutable
+                            onOpenAgentGuide: {
+                                if (Qt.openUrlExternally("https://github.com/nigh8w0lf/fractal-search/blob/main/quickshell-app/MCP.md"))
+                                    window.exclusiveKeyboard = false;
+                                else
+                                    app.fail("Could not open the MCP setup guide. Check your default browser.");
+                            }
                             onAddFolder: imageFolder.open()
                             onChooseModel: modelFolder.open()
                             onShowSkippedFiles: skippedFiles.open()

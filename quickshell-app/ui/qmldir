@@ -21,3 +21,4 @@ ModelIdlePolicy 1.0 ModelIdlePolicy.qml
 ModelRuntimeSection 1.0 ModelRuntimeSection.qml
 MediaPreview 1.0 MediaPreview.qml
 SearchSlider 1.0 SearchSlider.qml
+AgentConnectionSettings 1.0 AgentConnectionSettings.qml

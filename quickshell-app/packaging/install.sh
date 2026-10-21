@@ -194,6 +194,7 @@ chmod +x -- "$SEARCH_STAGE/plugin/fractal-search-mcp"
 SEARCH_VERSION_JSON=$(jq -Rn --arg version "$SEARCH_VERSION" '$version')
 SEARCH_SOCKET_JSON=$(jq -Rn --arg path "$SEARCH_RUNTIME_DIR/fractal-search/backend.sock" '$path')
 SEARCH_PICKER_JSON=$(jq -Rn --arg path "$SEARCH_DEST/bin/fractal-folder-picker" '$path')
+SEARCH_MCP_JSON=$(jq -Rn --arg path "$SEARCH_PLUGIN/fractal-search-mcp" '$path')
 SEARCH_BACKEND_JSON=$(jq -Rn --arg path "$SEARCH_DEST/bin/fractal-search" '$path')
 SEARCH_PROVIDER_JSON=$(jq -Rn --arg provider "$SEARCH_PROVIDER" '$provider')
 SEARCH_CUDA_DIRECTORY_JSON=$(jq -Rn --arg directory "$SEARCH_CUDA_LIB_DIR" '$directory')
@@ -206,6 +207,7 @@ QtObject {
     readonly property string serviceName: "fractal-search.service"
     readonly property string pickerExecutable: $SEARCH_PICKER_JSON
     readonly property string backendExecutable: $SEARCH_BACKEND_JSON
+    readonly property string mcpExecutable: $SEARCH_MCP_JSON
     readonly property string configuredProvider: $SEARCH_PROVIDER_JSON
     readonly property int configuredDeviceId: ${SEARCH_DEVICE_ID:--1}
     readonly property string cudaLibraryDirectory: $SEARCH_CUDA_DIRECTORY_JSON

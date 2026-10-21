@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 
 QtObject {
+    readonly property string mcpExecutable: Quickshell.env("FRACTAL_SEARCH_MCP")
     readonly property string socketPath: Quickshell.env("XDG_RUNTIME_DIR") + "/fractal-search/backend.sock"
     readonly property string bundleVersion: "development-harness"
     readonly property string serviceName: "fractal-search.service"

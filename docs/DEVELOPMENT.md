@@ -74,6 +74,7 @@ The desktop socket is trusted same-user access: it may index folders and open or
 | `quickshell-app/ui/SearchPanel.qml` | Panel geometry, focus, search/results, shortcuts and plugin lifecycle. |
 | `quickshell-app/ui/Controller.qml` | Socket protocol, application state, search/index operations and previews. |
 | `quickshell-app/ui/SettingsPage.qml` | Folders, Preferences and Performance tabs. |
+| `quickshell-app/ui/AgentConnectionSettings.qml` | Read-only MCP discovery and copyable installed client configuration under Preferences. |
 | `quickshell-app/ui/MediaPreview.qml`, `SearchSlider.qml` | Manual local audio/video playback, seek/volume controls and playback lifecycle. |
 | `quickshell-app/ui/ResultActions.qml` | Shared Open file / Show in folder controls for preview and narrow/list layouts. |
 | `quickshell-app/ui/DesktopFileOpener.qml` | GIO desktop launch, bounded diagnostics and visible opener failures. |

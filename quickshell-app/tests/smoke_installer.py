@@ -35,6 +35,7 @@ def main():
         assert panel.exists()
         runtime_qml = (panel.parent / 'RuntimeConfig.qml').read_text()
         assert 'pickerExecutable:' in runtime_qml
+        assert 'mcpExecutable: ' + json.dumps(str(plugin / 'fractal-search-mcp')) in runtime_qml
         assert 'closeShortcutEnabled: false' in runtime_qml
         assert bindings.read_text() == original_bindings
         assert list((data / 'fractal-search/runtime').glob('*/bin/fractal-folder-picker'))

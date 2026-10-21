@@ -155,6 +155,7 @@ while not (root / 'restart.complete').exists():
         client.close()
         env['FRACTAL_SEARCH_SOCKET'] = str(socket)
         env['FRACTAL_SEARCH_BINARY'] = str(args.binary.resolve())
+        env['FRACTAL_SEARCH_MCP'] = str(root / 'custom config/fractal-search-mcp')
         ui = root / 'ui'
         shutil.copytree(args.ui_dir.resolve(), ui)
         (ui / 'Commons').symlink_to('/usr/share/omarchy/shell/Commons', target_is_directory=True)
@@ -313,6 +314,16 @@ with (root / 'viewer.log').open('a') as log:
         if args.chrome_only:
             call('test', 'settings')
             wait(lambda s: s['page'] == 'settings' and not s['animating'])
+            call('test', 'clickTab', 'Preferences')
+            call('test', 'scrollSettings', '10000')
+            time.sleep(.4)
+            subprocess.run(['grim', str(root / 'agent-preferences.png')], env=env, check=True, timeout=5)
+            call('test', 'resize', '350', '440')
+            call('test', 'scrollSettings', '10000')
+            time.sleep(.4)
+            subprocess.run(['grim', str(root / 'agent-preferences-narrow.png')], env=env, check=True, timeout=5)
+            call('test', 'resize', '0', '0')
+            call('test', 'clickTab', 'Folders')
             call('test', 'partialVideoReport')
             state = wait(lambda s: s['failed'] == 1)
             assert 'file(s) with indexing issues' in state['error'], state

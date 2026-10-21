@@ -4,6 +4,8 @@
 
 The server uses stdio JSON-RPC and the official Rust MCP SDK, pinned to rmcp 3.1.4. It negotiates the SDK's supported initialize-based protocol revisions (including 2025-11-25). The client launches one process; no TCP listener or daemon registration is involved. JSON-RPC goes to stdout and diagnostics to stderr. See the [MCP stdio specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#stdio).
 
+In **Settings → Preferences → Connect an AI agent**, copy the installed server path or MCP JSON configuration, or open the setup guide. Paste the configuration into your MCP client; the client launches its own read-only server. This does not register clients automatically.
+
 ## Connect a client
 
 An installed bundle exposes a stable launcher at:

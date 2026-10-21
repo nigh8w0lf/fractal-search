@@ -7,6 +7,8 @@ import QtQuick.Layouts
 ColumnLayout {
     id: page
     required property Controller app
+    property string mcpExecutable: ""
+    signal openAgentGuide
     property int currentTab: 0
     property bool panelVisible: false
     readonly property bool performanceVisible: panelVisible && visible && currentTab === 2
@@ -363,6 +365,13 @@ ColumnLayout {
                         }
                     }
                 }
+            }
+            AgentConnectionSettings {
+                visible: page.currentTab === 1
+                Layout.fillWidth: true
+                app: page.app
+                serverPath: page.mcpExecutable
+                onOpenGuide: page.openAgentGuide()
             }
             ColumnLayout {
                 visible: page.currentTab === 2

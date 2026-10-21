@@ -15,7 +15,7 @@ Add your folders, search in natural language, and open a match in its default ap
 - **Fit your desktop:** Omarchy themes, keyboard navigation, folder/type filters and a choice of list or split preview layouts.
 - **Keep your library current:** optional folder watching, incremental rescans and visible indexing issues.
 - **Choose your hardware:** CPU support, with optional NVIDIA CUDA acceleration.
-- **Connect an agent:** a separate read-only MCP server provides catalog search, excerpts and cached thumbnails without exposing original paths or file bytes.
+- **Connect an agent:** copy client configuration from Settings → Preferences. A separate read-only MCP server provides catalog search, excerpts and cached thumbnails without exposing original paths or file bytes.
 
 ## Supported files
 
