@@ -82,15 +82,15 @@ from all local commit histories with git-filter-repo. The current source tree
 was unchanged, and the post-rewrite reachable-object scan found no binary media.
 A private recovery bundle and commit map are stored outside this repository.
 
-GitHub history is still unchanged: automatic approval review rejected the
-six-branch force-push pending explicit owner approval. Synchronize the remote
-with expected-tip force-with-lease checks before exposing repository history.
-Existing clones must then be refreshed to avoid reintroducing the removed blobs.
+The owner authorized updating only GitHub main. Its cleaned history was pushed
+with an explicit expected-tip force-with-lease check. Other remote branches were
+left untouched for the owner to delete; they can still retain the old media until
+removed. Existing clones must be refreshed to avoid reintroducing removed blobs.
 
 ## Deliberately remaining before publication
 
-1. Explicitly authorize the six-branch private GitHub force-push to synchronize
-   the cleaned local history, then verify the remote branches.
+1. Delete the other remote branches that retain old history, as planned by the
+   owner. Main is cleaned; no other remote branch was rewritten.
 2. Authorize public visibility and release publication, then create the release
    tag and upload the reviewed CPU/CUDA/source archives, checksums and notes.
 3. Replace the README's unavailable-download note with the actual release link.
