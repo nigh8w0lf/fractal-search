@@ -1,0 +1,77 @@
+[
+  {
+    "path": "onnxruntime-1.24.2/LICENSE",
+    "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.24.2/LICENSE",
+    "sha256": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c"
+  },
+  {
+    "path": "onnxruntime-1.24.2/ThirdPartyNotices.txt",
+    "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.24.2/ThirdPartyNotices.txt",
+    "sha256": "0e07b95f3a8d6230037707c5c4a2b554d12c4cb67369669ac255635528ffcee2"
+  },
+  {
+    "path": "defmt-parser-1.0.0/LICENSE-MIT",
+    "url": "https://raw.githubusercontent.com/knurling-rs/defmt/4a8cdb44891ed57b8ff5a023b6bec7137c48708f/LICENSE-MIT",
+    "sha256": "2710a622a896bba67356913d4d0492cab5465f61b2ecce6d880aeb483834fb50"
+  },
+  {
+    "path": "defmt-parser-1.0.0/LICENSE-APACHE",
+    "url": "https://raw.githubusercontent.com/knurling-rs/defmt/4a8cdb44891ed57b8ff5a023b6bec7137c48708f/LICENSE-APACHE",
+    "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90"
+  },
+  {
+    "path": "lance-10.0.0/LICENSE",
+    "url": "https://raw.githubusercontent.com/lance-format/lance/95f2f36b22043c3face00afe088c34e0742d01df/LICENSE",
+    "sha256": "6f4030a4f059f5618cf00375afd8f5d18fe48e0fc2be1c2e98b2c32c90c44938"
+  },
+  {
+    "path": "lance-namespace-reqwest-client-0.8.6/LICENSE",
+    "url": "https://raw.githubusercontent.com/lance-format/lance-namespace/590a4eb7163a85f56e0622f9359efa33d5ad6941/LICENSE",
+    "sha256": "03c4e02af8cbe96dd3a9bfaac9ee27ec6a8e9a3ee38ed7b290d50495c11eea48"
+  },
+  {
+    "path": "rmcp-3.1.4/LICENSE",
+    "url": "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/4a738b9dd99eaca418b614afa433a0cbdaf8d056/LICENSE",
+    "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
+  },
+  {
+    "path": "flatbuffers-25.12.19/LICENSE",
+    "url": "https://raw.githubusercontent.com/google/flatbuffers/7e163021e59cca4f8e1e35a7c828b5c6b7915953/LICENSE",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+  },
+  {
+    "path": "zune-core-0.4.12/LICENSE.md",
+    "url": "https://raw.githubusercontent.com/etemesi254/zune-image/f8fbb123d5ed04441e8324a555bfcda0cb1bd28f/LICENSE.md",
+    "sha256": "c6dff146a9f31848ac296faa5a08a4253caf2c384c86f906dc99e7fc0a39cc8c"
+  },
+  {
+    "path": "zune-jpeg-0.4.21/LICENSE.md",
+    "url": "https://raw.githubusercontent.com/etemesi254/zune-image/fa2c767a01d7d9373911d0bf63e0588553d67e0e/LICENSE.md",
+    "sha256": "c6dff146a9f31848ac296faa5a08a4253caf2c384c86f906dc99e7fc0a39cc8c"
+  },
+  {
+    "path": "standard/MIT.txt",
+    "url": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/MIT.txt",
+    "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+  },
+  {
+    "path": "onnxruntime-1.24.2/deps.txt",
+    "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.24.2/cmake/deps.txt",
+    "sha256": "a913db05c4e9965f9725aec7a5b9b10b071d13496e567283e81737ebe91ff027"
+  },
+  {
+    "path": "onnxruntime-1.24.2/external/eigen.cmake",
+    "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.24.2/cmake/external/eigen.cmake",
+    "sha256": "9db439c44f215186d3e8bde7970affd03d8fa911d89cac19adc30ed681ff32a2"
+  },
+  {
+    "path": "onnxruntime-1.24.2/patches/eigen/s390x-build.patch",
+    "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.24.2/cmake/patches/eigen/s390x-build.patch",
+    "sha256": "6d41f4504f665bc591336c668a1aa16ffc5e0f02fe9c2f9c46c6f5660b54c849"
+  },
+  {
+    "path": "onnxruntime-1.24.2/patches/eigen/s390x-build-werror.patch",
+    "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.24.2/cmake/patches/eigen/s390x-build-werror.patch",
+    "sha256": "a1a7b0ca8382cb00542587b6bc725f59abd59ad5bb491825f7876ad6e344ef0b"
+  }
+]

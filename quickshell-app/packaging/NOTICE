@@ -1,34 +1,33 @@
-Fractal Search development bundle
-
-Fractal Search is licensed under the MIT License; see LICENSE.
+Fractal Search
 Copyright (c) 2026 nigh8w0lf (Ashwin Cheekati).
-This license does not replace the licenses of third-party code or model assets.
+Fractal Search is licensed under the MIT License; see LICENSE.
+Third-party components retain their respective licenses and attribution.
 
-Native runtime: Rust, ONNX Runtime, LanceDB/Lance, Apache Arrow, Hugging Face
-tokenizers, zbus, libheif and libjpeg-turbo. System libraries are provided by Omarchy packages;
-ONNX Runtime is linked into the executable. Dependency licenses remain their
-respective owners' licenses. The bundle uses a local LanceDB 0.37.1 manifest
-patch that disables optional Jieba/Lindera tokenizers; its runtime source is
-unchanged. See LANCEDB-LICENSE for the upstream Apache-2.0 license.
+The third-party/ directory contains the exact Cargo.lock, a versioned resolved
+Linux dependency inventory, full crate license/notice texts, ONNX Runtime 1.24.2
+license and third-party notices, and the Rust runtime copyright/license texts.
+The inventory conservatively includes build and development dependencies;
+it does not assert that every listed package is linked into each executable.
+Nested notices from vendored native code are preserved alongside crate notices.
 
-Dependency licenses (ONNX Runtime: MIT; LanceDB/Lance and Arrow:
-Apache-2.0; tokenizers: Apache-2.0; zbus: MIT; libheif: LGPL-3.0;
-libjpeg-turbo: IJG/BSD/zlib).
+MPL-2.0-covered source for option-ext and ONNX Runtime's pinned Eigen revision is
+supplied in third-party/sources. Eigen's build metadata and patches are included
+under third-party/onnxruntime-1.24.2. See third-party/README.md for details.
+The local LanceDB manifest-only patch is documented in third-party/LANCEDB-PATCHES.md;
+its runtime source is unchanged. Its Apache-2.0 license is also in LANCEDB-LICENSE.
 
-CUDA-capable bundles additionally carry ONNX Runtime's CUDA/shared provider
-libraries. NVIDIA driver, CUDA 12 and cuDNN 9 libraries are external runtime
-requirements and are not redistributed in this bundle. The stdio MCP server
-uses rmcp (MIT) and Tokio (MIT).
+ONNX Runtime is statically linked. CUDA bundles additionally carry its CUDA and
+shared provider libraries. NVIDIA driver, CUDA runtime, cuRAND and cuDNN libraries
+are external dependencies and are NOT redistributed. Neither are the system
+libheif, libjpeg-turbo, glibc, libstdc++, Qt/Quickshell or FFmpeg libraries/tools.
+Their installation and licensing are provided by the user's operating system.
+No implication of endorsement by these projects or their contributors is made.
 
-Audio/video decoding invokes separately installed ffmpeg and ffprobe tools.
-Their licensing depends on the system FFmpeg build; no FFmpeg binary is bundled.
-
-First-run EmbeddingGemma 2 FP16 text, vision and audio assets are downloaded from
-onnx-community/embeddinggemma-2-ONNX at the exact revision in model-manifest.json.
-The export declares Apache-2.0. Upstream model and export:
-https://huggingface.co/google/embeddinggemma-2
+Model weights/tokenizers are not bundled. First-run setup downloads pinned,
+verified assets from onnx-community/embeddinggemma-2-ONNX at the revision recorded
+in model-manifest.json. Model/export terms apply separately from this application:
 https://huggingface.co/onnx-community/embeddinggemma-2-ONNX
-Preserve the applicable model license and attribution when distributing assets.
+https://huggingface.co/google/embeddinggemma-2
+Do not redistribute model assets under the application's MIT license.
 
-This local development bundle is not a published or signed release. Complete
-project and third-party license/redistribution review before public distribution.
+SHA256SUMS verifies bundle integrity; it is not a publisher signature.

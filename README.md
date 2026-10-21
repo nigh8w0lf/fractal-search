@@ -41,13 +41,30 @@ desktop defaults. Missing opener/application errors and launch timeouts stay
 visible; the panel hides or releases focus only after GIO accepts the launch.
 An application can still fail after accepting the request.
 
+## Agent-assisted setup
+
+Give your agent [docs/AGENT-SETUP.md](docs/AGENT-SETUP.md) and ask it to install or troubleshoot Fractal Search. Prebuilt bundles include the guide as `AGENT-SETUP.md` and a dedicated `AGENTS.md`. Agents modifying source should follow this repository’s contributor guidance and package/install the complete app.
+
 ## Build, install and open
 
-**Manual setup is required.** Use the source build below or a prebuilt bundle's `install.sh`. Omarchy's generic `omarchy plugin add` command only clones the repository; it does not build the native binaries, create the user service or generate runtime paths. Do not enable a raw clone as a working installation.
+**Manual setup is required.** End users should use a compatible prebuilt bundle's `install.sh`; no Rust compiler or Python environment is required. Omarchy's generic `omarchy plugin add` command only clones the repository; it does not build the native binaries, create the user service or generate runtime paths. Do not enable a raw clone as a working installation.
 
-From this repository's root:
+Download the CPU or CUDA archive and checksums from the published release linked by the marketplace listing. Check the release's architecture/system-library requirements and archive checksum, extract it, then run from the extracted directory:
 
 ```bash
+sha256sum --check SHA256SUMS
+./install.sh
+omarchy-shell shell toggle fractal.search
+```
+
+For explicitly selected NVIDIA acceleration, use the CUDA archive and `./install.sh --provider cuda --device-id 0`; see its `CUDA.md` for the separately installed driver/runtime libraries. Updates preserve the current provider when flags are omitted. The agent guide covers setup, verification and troubleshooting. Release preparation does not itself publish download links.
+
+For development from this repository's root:
+
+```bash
+# Fetch verified third-party covered source once for distributable bundles
+python3 scripts/fetch-release-sources.py
+
 # CPU development build, installation and summon
 ./start-quickshell-search.sh --dev
 
@@ -123,7 +140,7 @@ The repository has one root [manifest](manifest.json). Packaging rebases its pan
 
 Follow the [current publishing guide](https://plugins.omarchy.org/publish.html) and [submission requirements](https://github.com/omacom/omarchy-plugin-marketplace/blob/main/SUBMISSION.md). The installer and user-service management require maintainer review under the [automated security baseline](https://github.com/omacom/omarchy-plugin-marketplace/blob/main/SECURITY.md#automated-security-baseline). Local validation is not marketplace approval: submit a committed, tested snapshot and request `manual-setup` before the maintainer applies `approved-and-verified`. Do not claim standard one-click installation support.
 
-Fractal Search is [MIT licensed](LICENSE), copyright 2026 nigh8w0lf (Ashwin Cheekati). Vendored LanceDB retains its [Apache-2.0 license](vendor/lancedb/LICENSE) and [patch provenance](vendor/lancedb/PATCHES.md). Dependencies and downloaded models retain their own licenses. Publishing prebuilt binaries additionally requires a complete third-party notice/redistribution review; the current development bundle's [NOTICE](quickshell-app/packaging/NOTICE) is an overview, not a complete binary license inventory.
+Fractal Search is [MIT licensed](LICENSE), copyright 2026 nigh8w0lf (Ashwin Cheekati). Vendored LanceDB retains its [Apache-2.0 license](vendor/lancedb/LICENSE) and [patch provenance](vendor/lancedb/PATCHES.md). Dependencies and downloaded models retain their own licenses. Each bundle includes [NOTICE](quickshell-app/packaging/NOTICE), full third-party license/notice texts, an exact resolved dependency inventory, ONNX Runtime/Rust runtime attribution and covered MPL source. See [release preparation](docs/RELEASING.md) for provenance, platform limits and validation.
 
 ## Architecture and source map
 
@@ -205,7 +222,7 @@ A source edit is not an installed update: rebuild/package/install to change the 
 - [QMD validation results and blocked checks](docs/QMD-VALIDATION.md)
 - [Local QMD/512 integration checkpoint and unrun validation](docs/QMD-LOCAL-INTEGRATION.md)
 
-Model weights and generated bundles are not checked in. Repository licensing and manual installation are documented above; public binary release/signing and redistribution review remain separate work.
+Model weights and generated bundles are not checked in. Repository licensing and manual installation are documented above. Release archives and third-party notices are prepared with the [release workflow](docs/RELEASING.md); uploading/publishing and signing remain separate actions.
 
 ## LanceDB catalog format
 

@@ -36,10 +36,12 @@ def local_url(value):
 
 
 class Service:
-    def __init__(self, binary, models, data, log):
+    def __init__(self, binary, models, data, log, provider=None):
         self.args = [
             str(binary), "--model-dir", str(models), "--data-dir", str(data), "serve"
         ]
+        if provider is not None:
+            self.args += ["--provider", provider]
         self.log = log.open("w")
         self.process = subprocess.Popen(
             self.args,

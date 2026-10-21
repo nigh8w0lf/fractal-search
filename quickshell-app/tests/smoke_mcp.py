@@ -15,10 +15,10 @@ from smoke_backend import Service, png
 
 
 class Mcp:
-    def __init__(self, binary, data, models, log):
+    def __init__(self, binary, data, models, log, provider="cpu"):
         self.log = log.open("w")
         self.process = subprocess.Popen(
-            [str(binary), "--data-dir", str(data), "--model-dir", str(models), "--provider", "cpu", "--threads", "2"],
+            [str(binary), "--data-dir", str(data), "--model-dir", str(models), "--provider", provider, "--threads", "2"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
             text=True, bufsize=1, env={k: v for k, v in os.environ.items() if k != "FRACTAL_SEARCH_DEVICE_ID"},
         )

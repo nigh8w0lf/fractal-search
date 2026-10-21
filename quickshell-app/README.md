@@ -39,6 +39,8 @@ A video soundtrack decode failure is a visible partial success: all visual segme
 
 Rows show media kind, passage number or time range, and cached text excerpts (at most 2,048 UTF-8 bytes). Images have bounded previews; video shows a cached poster until you press Play. Audio and video play inline in the preview pane, starting at the selected match’s timestamp and continuing through the original file. Controls provide play/pause, seeking, elapsed/total time, mute and volume. Playback stops and releases the file when selection changes, the pane is hidden (including narrow/list-only layouts), Settings opens, or the panel closes. Loading/codec errors stay visible; playback never starts automatically. Qt Multimedia and its FFmpeg backend are required (`qt6-multimedia` and `qt6-multimedia-ffmpeg` on Omarchy). Text/audio do not request image previews. **Open file** opens the whole original with its default desktop app; it does not request seeking to the matched segment. **Show in folder** reveals the original. Files stay in place.
 
+Agent-assisted setup and troubleshooting: [agent setup guide](../docs/AGENT-SETUP.md). Release bundles include this guide and their own `AGENTS.md`.
+
 ## Install and launch
 
 For a prebuilt bundle, run its `install.sh`, then:
@@ -52,6 +54,7 @@ The installer installs both the `fractal.search` plugin and its native backend. 
 For development from this repository:
 
 ```bash
+python3 scripts/fetch-release-sources.py
 ./start-quickshell-search.sh --dev
 ```
 
@@ -91,11 +94,12 @@ The bundle also installs `~/.config/omarchy/plugins/fractal.search/fractal-searc
 Create a prebuilt bundle without installing it:
 
 ```bash
+python3 scripts/fetch-release-sources.py
 scripts/package-fractal-search.sh --output /absolute/path/to/fractal-search-bundle
 # Or --dev --no-build to package the existing debug binary.
 ```
 
-The bundle includes QML, native backend, installer/uninstaller, pinned model manifest, project MIT license, runtime notes and SHA-256 checksums. The single source manifest lives at `../manifest.json`; packaging rebases its entry point for the bundle. See the [root publication guidance](../README.md#marketplace-publication) for the required manual-setup listing. It is a local development artifact; public publication/signing and a complete redistribution-license review remain separate release work. Omarchy's generic plugin installer clones QML repositories and does not run installation hooks: use this product's bundle installer to obtain the backend too.
+The bundle includes QML, native binaries, installer/uninstaller, pinned model manifest, project MIT license, agent setup guidance, full third-party notices/covered source and SHA-256 checksums. The maintainer-only fetch step verifies pinned native dependency source; packaging uses that local cache and fails if attribution/source is missing or altered. See [release preparation](../docs/RELEASING.md) for CPU/CUDA builds and validation. The single source manifest lives at `../manifest.json`; packaging rebases its entry point for the bundle. See the [root publication guidance](../README.md#marketplace-publication) for the required manual-setup listing. Uploading, signing and marketplace approval remain separate actions. Omarchy's generic plugin installer clones QML repositories and does not run installation hooks: use this product's bundle installer to obtain the backend too.
 
 UI files: `$XDG_CONFIG_HOME/omarchy/plugins/fractal.search`. Backend/unit: `$XDG_DATA_HOME/fractal-search/runtime/<bundle-version>` and `$XDG_CONFIG_HOME/systemd/user/fractal-search.service`. The unit starts on demand; installation does not enable it at login. Updates drain the existing backend before swapping files, use versioned QML paths to avoid stale host component caches, and wait for the new panel to finish loading. Logs are available through `journalctl --user -u fractal-search.service`.
 

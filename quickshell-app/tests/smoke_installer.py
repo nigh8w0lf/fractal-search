@@ -43,6 +43,14 @@ def main():
         assert len(installed_license) == 1
         assert installed_license[0].read_bytes() == (bundle / 'LICENSE').read_bytes()
         assert (installed_license[0].parent / 'LANCEDB-LICENSE').read_bytes() == (bundle / 'LANCEDB-LICENSE').read_bytes()
+        installed_runtime = installed_license[0].parent
+        for name in ['AGENTS.md', 'AGENT-SETUP.md', 'NOTICE']:
+            assert (installed_runtime / name).read_bytes() == (bundle / name).read_bytes()
+        for source in (bundle / 'third-party').rglob('*'):
+            if source.is_file():
+                assert (installed_runtime / source.relative_to(bundle)).read_bytes() == source.read_bytes()
+        assert list((installed_runtime / 'third-party/sources').glob('option-ext-*.tar.gz'))
+        assert list((installed_runtime / 'third-party/sources').glob('eigen-*.zip'))
         mcp = plugin / 'fractal-search-mcp'
         help_result = subprocess.run([str(mcp), '--help'], text=True, capture_output=True)
         assert help_result.returncode == 0, help_result.stdout + help_result.stderr
@@ -107,6 +115,14 @@ def main():
         assert 'FAILED' in damaged.stdout + damaged.stderr
         assert panel.read_bytes() == original_ui
         qml.write_bytes(valid)
+        legal = bundle / 'third-party/onnxruntime-1.24.2/ThirdPartyNotices.txt'
+        valid_legal = legal.read_bytes()
+        legal.write_bytes(valid_legal + b'corruption')
+        damaged = install(False, ['--skip-shell'])
+        assert 'FAILED' in damaged.stdout + damaged.stderr
+        assert (installed_runtime / legal.relative_to(bundle)).read_bytes() == valid_legal
+        assert panel.read_bytes() == original_ui
+        legal.write_bytes(valid_legal)
         marker = plugin / '.fractal-search-install'; saved = marker.read_bytes(); marker.unlink()
         assert 'unmanaged' in install(False, ['--skip-shell']).stderr
         marker.write_bytes(saved)

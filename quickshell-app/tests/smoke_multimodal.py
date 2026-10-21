@@ -63,6 +63,7 @@ def main():
     parser.add_argument('backend', type=Path)
     parser.add_argument('mcp', type=Path)
     parser.add_argument('models', type=Path)
+    parser.add_argument('--provider', choices=['cpu', 'cuda'], default='cpu')
     args = parser.parse_args()
     for tool in ('ffmpeg', 'ffprobe'):
         if not shutil.which(tool):
@@ -72,10 +73,11 @@ def main():
         originals = root / 'originals'; originals.mkdir()
         fixtures(originals)
         catalog = root / 'data'
-        desktop = Service(args.backend.resolve(), args.models.resolve(), catalog, root / 'desktop.log')
+        desktop = Service(args.backend.resolve(), args.models.resolve(), catalog, root / 'desktop.log', provider=args.provider)
         mcp = None
         try:
             ready = desktop.until(lambda event: event.get('event') == 'ready')['payload']
+            assert ready['provider'] == args.provider.upper(), ready
             assert ready['catalog']['fileCount'] == ready['catalog']['assetCount'] == 0
             assert ready['catalog']['modelProfile'] == 'embeddinggemma2-daa72c51-fp16-multimodal-mrl512-v3'
             request = desktop.send({'type': 'index', 'directory': str(originals)})
@@ -127,8 +129,11 @@ def main():
             assert failed['failed'] == 1 and failed['indexed'] == 0, failed
             assert {item['assetId'] for item in desktop.call({'type': 'browse', 'limit': 100})['items']} == old_ids
             shutil.rmtree(originals)
+            # Verify persisted state with a separate reader and release the desktop's
+            # model allocations before the MCP inference session (including CUDA).
+            desktop.close()
             before = catalog_hashes(catalog)
-            mcp = Mcp(args.mcp.resolve(), catalog, args.models.resolve(), root / 'mcp.log')
+            mcp = Mcp(args.mcp.resolve(), catalog, args.models.resolve(), root / 'mcp.log', provider=args.provider)
             status = data(mcp.tool('status'))
             assert status['assetCount'] == count and status['fileCount'] == 5 and not status['textModelLoaded']
             assert status['modelProfile'] == 'embeddinggemma2-daa72c51-fp16-multimodal-mrl512-v3'
@@ -173,7 +178,6 @@ def main():
             assert catalog_hashes(catalog) == before
             assert 'Loaded onnx/vision_encoder_fp16.onnx' not in (root / 'mcp.log').read_text()
             assert 'Loaded onnx/audio_encoder_fp16.onnx' not in (root / 'mcp.log').read_text()
-            desktop.close()
         finally:
             if mcp is not None:
                 mcp.process.terminate(); mcp.process.wait(timeout=30); mcp.log.close()

@@ -2,6 +2,8 @@
 
 This bundle installs the `fractal.search` panel in the existing Omarchy Shell and its native Rust backend as a systemd user service. No Rust compiler, Python environment or separate Quickshell instance is required.
 
+For agent-assisted installation or troubleshooting, give your agent `AGENT-SETUP.md`; `AGENTS.md` routes agents to it.
+
 Run `./install.sh`, then `omarchy-shell shell toggle fractal.search`. Bind that command to your preferred shortcut. Use `./install.sh --bind-close` to integrate Super+W: the focused Fractal panel hides, its focused folder picker cancels, and other application windows retain normal closing. The installer backs up personal bindings, refuses to replace a personal Super+W override, and validates Hyprland's configuration. Updates retain this managed binding; uninstall restores the default by removing only its managed block. On first open, choose **Set up model** (~1.50 GB); previously downloaded files are verified and reused. **Choose folder** in Settings can select an existing pinned EmbeddingGemma 2 model folder instead.
 
 Omarchy/Quickshell, curl, jq, libheif, libjpeg-turbo, gcc-libs and GLib's gio command are runtime requirements, along with xdg-desktop-portal and a FileChooser backend (xdg-desktop-portal-gtk on Omarchy). The installer checks dependencies and reports missing packages with Omarchy installation instructions. Open file uses GIO's MIME associations and terminal-aware application launcher; desktop defaults are preserved, and immediate launch errors remain visible in the panel.
@@ -24,6 +26,6 @@ The stable read-only MCP command is `$XDG_CONFIG_HOME/omarchy/plugins/fractal.se
 
 EmbeddingGemma 2 and schema 4 require a fresh catalog and explicit reindexing. Installation never deletes or converts older data. Select the cache root containing tokenizer.json and onnx/ when choosing an existing model folder. FFmpeg and ffprobe are required for audio/video indexing. Inline preview playback additionally requires Qt Multimedia and its FFmpeg backend (Omarchy packages `qt6-multimedia` and `qt6-multimedia-ffmpeg`). Press Play to start at the matched timestamp; switching results or hiding the preview stops playback.
 
-Fractal Search is MIT licensed; see `LICENSE` for copyright and terms. Third-party code and models retain their own licenses; see `NOTICE` and `LANCEDB-LICENSE`.
+Fractal Search is MIT licensed; see `LICENSE` for copyright and terms. Third-party code and models retain their own licenses; see `NOTICE`, `LANCEDB-LICENSE` and `third-party/README.md`. Full notices, the dependency inventory and covered source are retained in the installed runtime alongside the agent setup guide.
 
 Updates restart a previously active backend after the new panel loads, while leaving a previously stopped backend stopped. Failed installs restore the previous service activity after rollback; rollback errors remain explicit and retain recovery files. Login registration is unchanged.

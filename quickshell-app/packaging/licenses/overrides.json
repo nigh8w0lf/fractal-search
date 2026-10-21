@@ -1,0 +1,74 @@
+{
+  "defmt-parser-1.0.0": [
+    "defmt-parser-1.0.0/LICENSE-MIT",
+    "defmt-parser-1.0.0/LICENSE-APACHE"
+  ],
+  "fax-0.2.6": [
+    "standard/MIT.txt"
+  ],
+  "fax_derive-0.2.0": [
+    "standard/MIT.txt"
+  ],
+  "flatbuffers-25.12.19": [
+    "flatbuffers-25.12.19/LICENSE"
+  ],
+  "fsst-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-arrow-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-arrow-scalar-58.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-arrow-stats-58.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-bitpacking-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-core-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-datagen-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-derive-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-index-core-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-io-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-linalg-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-namespace-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-namespace-impls-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-namespace-reqwest-client-0.8.6": [
+    "lance-namespace-reqwest-client-0.8.6/LICENSE"
+  ],
+  "lance-select-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "lance-tokenizer-10.0.0": [
+    "lance-10.0.0/LICENSE"
+  ],
+  "rmcp-3.1.4": [
+    "rmcp-3.1.4/LICENSE"
+  ],
+  "zune-core-0.4.12": [
+    "zune-core-0.4.12/LICENSE.md",
+    "flatbuffers-25.12.19/LICENSE"
+  ],
+  "zune-jpeg-0.4.21": [
+    "zune-jpeg-0.4.21/LICENSE.md",
+    "flatbuffers-25.12.19/LICENSE"
+  ]
+}

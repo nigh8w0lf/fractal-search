@@ -4,6 +4,10 @@ Read [README.md](README.md) first. These two root documents provide the current 
 
 **No silent fallbacks.** Invalid configuration, missing dependencies, inference failures and incompatible data must produce actionable errors. Never silently substitute providers, decoders, models or path-derived identities.
 
+## Route the task
+
+For end-user installation, updates or troubleshooting, read [the agent setup guide](docs/AGENT-SETUP.md) and prefer a verified prebuilt bundle. For source modifications, follow the contributor workflow below and applicable scoped instructions. Release bundles carry a dedicated AGENTS.md and the same setup guide; do not apply source-build steps to a binary-only bundle.
+
 ## Start here
 
 1. Confirm the working directory and inspect `git status --short` and the current branch. This is a self-contained project; do not modify a sibling checkout or introduce dependencies on one.
@@ -103,6 +107,8 @@ The resummon check requires Hyprland, hyprctl, Quickshell with QtTest, imv, grim
 Run simulated keyboard/mouse input only in the isolated compositor. Shared-desktop inspection must be read-only or scoped plugin IPC. Keep `FRACTAL_SEARCH_UI_TEST=1` confined to test processes. Never kill the desktop shell or inject global input to finish a test. If sandbox permissions block sockets/devices, report the environmental failure or use the available approval mechanism; do not weaken production code.
 
 ## Packaging and handoff
+
+- Release packaging must include AGENT-SETUP.md, bundle-specific AGENTS.md and generated third-party attribution, including covered source. Missing license inputs must fail packaging. Follow [release preparation](docs/RELEASING.md); never represent unsigned checksums as publisher signatures.
 
 - Keep exactly one plugin manifest at the repository root. Packaging rebases its panel entry point and includes the project MIT license; do not restore a second `quickshell-app/manifest.json`. Marketplace publication requires the manual-setup designation because the generic git installer does not build/configure the backend. See the root README for installation, removal and listing requirements.
 

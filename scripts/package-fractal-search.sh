@@ -54,6 +54,11 @@ fi
 jq -e '.entryPoints.panel == "quickshell-app/ui/SearchPanel.qml"' manifest.json >/dev/null || { echo 'Unexpected source panel entry point; update bundle layout explicitly.' >&2; exit 1; }
 jq '.entryPoints.panel = "ui/SearchPanel.qml"' manifest.json > "$SEARCH_OUTPUT/manifest.json"
 cp -- LICENSE quickshell-app/packaging/install.sh quickshell-app/packaging/prune-runtimes.sh quickshell-app/packaging/uninstall.sh quickshell-app/packaging/close-window.sh quickshell-app/packaging/close-binding.sh quickshell-app/packaging/README.md quickshell-app/packaging/NOTICE "$SEARCH_OUTPUT/"
+cp -- docs/AGENT-SETUP.md "$SEARCH_OUTPUT/AGENT-SETUP.md"
+cp -- quickshell-app/packaging/AGENTS.bundle.md "$SEARCH_OUTPUT/AGENTS.md"
+SEARCH_NOTICE_ARGS=("$SEARCH_OUTPUT")
+((SEARCH_CUDA)) && SEARCH_NOTICE_ARGS+=(--cuda)
+python3 scripts/generate-third-party-notices.py "${SEARCH_NOTICE_ARGS[@]}"
 cp -- vendor/lancedb/LICENSE "$SEARCH_OUTPUT/LANCEDB-LICENSE"
 for SEARCH_QML in quickshell-app/ui/*.qml quickshell-app/ui/qmldir; do
   [[ ${SEARCH_QML##*/} == shell.qml ]] && continue
@@ -62,8 +67,12 @@ done
 cp -- crates/fractal-search-core/models/embeddinggemma2.json "$SEARCH_OUTPUT/model-manifest.json"
 cp -- quickshell-app/MCP.md "$SEARCH_OUTPUT/MCP.md"
 cp -- quickshell-app/CUDA.md "$SEARCH_OUTPUT/CUDA.md"
-jq -n --arg architecture "$(uname -m)" --arg profile "$SEARCH_PROFILE" --argjson cuda "$SEARCH_CUDA" '{architecture:$architecture,profile:$profile,protocolVersion:1,cuda:($cuda == 1)}' > "$SEARCH_OUTPUT/bundle.json"
+jq -n --arg architecture "$(uname -m)" --arg profile "$SEARCH_PROFILE" --argjson cuda "$SEARCH_CUDA" --arg sourceCommit "$(git rev-parse HEAD)" --arg rustc "$(rustc --version)" --arg glibc "$(getconf GNU_LIBC_VERSION)" --argjson sourceDirty "$(if [[ -n $(git status --porcelain) ]]; then echo true; else echo false; fi)" '{architecture:$architecture,profile:$profile,protocolVersion:1,cuda:($cuda == 1),sourceCommit:$sourceCommit,sourceDirty:$sourceDirty,rustc:$rustc,buildGlibc:$glibc}' > "$SEARCH_OUTPUT/bundle.json"
 (cd -- "$SEARCH_OUTPUT"; find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
-[[ ! -x /usr/bin/omarchy ]] || omarchy plugin validate "$SEARCH_OUTPUT"
+if command -v omarchy >/dev/null; then
+  omarchy plugin validate "$SEARCH_OUTPUT"
+else
+  echo 'Omarchy manifest validation was not run: omarchy is not installed on this build host.' >&2
+fi
 echo "Bundle ready: $SEARCH_OUTPUT"
 echo "Install: $SEARCH_OUTPUT/install.sh"

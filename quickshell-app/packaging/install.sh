@@ -252,7 +252,7 @@ WantedBy=graphical-session.target
 UNIT
 if [[ ! -e $SEARCH_DEST ]]; then
   mkdir -- "$SEARCH_DEST"
-  cp -a -- "$SEARCH_BUNDLE/bin" "$SEARCH_BUNDLE/uninstall.sh" "$SEARCH_BUNDLE/README.md" "$SEARCH_BUNDLE/MCP.md" "$SEARCH_BUNDLE/CUDA.md" "$SEARCH_BUNDLE/LICENSE" "$SEARCH_BUNDLE/NOTICE" "$SEARCH_BUNDLE/LANCEDB-LICENSE" "$SEARCH_BUNDLE/bundle.json" "$SEARCH_DEST/"
+  cp -a -- "$SEARCH_BUNDLE/bin" "$SEARCH_BUNDLE/uninstall.sh" "$SEARCH_BUNDLE/README.md" "$SEARCH_BUNDLE/MCP.md" "$SEARCH_BUNDLE/CUDA.md" "$SEARCH_BUNDLE/LICENSE" "$SEARCH_BUNDLE/NOTICE" "$SEARCH_BUNDLE/LANCEDB-LICENSE" "$SEARCH_BUNDLE/third-party" "$SEARCH_BUNDLE/AGENTS.md" "$SEARCH_BUNDLE/AGENT-SETUP.md" "$SEARCH_BUNDLE/bundle.json" "$SEARCH_DEST/"
 fi
 systemd-analyze --user verify "$SEARCH_STAGE/fractal-search.service" 2> "$SEARCH_STAGE/unit-errors" || { cat "$SEARCH_STAGE/unit-errors" >&2; exit 1; }
 if ((!SEARCH_SKIP_SHELL)); then
