@@ -89,9 +89,9 @@ def main():
         entry = {k: package.get(k) for k in ['name', 'version', 'license', 'repository', 'authors']}
         if package['name'] in ('fax', 'fax_derive'):
             target = destination / 'crates' / key / 'ATTRIBUTION.txt'
-            target.write_text('Upstream declares MIT in Cargo.toml but supplies no separate license/copyright file.\n'
+            target.write_text('This pinned crate archive declares MIT in Cargo.toml but supplies no separate license/copyright file.\n'
                               + 'Declared authors: ' + ', '.join(package['authors']) + '\n'
-                              + 'The accompanying SPDX MIT text is a standard template, not an invented upstream copyright notice.\n'
+                              + 'The accompanying license is the actual upstream pdf-rs/fax MIT license, obtained from a later pinned upstream revision; see ../../upstream-provenance.json for the exact URL and hash.\n'
                               + 'Exact unmodified source and original metadata are supplied in ../../sources/.\n')
             copied.append(str(target.relative_to(bundle)))
         entry['notices'] = copied

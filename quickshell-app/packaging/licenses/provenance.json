@@ -73,5 +73,10 @@
     "path": "onnxruntime-1.24.2/patches/eigen/s390x-build-werror.patch",
     "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.24.2/cmake/patches/eigen/s390x-build-werror.patch",
     "sha256": "a1a7b0ca8382cb00542587b6bc725f59abd59ad5bb491825f7876ad6e344ef0b"
+  },
+  {
+    "path": "fax-upstream/LICENSE",
+    "url": "https://raw.githubusercontent.com/pdf-rs/fax/8f26f4f63a54fb93529ffdedd9b5a584c3ed01af/LICENSE",
+    "sha256": "7101390b4c8edd752f4c0de47f35d61b44d9cf0ee8dd032115e25644e277cfff"
   }
 ]

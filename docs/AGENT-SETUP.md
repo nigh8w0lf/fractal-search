@@ -26,6 +26,8 @@ Checksums detect damage; an unsigned checksum is not independent proof of publis
 
 ## Preflight
 
+The prebuilt release targets up-to-date x86_64 Omarchy with Omarchy Shell. Use the CPU bundle unless NVIDIA acceleration is explicitly requested. CUDA 12/cuDNN 9 are additional runtime dependencies, not guaranteed by Omarchy or its NVIDIA driver.
+
 Run inside the user's Omarchy graphical session. Check that `XDG_RUNTIME_DIR` is set, the user systemd manager is available, and `omarchy-shell shell ping` succeeds. Never restart/kill the desktop shell to fix setup. Read-only inspection is fine; use scoped plugin IPC rather than global simulated keyboard/mouse input.
 
 The installer checks required tools and native libraries and prints missing-dependency instructions. Runtime requirements include Omarchy/Quickshell, curl, jq, GLib (`gio`/`gdbus`), libheif, libjpeg-turbo, gcc-libs, ffmpeg/ffprobe, Qt Multimedia with its FFmpeg backend, and a working FileChooser portal. On Omarchy, use `omarchy pkg add` for specifically identified missing packages. System package installation is privileged: follow the user's authorization and the environment's approval mechanism. Do not perform an unrelated system upgrade or change desktop defaults.

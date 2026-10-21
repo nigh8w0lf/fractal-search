@@ -26,7 +26,7 @@ Audio/video files are limited to 2 GiB and two hours. PDF, Office documents, OCR
 
 ## Get started
 
-Fractal Search requires Omarchy Shell and its desktop/runtime dependencies. **Use the app’s bundle installer:** Omarchy’s generic git-plugin installer does not install the native backend.
+The prebuilt bundles target **up-to-date x86_64 Omarchy with Omarchy Shell**. Runtime dependencies are system packages; no custom build tools are needed. **Use the app’s bundle installer:** Omarchy’s generic git-plugin installer does not install the native backend.
 
 For a compatible prebuilt CPU or CUDA bundle, verify the downloaded archive against its release checksum, extract it, then run inside the extracted directory:
 
@@ -38,9 +38,23 @@ omarchy-shell shell toggle fractal.search
 
 Prebuilt installations need no Rust compiler or Python. Check the release’s architecture and system-library requirements. For NVIDIA acceleration, use the CUDA bundle with `./install.sh --provider cuda --device-id 0` and follow the [CUDA setup guide](quickshell-app/CUDA.md).
 
+Required system packages include FFmpeg, Qt Multimedia with its FFmpeg backend, libheif, libjpeg-turbo, GLib, curl, jq and a FileChooser portal. The installer reports missing dependencies. CUDA additionally needs separately installed **CUDA 12 and cuDNN 9** libraries; an NVIDIA driver alone is insufficient.
+
 On first launch, select **Set up model** to download and verify about **1.50 GB** of model assets, or choose an existing verified cache. Add folders under **Settings → Folders**, let indexing finish, then type a description to search.
 
 Public release downloads are not yet linked here. To build from source, follow the [development guide](docs/DEVELOPMENT.md#build-and-install-from-source). For agent-assisted installation or troubleshooting, use [AGENT-SETUP.md](docs/AGENT-SETUP.md); it is also included in release bundles.
+
+## Updates and removal
+
+Update by running the new bundle’s `install.sh`. To uninstall, run the installed runtime’s uninstaller before removing the plugin through Omarchy:
+
+```bash
+SEARCH_PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/fractal.search"
+SEARCH_INSTALLED_RUNTIME=$(cat "$SEARCH_PLUGIN_DIR/.fractal-search-install")
+"$SEARCH_INSTALLED_RUNTIME/uninstall.sh"
+```
+
+Uninstall preserves your catalog, models and runtime bundles. See the [user guide](docs/USER-GUIDE.md#removal-and-permissions) for details.
 
 ## Documentation
 

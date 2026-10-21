@@ -4,10 +4,10 @@
     "defmt-parser-1.0.0/LICENSE-APACHE"
   ],
   "fax-0.2.6": [
-    "standard/MIT.txt"
+    "fax-upstream/LICENSE"
   ],
   "fax_derive-0.2.0": [
-    "standard/MIT.txt"
+    "fax-upstream/LICENSE"
   ],
   "flatbuffers-25.12.19": [
     "flatbuffers-25.12.19/LICENSE"

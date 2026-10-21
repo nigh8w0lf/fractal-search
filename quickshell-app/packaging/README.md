@@ -1,5 +1,7 @@
 # Fractal Search for Omarchy
 
+This bundle targets up-to-date x86_64 Omarchy with Omarchy Shell. Runtime dependencies are standard system packages; CUDA 12/cuDNN 9 are additional dependencies for NVIDIA acceleration.
+
 This bundle installs the `fractal.search` panel in the existing Omarchy Shell and its native Rust backend as a systemd user service. No Rust compiler, Python environment or separate Quickshell instance is required.
 
 For agent-assisted installation or troubleshooting, give your agent `AGENT-SETUP.md`; `AGENTS.md` routes agents to it.
