@@ -105,4 +105,4 @@ Fractal Search is [MIT licensed](../LICENSE), copyright 2026 nigh8w0lf (Ashwin C
 
 ## Release readiness
 
-Target current x86_64 Omarchy with Omarchy Shell. Build tools are maintainer-only requirements; end users install standard runtime packages and the prebuilt bundle. NVIDIA acceleration additionally requires CUDA 12/cuDNN 9, which are not implied by an installed NVIDIA driver. See the [release readiness report](RELEASE-READINESS.md) for the tested scope and remaining publication actions, and the [submission draft](MARKETPLACE-SUBMISSION.md) for listing text. Neither document authorizes publication.
+Target current x86_64 Omarchy with Omarchy Shell. Build tools are maintainer-only requirements; end users install standard runtime packages and the prebuilt bundle. NVIDIA acceleration additionally requires CUDA 12/cuDNN 9, which are not implied by an installed NVIDIA driver. See the [release readiness report](RELEASE-READINESS.md) for the tested scope and remaining publication actions, and the [marketplace submission](MARKETPLACE-SUBMISSION.md) for listing text and review status. Neither document authorizes publication.

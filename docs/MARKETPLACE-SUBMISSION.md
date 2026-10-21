@@ -1,11 +1,21 @@
-# Marketplace submission draft
+# Marketplace submission
 
-Not submitted. Repository and release publication are authorized separately;
-this draft does not authorize a marketplace submission.
-The intended title is **[Plugin]: Fractal Search**. After publishing the reviewed
-source and release assets, copy the six sections below into the official issue
-form. The unchecked statements must be verified and confirmed by the owner before
-submission; all statements remain unchecked until that review.
+Submitted with the owner’s approval on 2026-10-22:
+[Fractal Search — issue #12503](https://github.com/omacom/omarchy-plugin-marketplace/issues/12503).
+Initial repository/manifest/Quattro validation passed. The automated security
+baseline reported no findings; installer, service-management and package-manager
+capabilities require maintainer review. Listing approval remains pending.
+
+The root `preview.png` is a real app capture using owner-approved demo images,
+a temporary catalog and a private compositor. The sample originals are not
+included. This is the single intentional exception to the repository’s media
+exclusion. The screenshot shows real semantic results for “snow-covered mountains”.
+
+After pushing preview/documentation changes, refresh the existing issue with the
+new full source commit to rerun exact-commit validation. The published v0.1.0
+binaries and source archive remain unchanged. Keep the manual-setup request below.
+
+## Listing details
 
 ### Repository URL
 
@@ -49,8 +59,8 @@ source. Models and NVIDIA/system libraries are not redistributed in the archives
 
 ### Submission checklist
 
-- [ ] The repository is public and contains installation and removal instructions.
-- [ ] I have documented the plugin license and any external dependencies.
-- [ ] I confirm that I own or have permission to submit this plugin and its preview assets.
-- [ ] The plugin does not overwrite user configuration without explicit consent.
-- [ ] I understand that approval is for listing and is not a security review.
+- [x] The repository is public and contains installation and removal instructions.
+- [x] I have documented the plugin license and any external dependencies.
+- [x] I confirm that I own or have permission to submit this plugin and its preview assets.
+- [x] The plugin does not overwrite user configuration without explicit consent.
+- [x] I understand that approval is for listing and is not a security review.

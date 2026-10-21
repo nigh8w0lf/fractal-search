@@ -4,8 +4,9 @@ Target: Fractal Search 0.1.0 for current **x86_64 Omarchy with Omarchy Shell**.
 The owner authorized public repository visibility and the CPU/CUDA release on
 2026-10-22. [Release v0.1.0](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.0)
 provides both bundles, matching source, checksums and validation/platform reports.
-Generated release output is excluded from Git. Marketplace submission is separate
-and has not been authorized or performed.
+Generated release output is excluded from Git. The owner subsequently authorized
+[marketplace submission #12503](https://github.com/omacom/omarchy-plugin-marketplace/issues/12503).
+Initial validation passed; maintainer review and listing approval remain pending.
 
 ## Compatibility
 
@@ -77,7 +78,9 @@ Other dependency notices and covered source remain included in each bundle.
 After local history cleanup, a known-token/private-key pattern scan of all 590 reachable Git blobs found no
 matches and no personal library paths under Downloads/Documents/Pictures/Videos.
 This limited scan is not proof that no secret exists. Current source excludes
-media, weights, runtime data and generated binaries.
+media originals, weights, runtime data and generated binaries. The owner approved
+one root `preview.png` marketplace screenshot using sample content; it is the
+only intentional binary-media exception.
 
 The two historical generated UI mockups and synthetic JPEG fixture were removed
 from all local commit histories with git-filter-repo. The current source tree
@@ -100,11 +103,11 @@ are unsigned; checksums provide integrity rather than independent publisher iden
 
 Remaining marketplace work:
 
-1. Recheck plugin ID availability and the current submission requirements.
-2. Confirm the ownership/submission checklist and authorize submission of the
-   prepared [listing draft](MARKETPLACE-SUBMISSION.md).
-3. Request manual setup and resolve the marketplace's exact-commit review before
-   obtaining maintainer approval.
+1. Refresh the existing submission against the preview/documentation commit;
+   preserve the published v0.1.0 release artifacts and source snapshot.
+2. Obtain maintainer review of the expected installer/service/package-manager
+   capabilities (the initial automated baseline reported no findings).
+3. Have the maintainer apply `manual-setup` before exact-commit approval and listing.
 
 The [release workflow](RELEASING.md) describes packaging and distribution;
 [official submission requirements](https://github.com/omacom/omarchy-plugin-marketplace/blob/main/SUBMISSION.md)
