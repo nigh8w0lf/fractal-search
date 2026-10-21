@@ -1,6 +1,6 @@
 # Fractal Search contributor guidance
 
-Read [README.md](README.md) first. These two root documents provide the current product and engineering orientation. Before editing `quickshell-app/`, also read its [scoped instructions](quickshell-app/AGENTS.md); consult specialized docs only for the area being changed. Keep changes focused and preserve unrelated work.
+Read [README.md](README.md) first. The README introduces the product; the [development guide](docs/DEVELOPMENT.md) covers builds, architecture and source ownership. Before editing `quickshell-app/`, also read its [scoped instructions](quickshell-app/AGENTS.md); consult specialized docs only for the area being changed. Keep changes focused and preserve unrelated work.
 
 **No silent fallbacks.** Invalid configuration, missing dependencies, inference failures and incompatible data must produce actionable errors. Never silently substitute providers, decoders, models or path-derived identities.
 
@@ -11,7 +11,7 @@ For end-user installation, updates or troubleshooting, read [the agent setup gui
 ## Start here
 
 1. Confirm the working directory and inspect `git status --short` and the current branch. This is a self-contained project; do not modify a sibling checkout or introduce dependencies on one.
-2. Read the source relevant to the task using the README source map. Current source is authoritative; dated validation sections in deeper docs describe past checks, not guarantees for today's checkout.
+2. Read the source relevant to the task using the [development source map](docs/DEVELOPMENT.md#architecture-and-source-map). Current source is authoritative; dated validation sections in deeper docs describe past checks, not guarantees for today's checkout.
 3. Distinguish source, installed plugin and live data. Editing source does not update the running UI. Tests must use temporary data, never the user's library.
 4. Implement and run the narrowest meaningful checks. For a UI change, verify rendering and actual interactions, including a narrow window and error/loading states. Package/install when the task calls for updating the running app.
 5. Review the diff, report what changed and what was tested, and identify environmental limitations. Do not claim unrun checks.
@@ -110,7 +110,7 @@ Run simulated keyboard/mouse input only in the isolated compositor. Shared-deskt
 
 - Release packaging must include AGENT-SETUP.md, bundle-specific AGENTS.md and generated third-party attribution, including covered source. Missing license inputs must fail packaging. Follow [release preparation](docs/RELEASING.md); never represent unsigned checksums as publisher signatures.
 
-- Keep exactly one plugin manifest at the repository root. Packaging rebases its panel entry point and includes the project MIT license; do not restore a second `quickshell-app/manifest.json`. Marketplace publication requires the manual-setup designation because the generic git installer does not build/configure the backend. See the root README for installation, removal and listing requirements.
+- Keep exactly one plugin manifest at the repository root. Packaging rebases its panel entry point and includes the project MIT license; do not restore a second `quickshell-app/manifest.json`. Marketplace publication requires the manual-setup designation because the generic git installer does not build/configure the backend. See the [user guide](docs/USER-GUIDE.md) for installation/removal and [release preparation](docs/RELEASING.md#marketplace-publication) for listing requirements.
 
 - Use `scripts/package-fractal-search.sh` and the bundle's `install.sh`, or `./start-quickshell-search.sh --dev` to build/install/summon. For CUDA updates include `--cuda` and preserve the selected provider/library path. `--no-build --summon` only opens an existing installation when no install options are supplied.
 - Successful installs prune obsolete runtime bundles, retaining the current/previous builds and runtimes in use; keep pruning after the rollback boundary and test with temporary directories.

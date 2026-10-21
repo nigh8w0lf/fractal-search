@@ -92,3 +92,11 @@ artifacts and obtaining authorization; do not silently create a public release,
 upload private source, tag, or submit a marketplace issue as part of packaging.
 Updates use the new bundle installer, preserving data/provider/settings and
 pruning only obsolete managed runtimes. Uninstall uses the installed uninstaller.
+
+## Marketplace publication
+
+The repository has one root [manifest](../manifest.json). Packaging rebases its panel path for the bundle; installation generates the selected runtime paths. Request the marketplace's **manual-setup** designation before approval so the listing directs users to these instructions instead of offering the generic install command. Suggested category: **Productivity**; tags: **ai**, **launcher**, **media**. The preview is optional; media remains excluded from this repository.
+
+Follow the [current publishing guide](https://plugins.omarchy.org/publish.html) and [submission requirements](https://github.com/omacom/omarchy-plugin-marketplace/blob/main/SUBMISSION.md). The installer and user-service management require maintainer review under the [automated security baseline](https://github.com/omacom/omarchy-plugin-marketplace/blob/main/SECURITY.md#automated-security-baseline). Local validation is not marketplace approval: submit a committed, tested snapshot and request `manual-setup` before the maintainer applies `approved-and-verified`. Do not claim standard one-click installation support.
+
+Fractal Search is [MIT licensed](../LICENSE), copyright 2026 nigh8w0lf (Ashwin Cheekati). Vendored LanceDB retains its [Apache-2.0 license](../vendor/lancedb/LICENSE) and [patch provenance](../vendor/lancedb/PATCHES.md). Dependencies and downloaded models retain their own licenses. Each bundle includes [NOTICE](../quickshell-app/packaging/NOTICE), full third-party license/notice texts, an exact resolved dependency inventory, ONNX Runtime/Rust runtime attribution and covered MPL source. See [release preparation](RELEASING.md) for provenance, platform limits and validation.
