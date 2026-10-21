@@ -72,20 +72,25 @@ retaining the older exact source and original author/license metadata. The
 attribution explicitly identifies the later origin of the license file.
 Other dependency notices and covered source remain included in each bundle.
 
-A known-token/private-key pattern scan of all 582 reachable Git blobs found no
+After local history cleanup, a known-token/private-key pattern scan of all 590 reachable Git blobs found no
 matches and no personal library paths under Downloads/Documents/Pictures/Videos.
 This limited scan is not proof that no secret exists. Current source excludes
 media, weights, runtime data and generated binaries.
 
-Three binary media paths remain in historical commits: two generated UI mockups
-and a synthetic JPEG regression fixture (now stored as hexadecimal text). They
-are not in the current tree or release source snapshot. Removing them from Git
-history would require a separately approved history rewrite and coordinated
-force-push; no history was rewritten during preparation.
+The two historical generated UI mockups and synthetic JPEG fixture were removed
+from all local commit histories with git-filter-repo. The current source tree
+was unchanged, and the post-rewrite reachable-object scan found no binary media.
+A private recovery bundle and commit map are stored outside this repository.
+
+GitHub history is still unchanged: automatic approval review rejected the
+six-branch force-push pending explicit owner approval. Synchronize the remote
+with expected-tip force-with-lease checks before exposing repository history.
+Existing clones must then be refreshed to avoid reintroducing the removed blobs.
 
 ## Deliberately remaining before publication
 
-1. Decide whether to remove those historical media blobs before exposing history.
+1. Explicitly authorize the six-branch private GitHub force-push to synchronize
+   the cleaned local history, then verify the remote branches.
 2. Authorize public visibility and release publication, then create the release
    tag and upload the reviewed CPU/CUDA/source archives, checksums and notes.
 3. Replace the README's unavailable-download note with the actual release link.
