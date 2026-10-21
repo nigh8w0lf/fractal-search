@@ -79,7 +79,7 @@ After local history cleanup, a known-token/private-key pattern scan of all 590 r
 matches and no personal library paths under Downloads/Documents/Pictures/Videos.
 This limited scan is not proof that no secret exists. Current source excludes
 media originals, weights, runtime data and generated binaries. The owner approved
-the root `preview.png` marketplace screenshot and `docs/previews/berries.png`
+the root `preview.png` marketplace screenshot and `docs/previews/insurance.png`
 README screenshot using sample content; these are the only intentional binary-media
 exceptions.
 

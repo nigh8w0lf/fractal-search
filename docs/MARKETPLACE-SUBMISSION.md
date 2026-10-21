@@ -6,12 +6,14 @@ Initial repository/manifest/Quattro validation passed. The automated security
 baseline reported no findings; installer, service-management and package-manager
 capabilities require maintainer review. Listing approval remains pending.
 
-The root `preview.png` shows real semantic results for “snow-covered mountains”.
-A second screenshot, `docs/previews/berries.png`, shows “fresh berries in warm
-sunlight” in the README. Both are native app captures using owner-approved demo
-images, a temporary catalog and a private compositor. The sample originals are
-not included. These two screenshots are the only intentional exceptions to the
-repository’s media exclusion; the marketplace uses the single root preview.
+The root `preview.png` shows the driving-license search from the “Ready to go”
+demo video (7.7 seconds). `docs/previews/insurance.png` shows the insurance search
+(13.7 seconds) in the README. Both are unaltered 1920×1080 frames from the rendered
+video, combining concise story text with actual native app footage. The footage
+uses owner-approved fictional sample documents, a temporary catalog and a private
+compositor. Sample originals and video binaries are not included in Git. These
+two screenshots replace the earlier mountain/berry images and remain the only
+intentional media exceptions; the marketplace uses the single root preview.
 
 After pushing preview/documentation changes, refresh the existing issue with the
 new full source commit to rerun exact-commit validation. The published v0.1.0
