@@ -33,7 +33,7 @@ venv/
 *.safetensors
 
 # Image and video assets stay local. Synthetic test fixtures use text.
-# The single root marketplace screenshot is explicitly allowed below.
+# Approved marketplace/README screenshots are explicitly allowed below.
 *.[pP][nN][gG]
 *.[jJ][pP][gG]
 *.[jJ][pP][eE][gG]
@@ -93,5 +93,6 @@ venv/
 *.[aA][iI][fF][fF]
 *.[wW][mM][aA]
 
-# Approved public marketplace screenshot; demo originals remain excluded.
+# Approved public screenshots; demo originals remain excluded.
 !/preview.png
+!/docs/previews/berries.png

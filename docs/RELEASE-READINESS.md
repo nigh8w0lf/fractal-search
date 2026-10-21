@@ -79,8 +79,9 @@ After local history cleanup, a known-token/private-key pattern scan of all 590 r
 matches and no personal library paths under Downloads/Documents/Pictures/Videos.
 This limited scan is not proof that no secret exists. Current source excludes
 media originals, weights, runtime data and generated binaries. The owner approved
-one root `preview.png` marketplace screenshot using sample content; it is the
-only intentional binary-media exception.
+the root `preview.png` marketplace screenshot and `docs/previews/berries.png`
+README screenshot using sample content; these are the only intentional binary-media
+exceptions.
 
 The two historical generated UI mockups and synthetic JPEG fixture were removed
 from all local commit histories with git-filter-repo. The current source tree

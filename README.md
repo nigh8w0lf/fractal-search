@@ -4,7 +4,9 @@ Local semantic search for images, text, audio and video on Omarchy Shell.
 
 Add your folders, search in natural language, and open a match in its default app. Your files stay where they are; indexing and search run on your machine.
 
-![Fractal Search finding snow-covered mountains in a sample image library](preview.png)
+![Search for “snow-covered mountains” in a sample image library](preview.png)
+
+![Search for “fresh berries in warm sunlight” in the same sample library](docs/previews/berries.png)
 
 ## Features
 

@@ -6,10 +6,12 @@ Initial repository/manifest/Quattro validation passed. The automated security
 baseline reported no findings; installer, service-management and package-manager
 capabilities require maintainer review. Listing approval remains pending.
 
-The root `preview.png` is a real app capture using owner-approved demo images,
-a temporary catalog and a private compositor. The sample originals are not
-included. This is the single intentional exception to the repository’s media
-exclusion. The screenshot shows real semantic results for “snow-covered mountains”.
+The root `preview.png` shows real semantic results for “snow-covered mountains”.
+A second screenshot, `docs/previews/berries.png`, shows “fresh berries in warm
+sunlight” in the README. Both are native app captures using owner-approved demo
+images, a temporary catalog and a private compositor. The sample originals are
+not included. These two screenshots are the only intentional exceptions to the
+repository’s media exclusion; the marketplace uses the single root preview.
 
 After pushing preview/documentation changes, refresh the existing issue with the
 new full source commit to rerun exact-commit validation. The published v0.1.0
