@@ -11,6 +11,6 @@
   ],
   "keepLoaded": true,
   "entryPoints": {
-    "panel": "quickshell-app/ui/SearchPanel.qml"
+    "panel": "quickshell-app/ui/SetupPanel.qml"
   }
 }

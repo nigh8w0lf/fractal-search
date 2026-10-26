@@ -51,7 +51,7 @@ if ((SEARCH_CUDA)); then
 fi
 # Keep one source manifest at the repository root for marketplace discovery.
 # Bundles flatten quickshell-app/, so rebase only the panel entry point.
-jq -e '.entryPoints.panel == "quickshell-app/ui/SearchPanel.qml"' manifest.json >/dev/null || { echo 'Unexpected source panel entry point; update bundle layout explicitly.' >&2; exit 1; }
+jq -e '.entryPoints.panel == "quickshell-app/ui/SetupPanel.qml"' manifest.json >/dev/null || { echo 'Unexpected source panel entry point; update bundle layout explicitly.' >&2; exit 1; }
 jq '.entryPoints.panel = "ui/SearchPanel.qml"' manifest.json > "$SEARCH_OUTPUT/manifest.json"
 cp -- LICENSE quickshell-app/packaging/install.sh quickshell-app/packaging/prune-runtimes.sh quickshell-app/packaging/uninstall.sh quickshell-app/packaging/close-window.sh quickshell-app/packaging/close-binding.sh quickshell-app/packaging/README.md quickshell-app/packaging/NOTICE "$SEARCH_OUTPUT/"
 cp -- docs/AGENT-SETUP.md "$SEARCH_OUTPUT/AGENT-SETUP.md"

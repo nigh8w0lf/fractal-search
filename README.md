@@ -30,21 +30,45 @@ Audio/video files are limited to 2 GiB and two hours. PDF, Office documents, OCR
 
 ## Get started
 
-The prebuilt bundles target **up-to-date x86_64 Omarchy with Omarchy Shell**. Runtime dependencies are system packages; no custom build tools are needed. **Use the app’s bundle installer:** Omarchy’s generic git-plugin installer does not install the native backend.
-
-Download **[v0.1.1](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.1)**:
-
-| Linux x86_64 | Download |
-| --- | --- |
-| CPU | [CPU bundle](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/fractal-search-0.1.1-linux-x86_64-cpu.tar.gz) |
-| NVIDIA CUDA | [CUDA bundle](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/fractal-search-0.1.1-linux-x86_64-cuda.tar.gz) |
-| Verification | [SHA256SUMS](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/SHA256SUMS) |
-
-Verify the downloaded archive against its release checksum, extract it, then run inside the extracted directory:
+On **up-to-date x86_64 Omarchy with Omarchy Shell**, add and enable the plugin:
 
 ```bash
-sha256sum --check SHA256SUMS
-./install.sh
+omarchy plugin add https://github.com/nigh8w0lf/fractal-search.git --enable
+omarchy-shell shell toggle fractal.search
+```
+
+The first-run screen offers **Install CPU** or **Install NVIDIA CUDA**. It downloads
+and verifies the pinned release, installs the backend and user service, and reports
+missing dependencies. Installation continues if you close the panel. CUDA requires
+separately installed CUDA 12/cuDNN 9; enter their library folder if installed
+privately. CPU needs no NVIDIA libraries.
+
+After installation, open Fractal Search again and select **Set up model** (about
+1.50 GB), then add folders under Settings → Folders. No compiler or Python is needed.
+The initial git checkout is retained as a recovery copy under
+`${XDG_STATE_HOME:-~/.local/state}/fractal-search/setup/`; the installed app uses the
+release bundle. Update it with a newer release bundle's installer, not `omarchy plugin update`.
+
+### Install a release directly
+
+Download [v0.1.1](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.1):
+[CPU](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/fractal-search-0.1.1-linux-x86_64-cpu.tar.gz),
+[CUDA](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/fractal-search-0.1.1-linux-x86_64-cuda.tar.gz),
+[checksums](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/SHA256SUMS).
+
+Or run this complete download, verification and installation sequence:
+
+```bash
+SEARCH_VARIANT=cpu # Use cuda for NVIDIA acceleration with CUDA 12/cuDNN 9 installed.
+SEARCH_DOWNLOAD_DIR=$(mktemp -d)
+cd "$SEARCH_DOWNLOAD_DIR"
+SEARCH_RELEASE=https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1
+curl --fail --location --remote-name "$SEARCH_RELEASE/fractal-search-0.1.1-linux-x86_64-$SEARCH_VARIANT.tar.gz"
+curl --fail --location --remote-name "$SEARCH_RELEASE/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS &&
+tar -xzf "fractal-search-0.1.1-linux-x86_64-$SEARCH_VARIANT.tar.gz" &&
+cd "fractal-search-0.1.1-linux-x86_64-$SEARCH_VARIANT" &&
+./install.sh --provider "$SEARCH_VARIANT"
 omarchy-shell shell toggle fractal.search
 ```
 

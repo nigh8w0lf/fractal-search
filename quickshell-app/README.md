@@ -4,6 +4,10 @@ An Omarchy Shell plugin with a Quickshell search panel and a bundled native Rust
 
 `crates/fractal-search-core/` implements native decoding, bounded multimodal preprocessing, the pinned 8,192-token tokenizer contract and the LanceDB segment catalog. The workspace contains independent packages for the plugin backend, native folder chooser and read-only MCP server; packaging builds all three together. Targeted `cargo build -p fractal-folder-picker --locked` builds omit the inference/catalog and MCP stacks. Build the daemon with `-p fractal-search` and the MCP server with `-p fractal-search-mcp`; enable `--features cuda` for each of those packages when needed.
 
+## First-run installation
+
+The root manifest points a fresh git clone to `ui/SetupPanel.qml`. Its CPU/CUDA actions invoke `packaging/first-run.sh`, which runs a detached user-service job to download a pinned release and hand off to the bundle installer. The clone must be unmodified and originate from the official HTTPS repository. It is retained outside the watched plugin tree for recovery. The bundled manifest still points directly to `ui/SearchPanel.qml`; bootstrap changes do not change native inference. See the [root install steps](../README.md#get-started) and [bootstrap validation](../docs/DEVELOPMENT.md#first-run-bootstrap-validation).
+
 ## Search and settings
 
 Type a description to search. Results use a compact list and a larger selected-result preview; **Open file** opens the whole original in its default app and **Show in folder** selects it in your file manager. Both actions remain available in the list-only layout and narrow windows. Arrow keys select results, Enter opens the selected file, Ctrl+Enter reveals it, and Escape goes back. There is no Browse all photos button.

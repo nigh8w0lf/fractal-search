@@ -6,7 +6,11 @@ Installation, everyday use, supported files and troubleshooting.
 
 ## Install and update
 
-**Manual setup is required.** End users should use a compatible prebuilt bundle's `install.sh`; no Rust compiler or Python environment is required. Omarchy's generic `omarchy plugin add` command only clones the repository; it does not build the native binaries, create the user service or generate runtime paths. Do not enable a raw clone as a working installation.
+The git-installed plugin opens a first-run setup panel. Run `omarchy plugin add https://github.com/nigh8w0lf/fractal-search.git --enable`, then `omarchy-shell shell toggle fractal.search`. Choose CPU or NVIDIA CUDA to download a checksum-pinned prebuilt backend and install its user service. No compiler or Python is needed. Close/reopen is safe while the detached setup job runs. Errors remain visible; fix missing system dependencies and retry. CUDA requires separately installed CUDA 12/cuDNN 9 libraries; enter the optional CUDA library folder when using a private installation.
+
+Setup retains the original clean git checkout under `${XDG_STATE_HOME:-~/.local/state}/fractal-search/setup/source-backup-*`. It refuses to replace an unexpected repository or a checkout with local changes. A failed release install restores the initial checkout when its path is free; an incomplete rollback retains the backup and reports its path. The log is `setup/install.log` in that same state directory. After backend installation, open the app and select **Set up model**, then add your folders.
+
+For direct installation or updates, use the [complete download commands in the README](../README.md#install-a-release-directly). Generic git-plugin updates are not supported after the handoff to the managed release installation.
 
 Use a compatible [CPU or CUDA release bundle](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.1) and its checksums. For source builds, see the [development guide](DEVELOPMENT.md). Check the release's architecture/system-library requirements and archive checksum, extract it, then run from the extracted directory:
 

@@ -52,7 +52,7 @@ For a new explicitly requested NVIDIA installation:
 
 For updates, retain the existing provider by omitting provider flags and using a compatible bundle. The installer drains the backend, preserves existing data/configuration and previous service activity, and prunes obsolete runtime bundles after success. It does not enable login startup. Never delete an unmanaged plugin directory to bypass the installer's refusal; inspect ownership and resolve it with the user. A CPU bundle must not replace a CUDA setup unless the user explicitly chooses CPU.
 
-Do not use generic `omarchy plugin add/update` to install this native application. The marketplace listing requires manual setup. Do not use `--skip-shell` on an end-user installation. `--bind-close` changes Super+W routing and requires user authorization; a normal install preserves personal bindings.
+A new `omarchy plugin add` installation opens the first-run panel, which downloads a pinned release and hands off to its installer. This is an explicit user action, not an install hook. For agent-assisted setup prefer the verified bundle workflow above. After handoff, use release installers for updates rather than `omarchy plugin update`. The marketplace manual-setup designation remains until maintainers review the new bootstrap. Do not use `--skip-shell` on an end-user installation. `--bind-close` changes Super+W routing and requires user authorization; a normal install preserves personal bindings.
 
 ## First use
 

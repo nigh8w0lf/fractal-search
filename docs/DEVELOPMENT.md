@@ -55,6 +55,24 @@ scripts/package-fractal-search.sh --dev --no-build --cuda --output /absolute/new
 
 Output directories must not already exist. `--no-build` packages all three existing binaries and checks their CPU/CUDA capability; it does not rebuild them. Install with the bundle's `install.sh`. UI and backend must be installed together. Updates drain the backend before swapping files; preserve its previous active state when using the installer directly. The repository launcher summons it afterwards.
 
+## Test first-run setup from local code
+
+Commit the setup changes locally, then remove any existing managed installation
+using its runtime's `uninstall.sh` (see the user guide). Catalogs and models remain.
+Install the committed source without publishing it:
+
+```bash
+omarchy plugin add /absolute/path/to/fractal-search --enable
+omarchy-shell shell toggle fractal.search
+```
+
+The bootstrap accepts an absolute local Git checkout whose origin is the official
+HTTPS repository and whose HEAD matches the installed clone. Uncommitted changes
+are not cloned; a dirty installed clone or changed source HEAD is rejected.
+This tests first-run installation of the pinned release binaries, not a build of
+local Rust/UI changes. For privately installed CUDA libraries, enter the absolute
+library folder in the setup panel (equivalent to the bundle installer's `--cuda-lib-dir` option).
+
 ## Architecture and source map
 
 ```text
@@ -71,6 +89,7 @@ The desktop socket is trusted same-user access: it may index folders and open or
 
 | Source | Responsibility |
 | --- | --- |
+| `quickshell-app/ui/SetupPanel.qml`, `quickshell-app/packaging/first-run.sh` | Source-clone first-run screen and detached, pinned release bootstrap. Bundles rebase their entry to SearchPanel and do not run the bootstrap. |
 | `quickshell-app/ui/SearchPanel.qml` | Panel geometry, focus, search/results, shortcuts and plugin lifecycle. |
 | `quickshell-app/ui/Controller.qml` | Socket protocol, application state, search/index operations and previews. |
 | `quickshell-app/ui/SettingsPage.qml` | Folders, Preferences and Performance tabs. |
@@ -116,3 +135,9 @@ Image, audio and video files are excluded from Git. Keep screen captures, design
 Use the task-specific commands in [AGENTS.md](../AGENTS.md#validation-commands). Tests use temporary catalogs and synthetic media; keyboard/mouse automation runs only in an isolated compositor. A source edit does not update the installed app: package and install UI and backend together.
 
 See the [documentation index](README.md) for inference, retrieval and dated validation reports. Historical results do not validate the current checkout. For distributable CPU/CUDA builds, attribution and publication, follow [release preparation](RELEASING.md).
+
+## First-run bootstrap validation
+
+`python3 quickshell-app/tests/smoke_first_run.py` exercises synthetic release archives, checksum rejection, repository/local-change refusal, installer rollback and interrupted-job reporting. `python3 quickshell-app/tests/smoke_setup_ui.py --native` checks the setup panel in a private compositor with a fixture installer. These do not install into the live desktop. The bootstrap pins v0.1.1 archive hashes; updating that pin requires independently verifying both published assets. Its worker runs as a transient user unit outside the replaced plugin directory. The installer retains a source recovery copy and preserves the existing data/model directories.
+
+These checks use a fixture installer/user-unit launcher and a private native UI; they do not establish that a complete live Omarchy multi-plugin reload is crash-free. The previously observed shell reload crash remains an independent release-readiness concern. Marketplace re-review is required before removing the manual-setup designation.
