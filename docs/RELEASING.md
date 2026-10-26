@@ -2,8 +2,9 @@
 
 Fractal Search is a native Linux/Omarchy application. Prepare separate CPU and
 CUDA archives; end users run the included installer and need no Rust/Python.
-Publishing a marketplace listing does not build these binaries. Request the
-marketplace's manual-setup designation and link the actual release downloads.
+Publishing a marketplace listing does not build these binaries. The source-clone
+setup panel downloads pinned published bundles; keep release downloads documented
+and retain manual-setup until the marketplace approves standard installation.
 
 ## Build and package
 
@@ -97,9 +98,18 @@ pruning only obsolete managed runtimes. Uninstall uses the installed uninstaller
 
 ## Marketplace publication
 
-The repository has one root [manifest](../manifest.json). Packaging rebases its panel path for the bundle; installation generates the selected runtime paths. Request the marketplace's **manual-setup** designation before approval so the listing directs users to these instructions instead of offering the generic install command. Suggested category: **Productivity**; tags: **ai**, **launcher**, **media**. The preview is optional; media remains excluded from this repository.
+The repository has one root [manifest](../manifest.json). Packaging rebases its panel path for the bundle; installation generates the selected runtime paths. Request the marketplace's **manual-setup** designation before approval so the listing directs users to these instructions instead of offering the generic install command. Suggested category: **Productivity**; tags: **ai**, **launcher**, **media**. The preview is optional; the two approved demo frames are the only binary-media exceptions.
 
 Follow the [current publishing guide](https://plugins.omarchy.org/publish.html) and [submission requirements](https://github.com/omacom/omarchy-plugin-marketplace/blob/main/SUBMISSION.md). The installer and user-service management require maintainer review under the [automated security baseline](https://github.com/omacom/omarchy-plugin-marketplace/blob/main/SECURITY.md#automated-security-baseline). Local validation is not marketplace approval: submit a committed, tested snapshot and request `manual-setup` before the maintainer applies `approved-and-verified`. Do not claim standard one-click installation support.
+
+For an already listed plugin, use the verification form's **Verify and publish a
+newer upstream commit** action with the exact pushed HEAD. First-run bootstrap
+changes can continue using unchanged pinned release bundles; do not overwrite
+published assets. Request fresh review for the new source. The current separate
+standard-installation action requires a passing baseline or an installer-only
+review; additional service-management capabilities require maintainer guidance.
+Do not assume snapshot approval removes `manual-setup`. See the marketplace's
+[installation boundary](https://github.com/omacom/omarchy-plugin-marketplace/blob/main/VERIFICATION.md#installation-boundary).
 
 Fractal Search is [MIT licensed](../LICENSE), copyright 2026 nigh8w0lf (Ashwin Cheekati). Vendored LanceDB retains its [Apache-2.0 license](../vendor/lancedb/LICENSE) and [patch provenance](../vendor/lancedb/PATCHES.md). Dependencies and downloaded models retain their own licenses. Each bundle includes [NOTICE](../quickshell-app/packaging/NOTICE), full third-party license/notice texts, an exact resolved dependency inventory, ONNX Runtime/Rust runtime attribution and covered MPL source. See [release preparation](RELEASING.md) for provenance, platform limits and validation.
 

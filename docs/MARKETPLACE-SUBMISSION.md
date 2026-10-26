@@ -4,7 +4,7 @@ Submitted with the owner’s approval on 2026-10-22:
 [Fractal Search — issue #12503](https://github.com/omacom/omarchy-plugin-marketplace/issues/12503).
 Initial repository/manifest/Quattro validation passed. The automated security
 baseline reported no findings; installer, service-management and package-manager
-capabilities require maintainer review. Listing approval remains pending.
+capabilities require maintainer review. The v0.1.1 snapshot was approved and listed with `manual-setup` on 2026-10-25.
 
 The root `preview.png` shows the driving-license search from the “Ready to go”
 demo video (7.7 seconds). `docs/previews/insurance.png` shows the insurance search
@@ -15,9 +15,22 @@ compositor. Sample originals and video binaries are not included in Git. These
 two screenshots replace the earlier mountain/berry images and remain the only
 intentional media exceptions; the marketplace uses the single root preview.
 
-After pushing preview/documentation changes, refresh the existing issue with the
-new full source commit to rerun exact-commit validation. The published v0.1.0
-binaries and source archive remain unchanged. Keep the manual-setup request below.
+## First-run update request — 2026-10-27
+
+Submit the new source through the marketplace verification form, selecting
+**Verify and publish a newer upstream commit**, with the exact pushed HEAD.
+The root entry now opens setup, downloads a checksum-pinned v0.1.1 CPU/CUDA bundle
+on user action, then hands off to the existing installer. Model setup remains in
+the installed app. No release assets are replaced. See the current validation
+scope in [release readiness](RELEASE-READINESS.md#first-run-update--2026-10-27).
+
+Request fresh review of installer/service-management capabilities and guidance on
+removing `manual-setup`. Current standard-installation policy accepts only a passing
+baseline or an installer-only review, so our additional service-management
+capability is a policy constraint even though the UI now handles installation.
+Keep the override until maintainers explicitly approve a supported path.
+
+The listing details below record the original manual-install submission.
 
 ## Listing details
 

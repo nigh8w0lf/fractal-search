@@ -1,4 +1,4 @@
-# Release readiness — 2026-10-22
+# Release readiness — 2026-10-27
 
 Target: Fractal Search 0.1.1 for current **x86_64 Omarchy with Omarchy Shell**.
 The owner authorized public repository visibility and the CPU/CUDA release on
@@ -6,7 +6,7 @@ The owner authorized public repository visibility and the CPU/CUDA release on
 provides both bundles, matching source, checksums and validation/platform reports.
 Generated release output is excluded from Git. The owner subsequently authorized
 [marketplace submission #12503](https://github.com/omacom/omarchy-plugin-marketplace/issues/12503).
-Initial validation passed; maintainer review and listing approval remain pending.
+The v0.1.1 snapshot was approved and published with `manual-setup` on 2026-10-25.
 
 ## v0.1.1 update
 
@@ -117,13 +117,36 @@ same tested executables and complete third-party notices. Archive contents,
 permissions, provenance and checksums are verified before upload. These archives
 are unsigned; checksums provide integrity rather than independent publisher identity.
 
+## First-run update — 2026-10-27
+
+The source-clone setup panel now downloads checksum-pinned v0.1.1 CPU/CUDA
+bundles through an explicit user action. It supports private CUDA library paths,
+reports errors and preserves a recovery checkout. The published release binaries,
+model contract and catalog schema are unchanged; no new binary release is needed
+for this bootstrap update.
+
+Validation: synthetic bootstrap checks passed success, private CUDA path forwarding,
+invalid path, local origin/HEAD checks, dirty/unexpected checkout rejection,
+checksum failure, installer rollback, interrupted worker and detached launch.
+The private native UI check passed normal/narrow layouts, error/retry, progress and
+close/reopen. QML lint retained the known PanelWindow metadata warning; native
+rendering passed. The owner confirmed the local first-run installation and model
+setup flow works after the managed app and model cache were removed. This is not
+a fresh-machine CPU installation test; existing catalog/preferences were retained.
+
 Remaining marketplace work:
 
-1. Refresh the existing submission against the preview/documentation commit;
-   preserve the published v0.1.0 release artifacts and source snapshot.
-2. Obtain maintainer review of the expected installer/service/package-manager
-   capabilities (the initial automated baseline reported no findings).
-3. Have the maintainer apply `manual-setup` before exact-commit approval and listing.
+1. Push the reviewed source and request **Verify and publish a newer upstream
+   commit**, identifying the exact HEAD in the verification issue form.
+2. Obtain fresh baseline/capability review. Prior approval covers only `ae2e1df`.
+3. Request guidance on standard-installation eligibility. The current guarded
+   removal of `manual-setup` requires a passing baseline or installer-only review;
+   our service-management capability does not meet that restriction. Do not hide
+   capabilities or claim that publishing this update automatically restores the
+   marketplace install command. Keep the current override until maintainers act.
+
+The previous shared-shell reload crash remains a known upstream/integration risk;
+successful local setup does not prove reload is crash-free across all installations.
 
 The [release workflow](RELEASING.md) describes packaging and distribution;
 [official submission requirements](https://github.com/omacom/omarchy-plugin-marketplace/blob/main/SUBMISSION.md)

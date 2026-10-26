@@ -90,6 +90,10 @@ SEARCH_INSTALLED_RUNTIME=$(cat "$SEARCH_PLUGIN_DIR/.fractal-search-install")
 "$SEARCH_INSTALLED_RUNTIME/uninstall.sh"
 ```
 
+If backend installation has not started, remove the initial clone with
+`omarchy plugin remove fractal.search`. If setup is running, let it finish before
+uninstalling so it cannot recreate the app during removal.
+
 Uninstall preserves your catalog, models and runtime bundles. See the [user guide](docs/USER-GUIDE.md#removal-and-permissions) for details.
 
 ## Documentation
