@@ -1,0 +1,79 @@
+name: Build and attest release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.repository == 'nigh8w0lf/fractal-search' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, cuda]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build in pinned Arch Linux environment
+        env:
+          SEARCH_VARIANT: ${{ matrix.variant }}
+          SEARCH_BUILD_IMAGE: archlinux@sha256:dfc5be7be44cf1acf3d9b3b902e3e9c8a29f97ed41e35631823cdc9c97e5d4f0
+        run: |
+          docker run --rm --volume "$GITHUB_WORKSPACE:/src" --workdir /src \
+            --env SEARCH_VARIANT --env SEARCH_BUILD_IMAGE \
+            "$SEARCH_BUILD_IMAGE" bash scripts/ci-release-build.sh
+      - name: Attest archive built by this job
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/ci/*.tar.gz
+      - name: Retain portable attestation
+        env:
+          SEARCH_ATTESTATION: ${{ steps.attest.outputs.bundle-path }}
+          SEARCH_VARIANT: ${{ matrix.variant }}
+        run: cp "$SEARCH_ATTESTATION" "dist/ci/$SEARCH_VARIANT.sigstore.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.variant }}
+          path: dist/ci/*
+          if-no-files-found: error
+          compression-level: 0
+  draft:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist/ci
+          merge-multiple: true
+      - name: Verify provenance and create draft (never replace existing release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(jq -er .version manifest.json)
+          for variant in cpu cuda; do
+            archive="dist/ci/fractal-search-$version-linux-x86_64-$variant.tar.gz"
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+          done
+          git archive --format=tar --prefix="fractal-search-$version/" HEAD | gzip -n > "dist/ci/fractal-search-$version-source.tar.gz"
+          (cd dist/ci; sha256sum *.tar.gz > SHA256SUMS)
+          gh release create "v$version" dist/ci/* --target "$GITHUB_SHA" \
+            --draft --title "Fractal Search v$version" --notes-file docs/RELEASE-NOTES.md

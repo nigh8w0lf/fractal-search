@@ -6,6 +6,29 @@ Publishing a marketplace listing does not build these binaries. The source-clone
 setup panel downloads pinned published bundles; keep release downloads documented
 and retain manual-setup until the marketplace approves standard installation.
 
+## GitHub build provenance
+
+`.github/workflows/release.yml` is manually dispatched from `main`. It builds CPU
+and CUDA separately on GitHub-hosted runners in a digest-pinned Arch container,
+using Rust 1.99.1 and Cargo.lock. No prebuilt application binaries or build caches
+are imported. Package inventories record the system packages installed during
+that run; this is attested provenance, not a claim of bit-for-bit reproducibility.
+The workflow runs workspace tests and model-free checks, packages full attribution,
+attests each final archive with GitHub/Sigstore, and verifies repository, workflow,
+source commit and hosted-runner identity before creating a draft release.
+
+Change the manifest version first. Dispatch the workflow and review both jobs.
+Download the draft bundles, verify their attestations, and run the installer and
+CPU/CUDA synthetic inference checks on Omarchy before publishing. Add the exact
+local validation results as a release asset. Hosted CI has no GPU or native
+Omarchy desktop. Never claim these were checked by hosted CI.
+
+After publication, update the bootstrap's version and both SHA-256 pins from the
+verified release archives, rerun its fixture checks, and submit the new HEAD to the
+marketplace with the build run, attestation commands and release digests. This
+follow-up source commit necessarily differs from the attested build commit;
+release tags and existing assets must remain unchanged.
+
 ## Build and package
 
 Run from a reviewed source checkout, with the pinned Cargo.lock and required
@@ -90,7 +113,8 @@ not a legal certification or an upstream endorsement.
   target caches and secrets from source snapshots.
 
 The included checksum manifests detect corruption, not publisher identity.
-No signing key is configured by this workflow. Publish only after reviewing the
+Local packaging does not sign builds. GitHub release builds additionally provide
+OIDC-backed Sigstore provenance attestations without a stored signing key. Publish only after reviewing the
 artifacts and obtaining authorization; do not silently create a public release,
 upload private source, tag, or submit a marketplace issue as part of packaging.
 Updates use the new bundle installer, preserving data/provider/settings and
