@@ -31,6 +31,10 @@ jobs:
           docker run --rm --volume "$GITHUB_WORKSPACE:/src" --workdir /src \
             --env SEARCH_VARIANT --env SEARCH_BUILD_IMAGE \
             "$SEARCH_BUILD_IMAGE" bash scripts/ci-release-build.sh
+      - name: Return container outputs to the runner
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" dist/ci
+          test -w dist/ci
       - name: Attest archive built by this job
         id: attest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
@@ -41,7 +45,10 @@ jobs:
           SEARCH_ATTESTATION: ${{ steps.attest.outputs.bundle-path }}
           SEARCH_VARIANT: ${{ matrix.variant }}
         run: cp "$SEARCH_ATTESTATION" "dist/ci/$SEARCH_VARIANT.sigstore.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      # Preserve the attested archive even if portable-bundle copying fails.
+      # The failed step still fails the job and blocks draft publication.
+      - if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.variant }}
           path: dist/ci/*

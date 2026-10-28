@@ -3,7 +3,7 @@
 set -euo pipefail
 [[ ${SEARCH_VARIANT:?} == cpu || $SEARCH_VARIANT == cuda ]]
 [[ ${SEARCH_BUILD_IMAGE:?} == archlinux@sha256:* ]]
-pacman -Syu --noconfirm --needed base-devel git clang cmake pkgconf protobuf libheif libjpeg-turbo openssl python jq rustup ffmpeg glib2
+pacman -Syu --noconfirm --needed base-devel git clang cmake pkgconf protobuf libheif libjpeg-turbo openssl python jq rustup ffmpeg glib2 time
 rustup toolchain install 1.99.1 --profile minimal --component rust-docs,rustfmt
 rustup default 1.99.1
 git config --global --add safe.directory /src
@@ -16,11 +16,15 @@ if [[ $SEARCH_VARIANT == cuda ]]; then
   features=(--features fractal-search/cuda,fractal-search-mcp/cuda)
   package_args=(--cuda)
 fi
-export CARGO_BUILD_JOBS=2 ORT_CUDA_VERSION=12
+export CARGO_BUILD_JOBS=4 ORT_CUDA_VERSION=12
+mkdir -p dist/ci
+free -h
+df -h /src
+nproc
 cargo fmt --all --check
 cargo fetch --locked
-cargo build --release --locked -p fractal-search -p fractal-folder-picker -p fractal-search-mcp --bins "${features[@]}"
-cargo test --release --workspace --locked "${features[@]}"
+/usr/bin/time -v -o "dist/ci/$SEARCH_VARIANT-build-resources.txt" cargo build --release --locked -p fractal-search -p fractal-folder-picker -p fractal-search-mcp --bins "${features[@]}"
+/usr/bin/time -v -o "dist/ci/$SEARCH_VARIANT-test-resources.txt" cargo test --release --workspace --locked "${features[@]}"
 python3 scripts/test_embeddinggemma2_contract.py
 python3 quickshell-app/tests/smoke_first_run.py
 python3 scripts/fetch-release-sources.py
