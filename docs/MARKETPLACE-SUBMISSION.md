@@ -15,6 +15,18 @@ compositor. Sample originals and video binaries are not included in Git. These
 two screenshots replace the earlier mountain/berry images and remain the only
 intentional media exceptions; the marketplace uses the single root preview.
 
+## Attested release follow-up — 2026-10-28
+
+The current review is [update #12952](https://github.com/omacom/omarchy-plugin-marketplace/issues/12952).
+Its form-heading failure was corrected; compatibility and the baseline completed
+with no findings and expected review capabilities. The maintainer then requested
+verifiable executable provenance. v0.1.2 supplies GitHub-hosted builds and signed
+attestations binding both archives to source `7ed037dece4196e1c030ce8997b94a95bc5f63ec`.
+See [release readiness](RELEASE-READINESS.md#v012-provenance-update) for digests,
+workflow evidence and validation scope. Refresh the same request to the new HEAD
+containing the v0.1.2 bootstrap pins; preserve its exact form headings and put
+supporting evidence in a comment. Do not claim approval before maintainer review.
+
 ## First-run update request — 2026-10-27
 
 Submit the new source through the marketplace verification form, selecting

@@ -51,10 +51,10 @@ release bundle. Update it with a newer release bundle's installer, not `omarchy 
 
 ### Install a release directly
 
-Download [v0.1.1](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.1):
-[CPU](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/fractal-search-0.1.1-linux-x86_64-cpu.tar.gz),
-[CUDA](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/fractal-search-0.1.1-linux-x86_64-cuda.tar.gz),
-[checksums](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/SHA256SUMS).
+Download [v0.1.2](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.2):
+[CPU](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.2/fractal-search-0.1.2-linux-x86_64-cpu.tar.gz),
+[CUDA](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.2/fractal-search-0.1.2-linux-x86_64-cuda.tar.gz),
+[checksums](https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.2/SHA256SUMS).
 
 Or run this complete download, verification and installation sequence:
 
@@ -62,15 +62,20 @@ Or run this complete download, verification and installation sequence:
 SEARCH_VARIANT=cpu # Use cuda for NVIDIA acceleration with CUDA 12/cuDNN 9 installed.
 SEARCH_DOWNLOAD_DIR=$(mktemp -d)
 cd "$SEARCH_DOWNLOAD_DIR"
-SEARCH_RELEASE=https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1
-curl --fail --location --remote-name "$SEARCH_RELEASE/fractal-search-0.1.1-linux-x86_64-$SEARCH_VARIANT.tar.gz"
+SEARCH_RELEASE=https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.2
+curl --fail --location --remote-name "$SEARCH_RELEASE/fractal-search-0.1.2-linux-x86_64-$SEARCH_VARIANT.tar.gz"
 curl --fail --location --remote-name "$SEARCH_RELEASE/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS &&
-tar -xzf "fractal-search-0.1.1-linux-x86_64-$SEARCH_VARIANT.tar.gz" &&
-cd "fractal-search-0.1.1-linux-x86_64-$SEARCH_VARIANT" &&
+tar -xzf "fractal-search-0.1.2-linux-x86_64-$SEARCH_VARIANT.tar.gz" &&
+cd "fractal-search-0.1.2-linux-x86_64-$SEARCH_VARIANT" &&
 ./install.sh --provider "$SEARCH_VARIANT"
 omarchy-shell shell toggle fractal.search
 ```
+
+The v0.1.2 CPU/CUDA archives were built on GitHub-hosted runners and carry signed
+build attestations. See [verification instructions](docs/AGENT-SETUP.md#obtain-and-check-the-bundle)
+for checking their repository, workflow and source commit. Checksums alone do not
+establish build provenance.
 
 Prebuilt installations need no Rust compiler or Python. Check the release’s architecture and system-library requirements. For NVIDIA acceleration, use the CUDA bundle with `./install.sh --provider cuda --device-id 0` and follow the [CUDA setup guide](quickshell-app/CUDA.md).
 

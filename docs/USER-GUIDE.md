@@ -12,7 +12,7 @@ Setup retains the original clean git checkout under `${XDG_STATE_HOME:-~/.local/
 
 For direct installation or updates, use the [complete download commands in the README](../README.md#install-a-release-directly). Generic git-plugin updates are not supported after the handoff to the managed release installation.
 
-Use a compatible [CPU or CUDA release bundle](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.1) and its checksums. For source builds, see the [development guide](DEVELOPMENT.md). Check the release's architecture/system-library requirements and archive checksum, extract it, then run from the extracted directory:
+Use a compatible [CPU or CUDA release bundle](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.2) and its checksums. For source builds, see the [development guide](DEVELOPMENT.md). Check the release's architecture/system-library requirements and archive checksum, extract it, then run from the extracted directory:
 
 ```bash
 sha256sum --check SHA256SUMS

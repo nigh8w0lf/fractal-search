@@ -105,14 +105,14 @@ trap cleanup EXIT
 validate_source
 validate_cuda_directory
 case "$SEARCH_PROVIDER" in
-  cpu) SEARCH_HASH=a392124a0f09b8b005376479d4244ed4495044e69b77a8c32e4b5b1b1343da0c ;;
-  cuda) SEARCH_HASH=41c228480393392f169d8ecddc6121ee103948c8fd33b47ae876d63409dc6de0 ;;
+  cpu) SEARCH_HASH=61d7fad6a5195b2a0ec73d2db57987f3c6e952632f95647ccc39b3cc9e2be300 ;;
+  cuda) SEARCH_HASH=6b77f0bdeb75963fac4cf437761d5de599959d9ccb5a247cf9268a98aff5b0f5 ;;
   *) echo 'Invalid provider'; exit 1 ;;
 esac
-SEARCH_NAME="fractal-search-0.1.1-linux-x86_64-$SEARCH_PROVIDER"
+SEARCH_NAME="fractal-search-0.1.2-linux-x86_64-$SEARCH_PROVIDER"
 SEARCH_STAGE=$(mktemp -d "$SEARCH_STATE/download.XXXXXX")
-status downloading "Downloading the v0.1.1 $SEARCH_PROVIDER backend…"
-curl --fail --location --proto '=https' --proto-redir '=https' --connect-timeout 30 --max-time 1800 --max-filesize 536870912 --output "$SEARCH_STAGE/bundle.tar.gz" "https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.1/$SEARCH_NAME.tar.gz"
+status downloading "Downloading the v0.1.2 $SEARCH_PROVIDER backend…"
+curl --fail --location --proto '=https' --proto-redir '=https' --connect-timeout 30 --max-time 1800 --max-filesize 536870912 --output "$SEARCH_STAGE/bundle.tar.gz" "https://github.com/nigh8w0lf/fractal-search/releases/download/v0.1.2/$SEARCH_NAME.tar.gz"
 status verifying 'Verifying the pinned release checksum…'
 printf '%s  %s\n' "$SEARCH_HASH" "$SEARCH_STAGE/bundle.tar.gz" | sha256sum --check --status || { echo 'Release checksum mismatch. Nothing was installed; retry or report the damaged download.'; exit 1; }
 # The pinned archive is immutable. Also reject traversal, links and special files.

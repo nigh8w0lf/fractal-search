@@ -1,12 +1,49 @@
-# Release readiness — 2026-10-27
+# Release readiness — 2026-10-28
 
-Target: Fractal Search 0.1.1 for current **x86_64 Omarchy with Omarchy Shell**.
+Target: Fractal Search 0.1.2 for current **x86_64 Omarchy with Omarchy Shell**.
 The owner authorized public repository visibility and the CPU/CUDA release on
 2026-10-22. [Release v0.1.0](https://github.com/nigh8w0lf/fractal-search/releases/tag/v0.1.0)
 provides both bundles, matching source, checksums and validation/platform reports.
 Generated release output is excluded from Git. The owner subsequently authorized
 [marketplace submission #12503](https://github.com/omacom/omarchy-plugin-marketplace/issues/12503).
 The v0.1.1 snapshot was approved and published with `manual-setup` on 2026-10-25.
+
+## v0.1.2 provenance update
+
+The maintainer requested independently verifiable source-to-binary evidence in
+[update review #12952](https://github.com/omacom/omarchy-plugin-marketplace/issues/12952#issuecomment-6430066686).
+The new CPU/CUDA archives were built from clean source
+`7ed037dece4196e1c030ce8997b94a95bc5f63ec` in
+[GitHub Actions run 40621719904](https://github.com/nigh8w0lf/fractal-search/actions/runs/40621719904).
+Both build jobs passed locked release builds, workspace tests, model-free checks,
+packaging, checksum verification, GitHub/Sigstore attestation and artifact upload.
+The draft job independently checked the attested repository, workflow, source
+commit and GitHub-hosted runner identity. Source and portable attestations are
+included with the release; full third-party attribution remains inside each bundle.
+
+| Archive | SHA-256 |
+| --- | --- |
+| CPU | `61d7fad6a5195b2a0ec73d2db57987f3c6e952632f95647ccc39b3cc9e2be300` |
+| CUDA | `6b77f0bdeb75963fac4cf437761d5de599959d9ccb5a247cf9268a98aff5b0f5` |
+
+Local verification of both downloaded archive attestations passed with the exact
+source digest and workflow enforced. Temporary installer tests and real synthetic
+image/text/audio/video indexing/search and read-only MCP passed on CPU and CUDA.
+The release's LOCAL-VALIDATION.json records the additional local checks separately
+from hosted CI. No personal library or live installation was used for validation.
+
+The initial CI attempt built/tested/attested its outputs but failed to copy the
+portable attestation into a root-owned directory. No release was published from
+that run. The successful run fixes output ownership and preserves uploaded
+archives even if portable-attestation copying fails, while still failing the job.
+It uses four compilation jobs and publishes timing/resource records. These are
+individual-process resource measurements, not a whole-machine memory benchmark.
+
+The bootstrap pins are updated in a subsequent source commit; they cannot be
+embedded in the archives whose hashes they name. The release tag remains bound to
+`7ed037d`; the marketplace request must identify the later current HEAD and link
+these archive attestations. v0.1.0/v0.1.1 assets are unchanged. Maintainer approval
+and standard-installation eligibility remain separate from this build evidence.
 
 ## v0.1.1 update
 
@@ -117,7 +154,7 @@ same tested executables and complete third-party notices. Archive contents,
 permissions, provenance and checksums are verified before upload. These archives
 are unsigned; checksums provide integrity rather than independent publisher identity.
 
-## First-run update — 2026-10-27
+## First-run update — 2026-10-27 (historical)
 
 The source-clone setup panel now downloads checksum-pinned v0.1.1 CPU/CUDA
 bundles through an explicit user action. It supports private CUDA library paths,

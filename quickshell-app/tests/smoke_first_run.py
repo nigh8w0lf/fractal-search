@@ -35,7 +35,7 @@ def main():
             provider = 'cuda' if case.startswith('cuda-') else 'cpu'
             cuda_dir = work / 'private CUDA lib'
             cuda_dir.mkdir()
-            bundle = work/f'fractal-search-0.1.1-linux-x86_64-{provider}'; bundle.mkdir()
+            bundle = work/f'fractal-search-0.1.2-linux-x86_64-{provider}'; bundle.mkdir()
             installer = bundle/'install.sh'
             installer.write_text('#!/bin/bash\nset -eu\n' + ('echo "Fixture missing dependency" >&2; exit 17\n' if case=='install-failure' else 'mkdir -p "$XDG_CONFIG_HOME/omarchy/plugins/fractal.search"\nprintf fixture > "$XDG_CONFIG_HOME/omarchy/plugins/fractal.search/.fractal-search-install"\n'))
             if case == 'cuda-path':
@@ -45,7 +45,7 @@ def main():
             archive=work/'fixture.tar.gz'
             with tarfile.open(archive,'w:gz') as tar: tar.add(bundle,arcname=bundle.name)
             script=work/'first-run.sh'
-            script.write_text(SOURCE.read_text().replace('41c228480393392f169d8ecddc6121ee103948c8fd33b47ae876d63409dc6de0',hashlib.sha256(archive.read_bytes()).hexdigest()).replace('a392124a0f09b8b005376479d4244ed4495044e69b77a8c32e4b5b1b1343da0c',hashlib.sha256(archive.read_bytes()).hexdigest() if case!='checksum' else '0'*64))
+            script.write_text(SOURCE.read_text().replace('6b77f0bdeb75963fac4cf437761d5de599959d9ccb5a247cf9268a98aff5b0f5',hashlib.sha256(archive.read_bytes()).hexdigest()).replace('61d7fad6a5195b2a0ec73d2db57987f3c6e952632f95647ccc39b3cc9e2be300',hashlib.sha256(archive.read_bytes()).hexdigest() if case!='checksum' else '0'*64))
             commands=work/'commands';commands.mkdir()
             (commands/'curl').write_text('#!/bin/bash\nwhile (($#)); do if [[ $1 == --output ]]; then cp "$FIXTURE_ARCHIVE" "$2"; exit; fi; shift; done\nexit 1\n''')
             (commands/'systemctl').write_text('#!/bin/sh\necho inactive\n')
